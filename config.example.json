@@ -1,0 +1,14 @@
+{
+  "jwt": "YOUR_JWT_TOKEN_HERE",
+  "client_id": "YOUR_IOPLATFORM_UUID_HERE",
+  "device_id": "THIS_DEVICE_ID",
+  "user_id": "YOUR_USER_ID",
+  "mappings": [
+    {
+      "local_host": "127.0.0.1",
+      "local_port": 18080,
+      "remote_host": "127.0.0.1",
+      "remote_port": 8080
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+// Reconstructed from UU Remote binary analysis and a 2026-08-31 wire capture.
+
+syntax = "proto3";
+
+package gv_pb;
+
+option go_package = "github.com/user/uulink/pkg/proto/gvpb";
+
+message PortMappingFrame {
+  uint32 session_id = 1;
+  uint64 rule_id = 2;
+  uint32 stream_id = 3;
+  FrameType type = 4;
+  bytes payload = 5;
+}
+
+enum FrameType {
+  SYN = 0;
+  FIN = 1;
+  DATA = 2;
+  SYN_ACK = 3;
+  DATA_ACK = 4;
+}
+
+message Message {
+  uint64 seq = 1;
+  uint64 timestamp = 2;
+  PortMappingFrame port_mapping_frame = 27;
+}
