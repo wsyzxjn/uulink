@@ -155,7 +155,7 @@ func SharePassCodeSign(controlID, passCode string) string {
 // GuestShareUploadSignRequest is the request body for the recipient-side
 // verification-code upload.
 type GuestShareUploadSignRequest struct {
-	CanControl bool   `json:"can_control"`
+	CanControl bool   `json:"can_remote_control"`
 	ControlID  string `json:"control_id"`
 	Sign       string `json:"sign"`
 	BackupSign string `json:"backup_sign"`
@@ -168,7 +168,8 @@ func (c *Client) GuestShareUploadSign(session *GuestSession, request *GuestShare
 		return nil, fmt.Errorf("guest share upload sign: %w", err)
 	}
 	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("guest share upload sign failed, code %v: %v", code, resp["msg"])
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
 	}
 	return resp, nil
 }
@@ -211,6 +212,50 @@ func (c *Client) JoinRoomByShareCodeWithGuest(session *GuestSession, connectID, 
 	data, ok := resp["data"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("join share room with guest response has no data: %v", resp)
+	}
+	return parseRoomConnectionInfo(data), nil
+}
+
+// JoinRoomByConfirmation starts the v2 remote-assistance confirmation flow.
+// The controlling side must be logged in; controlId identifies the controller.
+func (c *Client) JoinRoomByConfirmation(connectID, controlID string) (*RoomConnectionInfo, error) {
+	body := map[string]any{
+		"connect_id": connectID,
+		"control_id": controlID,
+	}
+	resp, err := c.Do("POST", "/api/v2/room/join/share/by_confirmation", body)
+	if err != nil {
+		return nil, fmt.Errorf("join room by confirmation: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("join room by confirmation response has no data: %v", resp)
+	}
+	return parseRoomConnectionInfo(data), nil
+}
+
+// JoinRoomByConfirmationWithGuest starts the v2 remote-assistance
+// confirmation flow using a guest controller identity.
+func (c *Client) JoinRoomByConfirmationWithGuest(session *GuestSession, connectID, controlID string) (*RoomConnectionInfo, error) {
+	body := map[string]any{
+		"connect_id": connectID,
+		"control_id": controlID,
+	}
+	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/join/share/by_confirmation", body)
+	if err != nil {
+		return nil, fmt.Errorf("join room by confirmation with guest: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("join room by confirmation with guest response has no data: %v", resp)
 	}
 	return parseRoomConnectionInfo(data), nil
 }

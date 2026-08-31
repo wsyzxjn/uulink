@@ -40,7 +40,8 @@ func main() {
 	listDevices := flag.Bool("list", false, "list available devices and exit")
 	guestTest := flag.Bool("guest", false, "run guest identity/share smoke test and exit")
 	userInfo := flag.Bool("user-info", false, "show current user info and exit")
-	loginQRCode := flag.Bool("login-qrcode", false, "generate an official QR-code login URL and exit")
+	loginQRCode := flag.Bool("login-qrcode", false, "exchange an official QR-code login for a JWT and update the config")
+	refreshLogin := flag.Bool("refresh-login", false, "validate the current JWT and refresh it by QR-code login only if needed")
 	loginQRCodeTimeout := flag.Duration("login-qrcode-timeout", 5*time.Minute, "maximum time to wait for QR-code login confirmation")
 	shareJoin := flag.Bool("share", false, "join a remote-assistance share by ID and code")
 	shareGuest := flag.Bool("share-guest", false, "join a remote-assistance share using a guest identity")
@@ -63,6 +64,10 @@ func main() {
 
 	client := api.NewClient(cfg)
 
+	if *refreshLogin {
+		doRefreshLogin(client, cfg, *configPath, *loginQRCodeTimeout)
+		return
+	}
 	if *listDevices {
 		doListDevices(client)
 		return
@@ -76,7 +81,7 @@ func main() {
 		return
 	}
 	if *loginQRCode {
-		doLoginQRCode(client, *loginQRCodeTimeout)
+		doLoginQRCode(client, cfg, *configPath, *loginQRCodeTimeout)
 		return
 	}
 
@@ -773,7 +778,26 @@ func saveQRCodeLoginStatus(path string, status *api.QRCodeLoginStatusResult) err
 	return os.WriteFile(path, data, 0600)
 }
 
-func doLoginQRCode(client *api.Client, timeout time.Duration) {
+func doRefreshLogin(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) {
+	state, err := client.GetLoginState()
+	if err == nil && state.Valid {
+		log.Printf("login state valid; no refresh needed (user_id_len=%d nickname=%q)",
+			len(state.UserID), state.Nickname)
+		return
+	}
+	if err != nil {
+		var responseErr *api.ResponseError
+		if !errors.As(err, &responseErr) {
+			log.Fatalf("validate login state: %v", err)
+		}
+		log.Printf("login state invalid: %v", responseErr)
+	} else {
+		log.Printf("login state invalid: user info response has no user_id")
+	}
+	doLoginQRCode(client, cfg, configPath, timeout)
+}
+
+func doLoginQRCode(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) {
 	guest, err := client.CreateGuest()
 	if err != nil {
 		log.Fatalf("create guest: %v", err)
@@ -822,7 +846,25 @@ func doLoginQRCode(client *api.Client, timeout time.Duration) {
 			if err := os.WriteFile("workspace/login-qrcode-jwt.json", []byte(token), 0600); err != nil {
 				log.Fatalf("save QR code login JWT: %v", err)
 			}
-			log.Printf("QR code login confirmed; JWT length=%d", len(token))
+			userID, err := api.JWTSubject(token)
+			if err != nil {
+				log.Fatalf("decode QR code login JWT: %v", err)
+			}
+			cfg.JWT = token
+			cfg.UserID = userID
+			cfg.GuestID = ""
+			if err := auth.SaveConfigFile(configPath, cfg); err != nil {
+				log.Fatalf("save refreshed config: %v", err)
+			}
+			refreshedState, err := client.GetLoginState()
+			if err != nil {
+				log.Fatalf("validate refreshed login state: %v", err)
+			}
+			if !refreshedState.Valid {
+				log.Fatalf("refreshed login state is invalid")
+			}
+			log.Printf("QR code login confirmed; JWT length=%d user_id_len=%d config=%s",
+				len(token), len(refreshedState.UserID), configPath)
 			return
 		}
 		if status.Token != "" {
@@ -898,10 +940,20 @@ func doGuestTest(client *api.Client) {
 	log.Printf("attempting join by share code as logged-in controller")
 	joined, err := client.JoinRoomByShareCode(share.ConnectID, share.ConnectCode)
 	if err != nil {
-		log.Fatalf("join by share code: %v", err)
+		log.Printf("join by share code as logged-in controller failed: %v", err)
+	} else {
+		log.Printf("joined guest share room as logged-in controller: signaling=%s gateways=%d token_len=%d",
+			joined.SignalingServer, len(joined.SignalingList), len(joined.Token))
 	}
-	log.Printf("joined guest share room: signaling=%s gateways=%d token_len=%d",
-		joined.SignalingServer, len(joined.SignalingList), len(joined.Token))
+
+	log.Printf("attempting join by share code as guest controller")
+	guestJoined, err := client.JoinRoomByShareCodeWithGuest(session, share.ConnectID, share.ConnectCode)
+	if err != nil {
+		log.Printf("join by share code as guest controller failed: %v", err)
+		return
+	}
+	log.Printf("joined guest share room as guest controller: signaling=%s gateways=%d token_len=%d",
+		guestJoined.SignalingServer, len(guestJoined.SignalingList), len(guestJoined.Token))
 }
 
 func mapKeys(m map[string]any) []string {

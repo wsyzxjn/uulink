@@ -46,6 +46,7 @@ The full scope, acceptance tests, and implementation roadmap are documented in
   established WebRTC over real UU signaling, and passed bidirectional concurrent
   TCP port forwarding
 - [x] QR-code login bootstrap, status polling, and JWT exchange
+- [x] Login-state refresh via `-refresh-login`
 
 The 2026-08-31 physical-device acceptance used:
 
@@ -104,6 +105,21 @@ So the guest flow is best understood as a guest room/share flow. The official
 client still requires a logged-in user on the controller side before it will
 start remote assistance.
 
+Current guest-flow status:
+
+- `POST /api/v1/guest/create`, `POST /api/v1/guest/room/create`, and
+  `POST /api/v1/guest/share/info` succeed without a user login.
+- The recipient-side upload-sign request uses the official
+  `can_remote_control` field. After upload-sign succeeds, refreshing guest
+  share info returns an eight-character `connect_code`.
+- A guest identity cannot join the resulting share as the controller:
+  `/api/v1/room/join/share/by_code` returns `1002`, and the v2
+  `by_confirmation` flow also returns `1002`.
+- Creating a guest session invalidates the current user JWT for the same
+  account. A valid user login is therefore still required on the controller
+  side, and a guest controlled session cannot coexist with that account's
+  user token in the current single-account setup.
+
 Additional live result: the official client can generate the remote-assistance
 temporary verification code while logged out. A guest identity cannot use that
 code to join as the controller; the controller side still needs a valid login.
@@ -155,6 +171,9 @@ cp config.example.json config.json
 
 # Generate a scannable QR code and poll for login confirmation
 workspace/login-qrcode.sh
+
+# Validate the configured JWT and refresh it only if it is invalid
+./uulink -refresh-login
 
 # The QR code expires server-side; the script refreshes it every four minutes.
 
