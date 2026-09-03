@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
 )
 
@@ -149,5 +150,60 @@ func TestFormatAllowedPorts(t *testing.T) {
 		if got := formatAllowedPorts(tt.ports); got != tt.want {
 			t.Errorf("formatAllowedPorts(%v) = %q, want %q", tt.ports, got, tt.want)
 		}
+	}
+}
+
+func TestCustomCodeValidationAndGeneration(t *testing.T) {
+	// Valid codes
+	for _, code := range []string{"Pass1234", "Secure9999", "Code2026Aa"} {
+		if err := api.ValidateCustomShareCode(code); err != nil {
+			t.Errorf("expected code %q to be valid, got: %v", code, err)
+		}
+	}
+
+	// Invalid codes
+	for _, code := range []string{"1234567", "allletters", "12345678", "toolongcode123456789", "invalid!@#"} {
+		if err := api.ValidateCustomShareCode(code); err == nil {
+			t.Errorf("expected code %q to be invalid, got nil", code)
+		}
+	}
+
+	// Generated code must always be valid
+	for i := 0; i < 5; i++ {
+		generated, err := api.GenerateCustomShareCode()
+		if err != nil {
+			t.Fatalf("GenerateCustomShareCode: %v", err)
+		}
+		if err := api.ValidateCustomShareCode(generated); err != nil {
+			t.Fatalf("generated code %q failed validation: %v", generated, err)
+		}
+	}
+}
+
+func TestCustomCodeResolutionPriority(t *testing.T) {
+	cfg := &auth.Config{
+		CustomCode: "ConfigPass1",
+		ShareID:    "998877",
+	}
+
+	resolve := func(flagCode, guestFlagCode, cfgCode string) string {
+		effective := flagCode
+		if effective == "" {
+			effective = guestFlagCode
+		}
+		if effective == "" {
+			effective = cfgCode
+		}
+		return effective
+	}
+
+	if got := resolve("FlagPass1", "GuestPass1", cfg.CustomCode); got != "FlagPass1" {
+		t.Errorf("flagCode priority = %q, want FlagPass1", got)
+	}
+	if got := resolve("", "GuestPass1", cfg.CustomCode); got != "GuestPass1" {
+		t.Errorf("guestFlagCode priority = %q, want GuestPass1", got)
+	}
+	if got := resolve("", "", cfg.CustomCode); got != "ConfigPass1" {
+		t.Errorf("cfgCode priority = %q, want ConfigPass1", got)
 	}
 }
