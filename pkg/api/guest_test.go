@@ -29,13 +29,17 @@ func TestGenerateSharePassCode(t *testing.T) {
 }
 
 func TestSharePassCodeSign(t *testing.T) {
-	const (
-		controlID = "12345678"
-		passCode  = "ABCDEFGH"
-	)
-	const want = "1bd34f9851a94e1dcff013944f1604d4bdf77fb1cbcda393678dc0b9db76f0d6"
-	if got := SharePassCodeSign(controlID, passCode); got != want {
+	const passCode = "ABCDEFGH"
+	const want = "9ac2197d9258257b1ae8463e4214e4cd0a578bc1517f2415928b91be4283fc48"
+	if got := SharePassCodeSign(passCode); got != want {
 		t.Fatalf("SharePassCodeSign() = %q, want %q", got, want)
+	}
+	const (
+		salt     = "mysalt"
+		wantSalt = "e7f622ee88c6023a41ed99de879bf7a640450cbffc23d9b294651f321414f430"
+	)
+	if got := SharePassCodeSignWithSalt(salt, passCode); got != wantSalt {
+		t.Fatalf("SharePassCodeSignWithSalt() = %q, want %q", got, wantSalt)
 	}
 }
 
@@ -147,8 +151,8 @@ func TestNewGuestShareUploadSignRequestModes(t *testing.T) {
 		controlID  = "12345678"
 		temporary  = "ABCDEFGH"
 		custom     = "JKLMNPQR"
-		tempSign   = "1bd34f9851a94e1dcff013944f1604d4bdf77fb1cbcda393678dc0b9db76f0d6"
-		customSign = "2d6a295da1c3104515b21963f30872759ca67e6269fe854a91041f891ecbecd5"
+		tempSign   = "9ac2197d9258257b1ae8463e4214e4cd0a578bc1517f2415928b91be4283fc48"
+		customSign = "e7ccbaa3a408d10bb093b9bb3e08f568de1947e13ffe894e6ea207bafb5f5cff"
 	)
 	tests := []struct {
 		mode ShareAuthMode

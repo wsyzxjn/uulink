@@ -63,8 +63,8 @@ func Sign(method string, rawURL string, headers map[string]string, body string) 
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func platformParams(goos string) (platform, versionName, versionCode string) {
-	if goos == "windows" {
+func platformParams(goos string, cfgPlatform int) (platform, versionName, versionCode string) {
+	if cfgPlatform == 1 || goos == "windows" {
 		return "1", "4.38.3", "9325"
 	}
 	return "4", "4.38.0", "616"
@@ -72,7 +72,7 @@ func platformParams(goos string) (platform, versionName, versionCode string) {
 
 // BuildHeaders returns the full set of authentication headers for an API request.
 func BuildHeaders(cfg *Config, ts string) map[string]string {
-	platform, versionName, versionCode := platformParams(runtime.GOOS)
+	platform, versionName, versionCode := platformParams(runtime.GOOS, cfg.Platform)
 	headers := map[string]string{
 		"X-Param-PLAT":      platform,
 		"X-Param-VN":        versionName,
@@ -105,6 +105,7 @@ type Config struct {
 	UserID       string        `json:"user_id"`
 	Hostname     string        `json:"hostname,omitempty"`
 	GuestID      string        `json:"guest_id,omitempty"`
+	Platform     int           `json:"platform,omitempty"`
 	Mappings     []PortMapping `json:"mappings,omitempty"`
 	AllowLAN     bool          `json:"allow_lan,omitempty"`
 	AllowedPorts []int         `json:"allowed_ports,omitempty"`

@@ -67,7 +67,7 @@ func TestLiveGuestToGuestConfirmationJoin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate share pass code: %v", err)
 	}
-	sign := SharePassCodeSign(controllerShare.ConnectID, passCode)
+	sign := SharePassCodeSign(passCode)
 	uploadResp, uploadErr := controlledClient.GuestShareUploadSign(controlledGuest, &GuestShareUploadSignRequest{
 		CanControl:       true,
 		ControlID:        controllerShare.ConnectID,

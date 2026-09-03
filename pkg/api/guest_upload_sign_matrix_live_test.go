@@ -59,8 +59,8 @@ func TestLiveGuestShareUploadSignMatrix(t *testing.T) {
 	}
 	for name, controlID := range candidates {
 		signs := map[string]string{
-			"forward": SharePassCodeSign(controlID, passCode),
-			"reverse": SharePassCodeSign(passCode, controlID),
+			"no_salt":   SharePassCodeSign(passCode),
+			"with_salt": SharePassCodeSignWithSalt(controlID, passCode),
 		}
 		for signName, sign := range signs {
 			request := NewGuestShareUploadSignRequest(controlID, passCode, "", ShareAuthTemporary)

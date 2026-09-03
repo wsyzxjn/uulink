@@ -87,6 +87,7 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 	cfg.GuestID = ""
 	cfg.ClientID = clientID
 	cfg.DeviceID = ""
+	cfg.Platform = 1
 	resp, err := NewClient(&cfg).Do("POST", "/api/v1/device/windows/init", body)
 	if err != nil {
 		return nil, fmt.Errorf("init windows device without auth: %w", err)

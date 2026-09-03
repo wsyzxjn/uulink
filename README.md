@@ -135,23 +135,30 @@ Start the endpoints without passing port flags:
 
 All configured ports will be mapped simultaneously.
 
-### Method 3: Temporary Connection via Share Code
+### Method 3: Temporary Connection via Share Code (Guest Mode)
 
-Use this method when machines are on different accounts or for temporary access without binding devices.
+Use this method when machines belong to different accounts or for temporary access without binding the target device to your account. The target machine does not need to be logged in.
 
 1. Start the assistance service on the target machine:
 
 ```bash
-./uulink -guest-serve
+# Start an unbound guest server (no login required on this machine)
+./uulink -unbound-guest-serve -local 19081 -remote-port 18090
 ```
 
-The terminal will display a `connect_id` and an 8-character `connect_code`.
+The terminal will display a `connect_id` and an 8-character `connect_code`:
 
-2. Connect from the client machine using the share credentials:
+```text
+INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
+```
+
+2. Connect from the controlling machine using your credentials and the share code:
 
 ```bash
-./uulink -share -share-id <CONNECT_ID> -share-code <CONNECT_CODE> -local 18080 -remote-port 8080
+./uulink -share -share-id 266444253 -share-code 6W44YBPL -local 19090 -remote-port 18091
 ```
+
+Once connected, bidirectional port forwarding between the two endpoints is active immediately.
 
 ## Configuration Reference
 
@@ -164,6 +171,8 @@ The terminal will display a `connect_id` and an 8-character `connect_code`.
   "device_id": "Device identifier on the UU Remote platform",
   "user_id": "User account identifier",
   "hostname": "Optional device name exposed during registration",
+  "allow_lan": false,
+  "allowed_ports": [22, 8080],
   "mappings": [
     {
       "local_host": "127.0.0.1",
@@ -189,14 +198,19 @@ Field details:
 - `remote_host`: Destination host on the remote end. Typically `127.0.0.1`.
 - `remote_port`: Destination port on the remote end.
 - `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
-- `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When set, incoming connections to other ports are rejected.
+- `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
+
+Incoming `CONNECT` requests are authorized by the receiving process. Both endpoints use the same mapping schema, and either endpoint may expose local listeners that reach services on the other endpoint, subject to the receiving endpoint's `allow_lan` and `allowed_ports` policy.
 
 ## Command-Line Options
 
 | Flag | Description | Default |
 | --- | --- | --- |
 | `-config <path>` | Path to configuration file | `config.json` |
+| `-login` | Interactively select login method (QR code or SMS code) | - |
 | `-login-qrcode` | Generate a login QR code and update credentials | - |
+| `-login-mobile <number>` | Mobile phone number for SMS verification code login | - |
+| `-login-country-code <code>` | Country code for mobile login (default `+86`) | `+86` |
 | `-refresh-login` | Validate current session and refresh if expired | - |
 | `-list` | List registered devices and their online status | - |
 | `-user-info` | Display current account user info | - |
@@ -210,8 +224,9 @@ Field details:
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
-| `-guest-serve` | Run assistance server and print share code | - |
-| `-share` | Enable share code client mode | - |
+| `-unbound-guest-serve` | Register an accountless guest device and print share code | - |
+| `-guest-serve` | Run assistance server on current device and print share code | - |
+| `-share` | Connect to an assistance server by share ID and code | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
 

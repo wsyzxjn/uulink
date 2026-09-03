@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -45,7 +46,10 @@ func main() {
 	listDevices := flag.Bool("list", false, "list available devices and exit")
 	guestTest := flag.Bool("guest", false, "run guest identity/share smoke test and exit")
 	userInfo := flag.Bool("user-info", false, "show current user info and exit")
+	interactiveLogin := flag.Bool("login", false, "interactively select login method (QR code or SMS code)")
 	loginQRCode := flag.Bool("login-qrcode", false, "exchange an official QR-code login for a JWT and update the config")
+	loginMobile := flag.String("login-mobile", "", "mobile phone number for SMS verification code login")
+	loginCountryCode := flag.String("login-country-code", "+86", "country code for mobile login (default: +86)")
 	refreshLogin := flag.Bool("refresh-login", false, "validate the current JWT and refresh it by QR-code login only if needed")
 	loginQRCodeTimeout := flag.Duration("login-qrcode-timeout", 5*time.Minute, "maximum time to wait for QR-code login confirmation")
 	shareJoin := flag.Bool("share", false, "join a remote-assistance share by ID and code")
@@ -111,6 +115,14 @@ func main() {
 	}
 	if *userInfo {
 		doUserInfo(client)
+		return
+	}
+	if *interactiveLogin {
+		doInteractiveLogin(client, cfg, *configPath, *loginQRCodeTimeout, *loginCountryCode)
+		return
+	}
+	if *loginMobile != "" {
+		doMobileLogin(client, cfg, *configPath, *loginCountryCode, *loginMobile)
 		return
 	}
 	if *loginQRCode {
@@ -523,6 +535,7 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	}
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
+	cfg.Platform = 1
 	logging.Debugf("unbound guest identity created")
 
 	room, err := client.CreateGuestRoom(session)
@@ -673,7 +686,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			}
 			logging.Debugf("saved guest share info to %s", roomFile)
 		}
-		logging.Infof("guest share ready: connect_id=%s code_length=%d", share.ConnectID, len(share.ConnectCode))
+		logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
 	}
 
 	var tun *tunnel.Tunnel
@@ -1085,6 +1098,95 @@ func saveQRCodeLoginStatus(path string, status *api.QRCodeLoginStatusResult) err
 		return err
 	}
 	return os.WriteFile(path, data, 0600)
+}
+
+func doInteractiveLogin(client *api.Client, cfg *auth.Config, configPath string, qrTimeout time.Duration, defaultCountryCode string) {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("Select login method:")
+	fmt.Println("  1. QR code scan (Recommended)")
+	fmt.Println("  2. SMS verification code (Mobile)")
+	fmt.Print("Enter choice [1/2, default 1]: ")
+	choiceText, _ := reader.ReadString('\n')
+	choice := strings.TrimSpace(choiceText)
+	switch choice {
+	case "2", "mobile", "sms":
+		doMobileLogin(client, cfg, configPath, defaultCountryCode, "")
+	default:
+		doLoginQRCode(client, cfg, configPath, qrTimeout)
+	}
+}
+
+func doMobileLogin(client *api.Client, cfg *auth.Config, configPath, countryCode, mobile string) {
+	reader := bufio.NewReader(os.Stdin)
+	if mobile == "" {
+		fmt.Print("Enter mobile phone number: ")
+		text, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatalf("read mobile number: %v", err)
+		}
+		mobile = strings.TrimSpace(text)
+		if mobile == "" {
+			log.Fatal("mobile phone number cannot be empty")
+		}
+	}
+	if countryCode == "" {
+		countryCode = "+86"
+	}
+
+	log.Printf("requesting SMS verification code for %s %s...", countryCode, mobile)
+	resp, err := client.RequestMobileCode(countryCode, mobile)
+	if err != nil {
+		if respErr, ok := err.(*api.ResponseError); ok {
+			log.Fatalf("request SMS code failed: code=%d msg=%q (note: server may require captcha if triggered by security policy)",
+				respErr.Code, respErr.Message)
+		}
+		log.Fatalf("request SMS code: %v", err)
+	}
+	log.Printf("SMS code request sent (code=%v msg=%q)", resp["code"], resp["msg"])
+
+	fmt.Print("Enter SMS verification code: ")
+	codeText, err := reader.ReadString('\n')
+	if err != nil {
+		log.Fatalf("read SMS code: %v", err)
+	}
+	code := strings.TrimSpace(codeText)
+	if code == "" {
+		log.Fatal("verification code cannot be empty")
+	}
+
+	login, err := client.LoginByMobile(countryCode, mobile, code)
+	if err != nil {
+		if respErr, ok := err.(*api.ResponseError); ok {
+			log.Fatalf("mobile login failed: code=%d msg=%q", respErr.Code, respErr.Message)
+		}
+		log.Fatalf("mobile login: %v", err)
+	}
+
+	data, _ := login["data"].(map[string]any)
+	token, _ := data["token"].(string)
+	if token == "" {
+		log.Fatalf("mobile login response has no token: %v", login)
+	}
+
+	userID, err := api.JWTSubject(token)
+	if err != nil {
+		log.Fatalf("decode login JWT: %v", err)
+	}
+	cfg.JWT = token
+	cfg.UserID = userID
+	cfg.GuestID = ""
+	if err := auth.SaveConfigFile(configPath, cfg); err != nil {
+		log.Fatalf("save refreshed config: %v", err)
+	}
+	refreshedState, err := client.GetLoginState()
+	if err != nil {
+		log.Fatalf("validate refreshed login state: %v", err)
+	}
+	if !refreshedState.Valid {
+		log.Fatalf("refreshed login state is invalid")
+	}
+	log.Printf("mobile login confirmed; JWT length=%d user_id_len=%d config=%s",
+		len(token), len(refreshedState.UserID), configPath)
 }
 
 func doRefreshLogin(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) {

@@ -71,6 +71,7 @@ func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceI
 	cfg.GuestID = ""
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
+	cfg.Platform = 1
 	session, err := NewClient(&cfg).CreateGuest()
 	if err != nil {
 		return nil, identity, fmt.Errorf("create guest for unbound device: %w", err)
@@ -220,19 +221,18 @@ func ValidateCustomShareCode(code string) error {
 }
 
 // SharePassCodeSign returns the lowercase SHA-256 hex digest used by the guest
-// share upload-sign endpoint.
-func SharePassCodeSign(controlID, passCode string) string {
-	digest := sha256.Sum256([]byte(controlID + passCode))
+// share upload-sign endpoint for the pass code without push salt.
+func SharePassCodeSign(passCode string) string {
+	digest := sha256.Sum256([]byte(passCode))
 	return hex.EncodeToString(digest[:])
 }
 
 // SharePassCodeSignWithSalt returns the SHA-256 digest that incorporates the
-// server-provided salt from the remote-control push. The official flow uses
-// a challenge-response: the server sends a salt, the guest re-signs the pass
-// code with it, and the server validates the controller's submitted code
-// against that salted digest.
-func SharePassCodeSignWithSalt(controlID, salt, passCode string) string {
-	digest := sha256.Sum256([]byte(controlID + salt + passCode))
+// server-provided salt from the remote-control push. As verified from official
+// client disassembly, controlID is passed separately in the JSON body, and the
+// signature is SHA256(salt + passCode).
+func SharePassCodeSignWithSalt(salt, passCode string) string {
+	digest := sha256.Sum256([]byte(salt + passCode))
 	return hex.EncodeToString(digest[:])
 }
 
@@ -313,23 +313,13 @@ type GuestShareUploadSignRequest struct {
 // share authorization mode. The temporary code is signed in sign and the
 // custom code is signed in backup_sign.
 func NewGuestShareUploadSignRequest(controlID, temporaryCode, customCode string, mode ShareAuthMode) *GuestShareUploadSignRequest {
-	request := &GuestShareUploadSignRequest{
-		CanControl:       true,
-		ControlID:        controlID,
-		ControlMode:      mode.OfficialControlMode(),
-		NeedConfirmation: mode.NeedsConfirmation(),
-	}
-	if mode == ShareAuthTemporary || mode == ShareAuthBoth {
-		request.Sign = SharePassCodeSign(controlID, temporaryCode)
-	}
-	if mode == ShareAuthCustom || mode == ShareAuthBoth {
-		request.BackupSign = SharePassCodeSign(controlID, customCode)
-	}
-	return request
+	return NewGuestShareUploadSignRequestWithSalt(controlID, "", temporaryCode, customCode, mode)
 }
 
 // NewGuestShareUploadSignRequestWithSalt builds the upload-sign body using
-// the salted digest from the remote-control push.
+// the salted digest from the remote-control push. As verified from official
+// client disassembly, controlID is passed separately in the JSON body, and the
+// signature is SHA256(salt + passCode).
 func NewGuestShareUploadSignRequestWithSalt(controlID, salt, temporaryCode, customCode string, mode ShareAuthMode) *GuestShareUploadSignRequest {
 	request := &GuestShareUploadSignRequest{
 		CanControl:       true,
@@ -338,10 +328,10 @@ func NewGuestShareUploadSignRequestWithSalt(controlID, salt, temporaryCode, cust
 		NeedConfirmation: mode.NeedsConfirmation(),
 	}
 	if mode == ShareAuthTemporary || mode == ShareAuthBoth {
-		request.Sign = SharePassCodeSignWithSalt(controlID, salt, temporaryCode)
+		request.Sign = SharePassCodeSignWithSalt(salt, temporaryCode)
 	}
 	if mode == ShareAuthCustom || mode == ShareAuthBoth {
-		request.BackupSign = SharePassCodeSignWithSalt(controlID, salt, customCode)
+		request.BackupSign = SharePassCodeSignWithSalt(salt, customCode)
 	}
 	return request
 }
