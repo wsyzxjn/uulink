@@ -64,10 +64,11 @@ func main() {
 	forceRelay := flag.Bool("force-relay", false, "force WebRTC to use TURN relay only")
 	pckSweep := flag.Bool("pck-sweep", false, "sweep PCK.V3 channels with CONNECT frames after setup")
 	mixkcpMode := flag.Bool("mixkcp", false, "send PM frames over mix-kcp UDP to the ICE peer (raw frame format, crypto layout preserved)")
-	localPort := flag.Int("local", 0, "local port to listen on")
+	localPort := flag.String("local", "", "local port or port range to listen on (e.g. 8080 or 9000-9010)")
 	localHost := flag.String("local-host", "127.0.0.1", "local address to listen on")
 	remoteHost := flag.String("remote-host", "127.0.0.1", "remote target host")
-	remotePort := flag.Int("remote-port", 0, "remote target port")
+	remotePort := flag.String("remote-port", "", "remote target port or port range (e.g. 8080 or 9000-9010)")
+	mappingFlag := flag.String("mapping", "", "port forwarding rule or range (e.g. 8080:8080 or 9000-9010:8000-8010)")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
@@ -158,7 +159,7 @@ func main() {
 		log.Fatal("-guest-serve and -unbound-guest-serve cannot be combined")
 	}
 	if *unboundGuestServe {
-		rules, err := configuredRules(cfg, *ruleIDFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
@@ -170,7 +171,7 @@ func main() {
 		return
 	}
 	if *guestServe {
-		rules, err := configuredRules(cfg, *ruleIDFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
@@ -185,7 +186,7 @@ func main() {
 		if *deviceID != "" {
 			log.Fatal("-device cannot be combined with -serve; the server uses this config's device")
 		}
-		rules, err := configuredRules(cfg, *ruleIDFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
@@ -201,7 +202,7 @@ func main() {
 	if *roomFile == "" && !usesShareRoom && (targetDevID == "" || (targetDevID == cfg.DeviceID && !*allowSelf)) {
 		log.Fatal("target device must differ from this machine (use -device)")
 	}
-	rules, err := configuredRules(cfg, *ruleIDFlag, *localHost, *localPort, *remoteHost, *remotePort)
+	rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 	if err != nil {
 		log.Fatalf("configure mappings: %v", err)
 	}
@@ -912,17 +913,11 @@ func loadRoomFile(path string) (*api.RoomConnectionInfo, error) {
 	}, nil
 }
 
-func configuredRules(cfg *auth.Config, ruleIDFlag, localHost string, localPort int, remoteHost string, remotePort int) ([]tunnel.Rule, error) {
+func configuredRules(cfg *auth.Config, ruleIDFlag, mappingFlag, localHost, cliLocalPort, remoteHost, cliRemotePort string) ([]tunnel.Rule, error) {
 	var rules []tunnel.Rule
 	seen := make(map[string]bool)
 
 	appendRule := func(rule tunnel.Rule) error {
-		if rule.LocalHost == "" {
-			rule.LocalHost = "127.0.0.1"
-		}
-		if rule.TargetHost == "" {
-			rule.TargetHost = "127.0.0.1"
-		}
 		if rule.ID == "" {
 			rule.ID = generateRuleID()
 		}
@@ -941,32 +936,103 @@ func configuredRules(cfg *auth.Config, ruleIDFlag, localHost string, localPort i
 	}
 
 	for _, mapping := range cfg.Mappings {
-		if err := appendRule(tunnel.Rule{
-			ID:         mapping.RuleID,
-			LocalHost:  mapping.LocalHost,
-			LocalPort:  mapping.LocalPort,
-			TargetHost: mapping.RemoteHost,
-			TargetPort: mapping.RemotePort,
-		}); err != nil {
-			return nil, err
+		lHost := mapping.LocalHost
+		if lHost == "" {
+			lHost = "127.0.0.1"
+		}
+		rHost := mapping.RemoteHost
+		if rHost == "" {
+			rHost = "127.0.0.1"
+		}
+
+		var pairs []tunnel.PortPair
+		var err error
+		switch {
+		case mapping.Range != "":
+			pairs, err = tunnel.ParsePortMappingSpec(mapping.Range)
+		case mapping.LocalRange != "" || mapping.RemoteRange != "":
+			lSpec := mapping.LocalRange
+			if lSpec == "" && mapping.LocalPort != 0 {
+				lSpec = strconv.Itoa(mapping.LocalPort)
+			}
+			rSpec := mapping.RemoteRange
+			if rSpec == "" && mapping.RemotePort != 0 {
+				rSpec = strconv.Itoa(mapping.RemotePort)
+			}
+			pairs, err = tunnel.ExpandPortRange(lSpec, rSpec)
+		case mapping.LocalPort != 0 && mapping.RemotePort != 0:
+			pairs = []tunnel.PortPair{{LocalPort: mapping.LocalPort, RemotePort: mapping.RemotePort}}
+		default:
+			return nil, fmt.Errorf("mapping must specify local and remote ports or ranges")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("mapping rule: %w", err)
+		}
+
+		for _, pair := range pairs {
+			rID := mapping.RuleID
+			if len(pairs) > 1 {
+				rID = "" // generate unique numeric rule IDs across ranges
+			}
+			if err := appendRule(tunnel.Rule{
+				ID:         rID,
+				LocalHost:  lHost,
+				LocalPort:  pair.LocalPort,
+				TargetHost: rHost,
+				TargetPort: pair.RemotePort,
+			}); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	if localPort != 0 || remotePort != 0 {
-		if localPort == 0 || remotePort == 0 {
+	if mappingFlag != "" {
+		pairs, err := tunnel.ParsePortMappingSpec(mappingFlag)
+		if err != nil {
+			return nil, fmt.Errorf("-mapping: %w", err)
+		}
+		for _, pair := range pairs {
+			rID := ruleIDFlag
+			if len(pairs) > 1 {
+				rID = ""
+			}
+			if err := appendRule(tunnel.Rule{
+				ID:         rID,
+				LocalHost:  localHost,
+				LocalPort:  pair.LocalPort,
+				TargetHost: remoteHost,
+				TargetPort: pair.RemotePort,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if cliLocalPort != "" || cliRemotePort != "" {
+		if cliLocalPort == "" || cliRemotePort == "" {
 			return nil, fmt.Errorf("both -local and -remote-port are required for a command-line mapping")
 		}
 		if len(cfg.Mappings) > 0 && ruleIDFlag != "" {
 			return nil, fmt.Errorf("-rule-id cannot be applied globally when config mappings define their own rule_id")
 		}
-		if err := appendRule(tunnel.Rule{
-			ID:         ruleIDFlag,
-			LocalHost:  localHost,
-			LocalPort:  localPort,
-			TargetHost: remoteHost,
-			TargetPort: remotePort,
-		}); err != nil {
-			return nil, err
+		pairs, err := tunnel.ExpandPortRange(cliLocalPort, cliRemotePort)
+		if err != nil {
+			return nil, fmt.Errorf("cli port mapping: %w", err)
+		}
+		for _, pair := range pairs {
+			rID := ruleIDFlag
+			if len(pairs) > 1 {
+				rID = ""
+			}
+			if err := appendRule(tunnel.Rule{
+				ID:         rID,
+				LocalHost:  localHost,
+				LocalPort:  pair.LocalPort,
+				TargetHost: remoteHost,
+				TargetPort: pair.RemotePort,
+			}); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return rules, nil

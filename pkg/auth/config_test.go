@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -79,5 +80,31 @@ func TestEffectiveHostnameFallsBackToSystemHostname(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("EffectiveHostname() = %q, want %q", got, want)
+	}
+}
+
+func TestUnmarshalPortMappingFormats(t *testing.T) {
+	jsonBlob := `[
+		{"local_port": 8080, "remote_port": 8080},
+		{"local_port": "9000-9005", "remote_port": "8000-8005"},
+		{"range": "7000-7002:6000-6002"}
+	]`
+
+	var mappings []PortMapping
+	if err := json.Unmarshal([]byte(jsonBlob), &mappings); err != nil {
+		t.Fatalf("unmarshal port mappings: %v", err)
+	}
+
+	if len(mappings) != 3 {
+		t.Fatalf("len(mappings) = %d, want 3", len(mappings))
+	}
+	if mappings[0].LocalPort != 8080 || mappings[0].RemotePort != 8080 {
+		t.Errorf("mapping[0] = %+v", mappings[0])
+	}
+	if mappings[1].LocalRange != "9000-9005" || mappings[1].RemoteRange != "8000-8005" {
+		t.Errorf("mapping[1] = %+v", mappings[1])
+	}
+	if mappings[2].Range != "7000-7002:6000-6002" {
+		t.Errorf("mapping[2] = %+v", mappings[2])
 	}
 }

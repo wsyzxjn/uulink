@@ -105,6 +105,16 @@ Similarly, to forward an SSH service:
 ./uulink -device <TARGET_DEVICE_ID> -local 2222 -remote-port 22
 ```
 
+You can also forward consecutive port ranges or use the compact `-mapping` syntax:
+
+```bash
+# Map a port range 1-to-1 (e.g. 6 ports: 9000->8000, 9001->8001, ..., 9005->8005):
+./uulink -device <TARGET_DEVICE_ID> -local 9000-9005 -remote-port 8000-8005
+
+# Or with compact mapping flag:
+./uulink -device <TARGET_DEVICE_ID> -mapping 9000-9005:8000-8005
+```
+
 ### Method 2: Batch Mapping via Configuration File
 
 When managing multiple forwarded ports, specify them in the `mappings` section of `config.json`:
@@ -117,12 +127,11 @@ When managing multiple forwarded ports, specify them in the `mappings` section o
       "remote_port": 3389
     },
     {
-      "local_port": 2222,
-      "remote_port": 22
+      "local_port": "9000-9005",
+      "remote_port": "8000-8005"
     },
     {
-      "local_port": 8080,
-      "remote_port": 80
+      "range": "7000-7002:6000-6002"
     }
   ]
 }
@@ -216,10 +225,11 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-user-info` | Display current account user info | - |
 | `-serve` | Run in server mode waiting for controller connection | - |
 | `-device <id>` | Target remote device ID to connect to | config device_id |
-| `-local <port>` | Local port to listen on | - |
+| `-local <port/range>` | Local port or port range to listen on (e.g. `8080` or `9000-9010`) | - |
 | `-local-host <ip>` | Local address to bind to | `127.0.0.1` |
-| `-remote-port <port>` | Target port on remote host | - |
+| `-remote-port <port/range>` | Target port or port range (e.g. `8080` or `9000-9010`) | - |
 | `-remote-host <ip>` | Target host on remote end | `127.0.0.1` |
+| `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
 | `-force-relay` | Force WebRTC to use TURN relay only | off |
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |

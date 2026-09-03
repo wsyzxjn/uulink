@@ -114,6 +114,81 @@ func ParseAllowedPorts(s string) (map[int]bool, error) {
 	return ports, nil
 }
 
+// PortPair describes a matched local port and remote target port.
+type PortPair struct {
+	LocalPort  int
+	RemotePort int
+}
+
+// ParsePortRange parses either a single port ("8080") or a range ("9000-9010").
+func ParsePortRange(s string) (start, end int, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, fmt.Errorf("port is empty")
+	}
+	if strings.Contains(s, "-") {
+		parts := strings.SplitN(s, "-", 2)
+		startStr := strings.TrimSpace(parts[0])
+		endStr := strings.TrimSpace(parts[1])
+		start, err1 := strconv.Atoi(startStr)
+		end, err2 := strconv.Atoi(endStr)
+		if err1 != nil || err2 != nil || start <= 0 || end > 65535 || start > end {
+			return 0, 0, fmt.Errorf("invalid port range %q", s)
+		}
+		return start, end, nil
+	}
+	p, err := strconv.Atoi(s)
+	if err != nil || p <= 0 || p > 65535 {
+		return 0, 0, fmt.Errorf("invalid port %q", s)
+	}
+	return p, p, nil
+}
+
+// ExpandPortRange takes local and remote port specifications (single ports or ranges)
+// and expands them into matching 1-to-1 port pairs.
+// Examples:
+//   "8080", "8080" -> [{8080, 8080}]
+//   "9000-9005", "8000-8005" -> [{9000, 8000}, {9001, 8001}, ...]
+func ExpandPortRange(localSpec, remoteSpec string) ([]PortPair, error) {
+	localStart, localEnd, err := ParsePortRange(localSpec)
+	if err != nil {
+		return nil, fmt.Errorf("local port: %w", err)
+	}
+	remoteStart, remoteEnd, err := ParsePortRange(remoteSpec)
+	if err != nil {
+		return nil, fmt.Errorf("remote port: %w", err)
+	}
+
+	localCount := localEnd - localStart + 1
+	remoteCount := remoteEnd - remoteStart + 1
+	if localCount != remoteCount {
+		return nil, fmt.Errorf("local range has %d ports (%s) but remote range has %d ports (%s); ranges must be equal in length",
+			localCount, localSpec, remoteCount, remoteSpec)
+	}
+
+	pairs := make([]PortPair, localCount)
+	for i := 0; i < localCount; i++ {
+		pairs[i] = PortPair{
+			LocalPort:  localStart + i,
+			RemotePort: remoteStart + i,
+		}
+	}
+	return pairs, nil
+}
+
+// ParsePortMappingSpec parses a "LOCAL_SPEC:REMOTE_SPEC" mapping string into port pairs.
+// Examples:
+//   "8080:8080"
+//   "9000-9005:8000-8005"
+func ParsePortMappingSpec(spec string) ([]PortPair, error) {
+	spec = strings.TrimSpace(spec)
+	parts := strings.Split(spec, ":")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid mapping spec %q, want LOCAL_PORT:REMOTE_PORT or LOCAL_RANGE:REMOTE_RANGE", spec)
+	}
+	return ExpandPortRange(parts[0], parts[1])
+}
+
 func isValidTargetHost(host string) bool {
 	if host == "" || len(host) > maxTargetHostLen {
 		return false

@@ -7,12 +7,96 @@ import (
 )
 
 func TestConfiguredRulesAllowsInboundOnly(t *testing.T) {
-	rules, err := configuredRules(&auth.Config{}, "", "127.0.0.1", 0, "127.0.0.1", 0)
+	rules, err := configuredRules(&auth.Config{}, "", "", "127.0.0.1", "", "127.0.0.1", "")
 	if err != nil {
 		t.Fatalf("configuredRules inbound-only: %v", err)
 	}
 	if len(rules) != 0 {
 		t.Fatalf("inbound-only rules = %v, want none", rules)
+	}
+}
+
+func TestConfiguredRulesSinglePort(t *testing.T) {
+	rules, err := configuredRules(&auth.Config{}, "101", "", "127.0.0.1", "8080", "127.0.0.1", "18080")
+	if err != nil {
+		t.Fatalf("configuredRules single port: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("len(rules) = %d, want 1", len(rules))
+	}
+	if rules[0].LocalPort != 8080 || rules[0].TargetPort != 18080 || rules[0].ID != "101" {
+		t.Errorf("rule[0] = %+v", rules[0])
+	}
+}
+
+func TestConfiguredRulesPortRange(t *testing.T) {
+	rules, err := configuredRules(&auth.Config{}, "", "", "127.0.0.1", "9000-9002", "127.0.0.1", "8000-8002")
+	if err != nil {
+		t.Fatalf("configuredRules port range: %v", err)
+	}
+	if len(rules) != 3 {
+		t.Fatalf("len(rules) = %d, want 3", len(rules))
+	}
+	expected := []struct{ local, remote int }{
+		{9000, 8000},
+		{9001, 8001},
+		{9002, 8002},
+	}
+	for i, exp := range expected {
+		if rules[i].LocalPort != exp.local || rules[i].TargetPort != exp.remote {
+			t.Errorf("rule[%d] = %+v, want local %d -> remote %d", i, rules[i], exp.local, exp.remote)
+		}
+	}
+}
+
+func TestConfiguredRulesMappingFlag(t *testing.T) {
+	rules, err := configuredRules(&auth.Config{}, "", "5000-5001:6000-6001", "127.0.0.1", "", "127.0.0.1", "")
+	if err != nil {
+		t.Fatalf("configuredRules -mapping: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("len(rules) = %d, want 2", len(rules))
+	}
+	if rules[0].LocalPort != 5000 || rules[0].TargetPort != 6000 {
+		t.Errorf("rule[0] = %+v", rules[0])
+	}
+	if rules[1].LocalPort != 5001 || rules[1].TargetPort != 6001 {
+		t.Errorf("rule[1] = %+v", rules[1])
+	}
+}
+
+func TestConfiguredRulesConfigRange(t *testing.T) {
+	cfg := &auth.Config{
+		Mappings: []auth.PortMapping{
+			{LocalRange: "7000-7001", RemoteRange: "8000-8001"},
+			{Range: "9000-9001:10000-10001"},
+		},
+	}
+	rules, err := configuredRules(cfg, "", "", "127.0.0.1", "", "127.0.0.1", "")
+	if err != nil {
+		t.Fatalf("configuredRules config ranges: %v", err)
+	}
+	if len(rules) != 4 {
+		t.Fatalf("len(rules) = %d, want 4", len(rules))
+	}
+	if rules[0].LocalPort != 7000 || rules[0].TargetPort != 8000 {
+		t.Errorf("rule[0] = %+v", rules[0])
+	}
+	if rules[1].LocalPort != 7001 || rules[1].TargetPort != 8001 {
+		t.Errorf("rule[1] = %+v", rules[1])
+	}
+	if rules[2].LocalPort != 9000 || rules[2].TargetPort != 10000 {
+		t.Errorf("rule[2] = %+v", rules[2])
+	}
+	if rules[3].LocalPort != 9001 || rules[3].TargetPort != 10001 {
+		t.Errorf("rule[3] = %+v", rules[3])
+	}
+}
+
+func TestConfiguredRulesRangeMismatchError(t *testing.T) {
+	_, err := configuredRules(&auth.Config{}, "", "", "127.0.0.1", "9000-9005", "127.0.0.1", "8000-8002")
+	if err == nil {
+		t.Fatal("expected error on range length mismatch, got nil")
 	}
 }
 
