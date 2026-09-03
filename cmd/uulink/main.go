@@ -23,6 +23,7 @@ import (
 
 	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
+	"github.com/user/uulink/pkg/logging"
 	"github.com/user/uulink/pkg/peer"
 	"github.com/user/uulink/pkg/signaling"
 	"github.com/user/uulink/pkg/tunnel"
@@ -63,7 +64,16 @@ func main() {
 	localHost := flag.String("local-host", "127.0.0.1", "local address to listen on")
 	remoteHost := flag.String("remote-host", "127.0.0.1", "remote target host")
 	remotePort := flag.Int("remote-port", 0, "remote target port")
+	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
+	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
+	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
 	flag.Parse()
+
+	parsedLogLevel, err := logging.ParseLevel(*logLevel)
+	if err != nil {
+		log.Fatalf("parse log level: %v", err)
+	}
+	logging.SetLevel(parsedLogLevel)
 
 	authMode, err := api.ParseShareAuthMode(*shareAuthMode)
 	if err != nil {
@@ -78,6 +88,11 @@ func main() {
 	cfg, err := auth.LoadConfigFile(*configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+
+	secPolicy, err := buildSecurityPolicy(cfg, *allowLAN, *allowedPortsFlag)
+	if err != nil {
+		log.Fatalf("configure security policy: %v", err)
 	}
 
 	client := api.NewClient(cfg)
@@ -139,7 +154,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		})
+		}, secPolicy)
 		return
 	}
 	if *guestServe {
@@ -151,7 +166,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		})
+		}, secPolicy)
 		return
 	}
 	if *serveMode {
@@ -162,7 +177,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
-		doServe(client, cfg, rules, *roomFile, *forceRelay)
+		doServe(client, cfg, rules, *roomFile, *forceRelay, secPolicy)
 		return
 	}
 
@@ -183,64 +198,46 @@ func main() {
 	var room *api.RoomConnectionInfo
 	controllerAppControlID := ""
 	if *shareJoin || *shareConfirmation {
-		log.Printf("using configured controller device_id=%s client_id_len=%d", cfg.DeviceID, len(cfg.ClientID))
+		logging.Infof("joining share room as controller")
 	}
 	switch {
 	case *shareConfirmation:
-		log.Println("joining room by confirmation...")
 		if *shareControlID == "" {
-			controlMode, controlModeErr := client.GetShareControlMode(*shareID)
+			_, controlModeErr := client.GetShareControlMode(*shareID)
 			if controlModeErr != nil {
-				log.Printf("share control mode query failed: %v", controlModeErr)
-			} else {
-				log.Printf("share control mode response keys=%v", mapKeys(controlMode))
-				if data, ok := controlMode["data"].(map[string]any); ok {
-					for key, value := range data {
-						if text, ok := value.(string); ok {
-							log.Printf("share control mode field=%s length=%d", key, len(text))
-						}
-					}
-				}
+				logging.Debugf("share control mode query failed: %v", controlModeErr)
 			}
 		}
 		controlID := *shareControlID
 		if *shareControlID != "" {
-			log.Printf("using explicit share control_id=%s", controlID)
+			logging.Debugf("using explicit share control_id=%s", controlID)
 		} else {
 			var err error
 			controlID, err = generateAppControlID()
 			if err != nil {
 				log.Fatalf("generate share control id: %v", err)
 			}
-			log.Printf("generated share control_id_length=%d", len(controlID))
+			logging.Debugf("generated share control_id_length=%d", len(controlID))
 		}
 		controllerAppControlID = controlID
 		room, err = client.JoinRoomByConfirmation(*shareID, controlID)
 		if err != nil {
 			if responseErr, ok := err.(*api.ResponseError); ok {
 				data, _ := responseErr.Response["data"].(map[string]any)
-				log.Printf("join room by confirmation error data keys=%v", mapKeys(data))
-				for key, value := range data {
-					log.Printf("join room by confirmation error field=%s type=%T", key, value)
-				}
+				logging.Debugf("join room by confirmation error data keys=%v", mapKeys(data))
 			}
 			log.Fatalf("join room by confirmation: %v", err)
 		}
 	case *shareJoin:
-		log.Println("joining room by share code...")
 		room, err = client.JoinRoomByShareCode(*shareID, *shareCode)
 		if err != nil {
 			if responseErr, ok := err.(*api.ResponseError); ok {
 				data, _ := responseErr.Response["data"].(map[string]any)
-				log.Printf("join room by share code error data keys=%v", mapKeys(data))
-				for key, value := range data {
-					log.Printf("join room by share code error field=%s type=%T", key, value)
-				}
+				logging.Debugf("join room by share code error data keys=%v", mapKeys(data))
 			}
 			log.Fatalf("join share room: %v", err)
 		}
 	case *shareGuest:
-		log.Println("joining room by share code with a guest identity...")
 		guestSession, guestErr := client.CreateGuest()
 		if guestErr != nil {
 			log.Fatalf("create guest: %v", guestErr)
@@ -254,20 +251,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("load room file: %v", err)
 		}
-		log.Printf("loaded room from %s", *roomFile)
+		logging.Debugf("loaded room from %s", *roomFile)
 		// The room-file controller reuses the guest's signaling token. The
 		// passive peer skips the controller-role events that the gateway
 		// rejects for this token, while Controlling=true prevents the gateway
 		// from treating the second connection as a duplicate controlled session.
 		room.IsRoomFileController = true
 	default:
-		log.Printf("joining room for device %s...", targetDevID)
+		logging.Infof("joining remote device %s", targetDevID)
 		room, err = client.JoinRoomByDevice(targetDevID, false)
 		if err != nil {
 			log.Fatalf("join room: %v", err)
 		}
 	}
-	log.Printf("signaling_server=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
+	logging.Debugf("signaling server=%s gateways=%d", room.SignalingServer, len(room.SignalingList))
 
 	gateway := room.SignalingServer
 	if gateway == "" && len(room.SignalingList) > 0 {
@@ -275,7 +272,7 @@ func main() {
 	}
 
 	// Step 2: connect to signaling gateway
-	log.Printf("connecting to signaling gateway %s...", gateway)
+	logging.Debugf("connecting to signaling gateway %s", gateway)
 	sig, err := signaling.Connect(&signaling.ConnectConfig{
 		GatewayURL:  gateway,
 		NRDAuth:     room.Token,
@@ -290,7 +287,7 @@ func main() {
 	select {
 	case <-sig.NamespaceConnected():
 	case <-time.After(5 * time.Second):
-		log.Println("warning: namespace connect timeout")
+		logging.Warnf("signaling namespace connect timeout")
 	case <-sig.Done():
 		log.Fatal("signaling closed")
 	}
@@ -298,7 +295,7 @@ func main() {
 	// Log forward_setting events (server pushes these after answer)
 	sig.On("forward_setting", func(ev *signaling.Event) {
 		if len(ev.Args) > 0 {
-			log.Printf("[signaling] forward_setting: %s", string(ev.Args[0])[:min(400, len(string(ev.Args[0])))])
+			logging.Debugf("[signaling] forward_setting received (%d bytes)", len(ev.Args[0]))
 		}
 	})
 
@@ -306,18 +303,17 @@ func main() {
 		if err := peer.CapOverride(*capFlag); err != nil {
 			log.Fatalf("cap override: %v", err)
 		}
-		log.Printf("capability blob overridden: %s", *capFlag)
+		logging.Debugf("capability blob overridden: %s", *capFlag)
 	}
 	debugRule := rules[0]
 	ruleID := debugRule.ID
 
 	// Step 4: control handshake (gets client_id, ice_id, TURN servers)
-	log.Println("sending control event...")
 	var tun *tunnel.Tunnel
 	peerDeviceID := cfg.DeviceID
 	if *controlDeviceID != "" {
 		peerDeviceID = *controlDeviceID
-		log.Printf("control ConnectOptions device_id=%s (auth device_id=%s)", peerDeviceID, cfg.DeviceID)
+		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
 	}
 	p, err := peer.NewController(&peer.Config{
 		Signal:       sig,
@@ -326,8 +322,6 @@ func main() {
 		Passive:      room.IsRoomFileController,
 		ForceRelay:   *forceRelay,
 		OnSignalData: func(data []byte) {
-			// Port mapping frames arrive on the room's pb channel
-			log.Printf("[pb-recv] %s", truncateStr(string(data), 200))
 			if tun != nil {
 				tun.HandleMessage(data)
 			}
@@ -338,18 +332,23 @@ func main() {
 	defer p.Close()
 
 	// Step 5: create PeerConnection + data channels + send soac offer
-	log.Println("creating WebRTC offer...")
 	if err := p.Connect(nil); err != nil {
 		log.Fatalf("peer connect: %v", err)
 	}
 
 	// Step 6: start the local listener once the PM data channel is ready.
 	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p, sig: sig})
+	tun.SetSecurityPolicy(secPolicy)
 	p.OnFileChannelOpen(func() {
-		if err := tun.Start(); err != nil {
-			log.Fatalf("start tunnel: %v", err)
+		if len(rules) > 0 {
+			if err := tun.Start(); err != nil {
+				log.Fatalf("start tunnel: %v", err)
+			}
+			logActiveMappings("port forwarding active", rules)
+		} else {
+			logging.Infof("inbound port mapping active (no local listeners configured)")
 		}
-		logActiveMappings("port forwarding active", rules)
+		logSecurityPolicy(secPolicy)
 	})
 	defer tun.Stop()
 
@@ -364,18 +363,18 @@ func main() {
 		go func() {
 			<-readyCh
 			time.Sleep(500 * time.Millisecond)
-			log.Println("[pck] replicating channel setup")
+			logging.Debugf("[pck] replicating channel setup")
 			// session setup kinds 1,2 then register chans 3,4 like the official client
 			if err := p.SendSignalPB(tunnel.BuildSessionSetup(1)); err != nil {
-				log.Printf("[pck] setup1 error: %v", err)
+				logging.Errorf("[pck] setup1 error: %v", err)
 			}
 			if err := p.SendSignalPB(tunnel.BuildSessionSetup(2)); err != nil {
-				log.Printf("[pck] setup2 error: %v", err)
+				logging.Errorf("[pck] setup2 error: %v", err)
 			}
 			time.Sleep(300 * time.Millisecond)
 			for _, ch := range []uint32{3, 4} {
 				if err := p.SendSignalPB(tunnel.BuildRegistration(ch)); err != nil {
-					log.Printf("[pck] reg %d error: %v", ch, err)
+					logging.Errorf("[pck] reg %d error: %v", ch, err)
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
@@ -383,37 +382,36 @@ func main() {
 			for targetChan := uint32(0); targetChan <= 20; targetChan++ {
 				frame, err := tunnel.BuildConnectPCK(targetChan, ruleID, "1", debugRule.TargetHost, debugRule.TargetPort)
 				if err != nil {
-					log.Printf("[pck] build CONNECT error: %v", err)
+					logging.Errorf("[pck] build CONNECT error: %v", err)
 					continue
 				}
 				if err := p.SendSignalPB(frame); err != nil {
-					log.Printf("[pck] target chan %d send error: %v", targetChan, err)
+					logging.Errorf("[pck] target chan %d send error: %v", targetChan, err)
 					continue
 				}
-				log.Printf("[pck] CONNECT sent on target chan %d, waiting 2s", targetChan)
+				logging.Debugf("[pck] CONNECT sent on target chan %d", targetChan)
 				time.Sleep(2 * time.Second)
 			}
-			log.Println("[pck] sweep done")
+			logging.Debugf("[pck] sweep done")
 		}()
 	}
 
-	logActiveMappings("port forwarding configured", rules)
-	log.Println("waiting for WebRTC connection... press Ctrl+C to stop")
+	logging.Infof("waiting for WebRTC connection")
 
 	if *mixkcpMode {
 		p.OnICEConnected(func() {
 			peerAddr := firstHostCandidate(p.RemoteCandidates())
 			if peerAddr == nil {
-				log.Printf("[mixkcp] no host candidate from remote, cannot send")
+				logging.Errorf("[mixkcp] no host candidate from remote, cannot send")
 				return
 			}
 			sender, err := mixsend.NewSender(peerAddr)
 			if err != nil {
-				log.Printf("[mixkcp] sender: %v", err)
+				logging.Errorf("[mixkcp] sender: %v", err)
 				return
 			}
 			defer sender.Close()
-			log.Printf("[mixkcp] sending CONNECT to %s (rule %s, target %s:%d)",
+			logging.Debugf("[mixkcp] sending CONNECT to %s (rule %s, target %s:%d)",
 				peerAddr, ruleID, debugRule.TargetHost, debugRule.TargetPort)
 
 			// CONNECT payload: the PM JSON message (wire format per findings 9.8;
@@ -423,10 +421,10 @@ func main() {
 				time.Now().Unix(), ruleID, base64.StdEncoding.EncodeToString(
 					[]byte(fmt.Sprintf(`{"version":1,"target_port":%d,"target_host":"%s"}`, debugRule.TargetPort, debugRule.TargetHost))))
 			if err := sender.SendPMFrame(0x43, []byte(connectJSON)); err != nil {
-				log.Printf("[mixkcp] send CONNECT: %v", err)
+				logging.Errorf("[mixkcp] send CONNECT: %v", err)
 				return
 			}
-			log.Printf("[mixkcp] CONNECT frame sent, payload json: %s", connectJSON)
+			logging.Debugf("[mixkcp] CONNECT frame sent (%d bytes)", len(connectJSON))
 
 			// wait for a possible SYN_ACK (honest no-response state recorded)
 			senderDeadline := time.Now().Add(10 * time.Second)
@@ -434,12 +432,12 @@ func main() {
 				sender.SetReadDeadline(senderDeadline)
 				f, err := sender.ReceivePMFrame()
 				if err != nil {
-					log.Printf("[mixkcp] no SYN_ACK received within deadline: %v", err)
+					logging.Debugf("[mixkcp] no SYN_ACK received within deadline: %v", err)
 					return
 				}
-				log.Printf("[mixkcp] inbound frame cmd=%#x session=%s", f.Cmd, hex.EncodeToString(f.Session))
+				logging.Debugf("[mixkcp] inbound frame cmd=%#x", f.Cmd)
 				if f.Cmd == 0x5d {
-					log.Printf("[mixkcp] SYN_ACK-like frame received: %s", hex.EncodeToString(f.Build()))
+					logging.Debugf("[mixkcp] SYN_ACK-like frame received")
 				}
 			}
 		})
@@ -447,14 +445,14 @@ func main() {
 
 	sig.On("bmsg_push", func(ev *signaling.Event) {
 		if len(ev.Args) > 0 {
-			log.Printf("[signaling] bmsg_push: %s", truncate(string(ev.Args[0]), 150))
+			logging.Debugf("[signaling] bmsg_push received (%d bytes)", len(ev.Args[0]))
 		}
 	})
 	sig.On("peerConnected", func(ev *signaling.Event) {
-		log.Printf("[signaling] peer connected!")
+		logging.Infof("peer connected")
 	})
 	sig.On("peerError", func(ev *signaling.Event) {
-		log.Printf("[signaling] peer error: %s", truncate(string(ev.Args[0]), 150))
+		logging.Errorf("peer error: %s", truncate(string(ev.Args[0]), 150))
 	})
 
 	interrupt := make(chan os.Signal, 1)
@@ -462,18 +460,18 @@ func main() {
 
 	select {
 	case <-interrupt:
-		log.Println("interrupted, shutting down...")
+		logging.Infof("interrupted, shutting down")
 	case <-sig.Done():
-		log.Println("signaling connection closed, shutting down...")
+		logging.Infof("signaling connection closed, shutting down")
 	}
 }
 
-func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool) {
+func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, policy tunnel.SecurityPolicy) {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		log.Fatalf("resolve hostname: %v", err)
 	}
-	log.Printf("registering controlled device %q...", hostname)
+	logging.Debugf("registering controlled device %q", hostname)
 	if _, err := client.InitMacDevice(hostname); err != nil {
 		log.Fatalf("register controlled device: %v", err)
 	}
@@ -481,12 +479,12 @@ func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile
 		log.Fatalf("enable controlled device: %v", err)
 	}
 
-	log.Println("creating room (controlled/server mode)...")
+	logging.Debugf("creating controlled room")
 	room, err := client.CreateRoom()
 	if err != nil {
 		log.Fatalf("create room: %v", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, nil, forceRelay, guestShareOptions{})
+	serveRoom(client, cfg, rules, room, roomFile, nil, forceRelay, guestShareOptions{}, policy)
 }
 
 type guestShareOptions struct {
@@ -495,8 +493,7 @@ type guestShareOptions struct {
 	CustomCode string
 }
 
-func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions) {
-	log.Println("creating guest-controlled room...")
+func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
 	session, err := client.CreateGuest()
 	if err != nil {
 		log.Fatalf("create guest: %v", err)
@@ -505,12 +502,10 @@ func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roo
 	if err != nil {
 		log.Fatalf("create guest room: %v", err)
 	}
-	log.Printf("guest room created: signaling=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
-	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions)
+	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy)
 }
 
-func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions) {
-	log.Println("registering a new accountless device and creating a guest session...")
+func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		log.Fatalf("resolve hostname: %v", err)
@@ -521,21 +516,16 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	}
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
-	log.Printf("unbound guest identity: client_id=%s device_id=%s guest_id=%s",
-		identity.ClientID, identity.DeviceID, session.GuestID)
+	logging.Debugf("unbound guest identity created")
 
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
 		log.Fatalf("create guest room: %v", err)
 	}
-	log.Printf("guest room created: signaling=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
-	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions)
+	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy)
 }
 
-func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, forceRelay bool, shareOptions guestShareOptions) {
-	log.Printf("signaling_server=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
-	log.Printf("server device_id=%s", cfg.DeviceID)
-	logActiveMappings("server mappings configured", rules)
+func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
 	if roomFile != "" {
 		roomInfoFile := roomFile
 		if guestSession != nil {
@@ -544,14 +534,14 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		if err := saveRoomFile(roomInfoFile, room); err != nil {
 			log.Fatalf("save room file: %v", err)
 		}
-		log.Printf("saved room connection info to %s", roomInfoFile)
+		logging.Debugf("saved room connection info to %s", roomInfoFile)
 	}
 
 	gateway := room.SignalingServer
 	if gateway == "" && len(room.SignalingList) > 0 {
 		gateway = room.SignalingList[0]
 	}
-	log.Printf("connecting to signaling gateway %s...", gateway)
+	logging.Debugf("connecting to signaling gateway %s", gateway)
 	sig, err := signaling.Connect(&signaling.ConnectConfig{
 		GatewayURL:  gateway,
 		NRDAuth:     room.Token,
@@ -606,24 +596,24 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(ev.Args[0], &push); err != nil {
-			log.Printf("[signaling] controlled bmsg_push parse error: %v", err)
+			logging.Errorf("[signaling] controlled bmsg_push parse error: %v", err)
 			return
 		}
 
 		if guestSession != nil && push.Type == "remote_control" {
 			if push.Data.ControlID == "" {
-				log.Printf("remote control push has no control_id (salt_length=%d)", len(push.Data.Salt))
+				logging.Warnf("remote control push has no control_id")
 				return
 			}
 			updatedShare, err := uploadGuestShareCode(client, guestSession, share, push.Data.ControlID, push.Data.Salt, shareOptions)
 			if err != nil {
-				log.Printf("upload remote-control guest share sign failed: %v", err)
+				logging.Errorf("upload remote-control guest share sign failed: %v", err)
 				return
 			}
 			share = updatedShare
 			if roomFile != "" {
 				if err := saveGuestShareFile(roomFile, share); err != nil {
-					log.Printf("update remote-control guest share file failed: %v", err)
+					logging.Errorf("update remote-control guest share file failed: %v", err)
 				}
 			}
 			_, err = client.GuestShareConfirmation(guestSession, &api.GuestShareConfirmationRequest{
@@ -632,42 +622,41 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 				NeedPassword: shareOptions.AuthMode != api.ShareAuthCustom,
 			})
 			if err != nil {
-				log.Printf("confirm remote control failed: %v", err)
+				logging.Errorf("confirm remote control failed: %v", err)
 				return
 			}
-			log.Printf("remote control confirmed: control_id_length=%d salt_length=%d",
-				len(push.Data.ControlID), len(push.Data.Salt))
+			logging.Infof("remote control confirmed")
 			return
 		}
 
 		if push.Type == "get_control_mode" {
-			log.Printf("[signaling] get_control_mode payload: %s", truncate(string(ev.Args[0]), 1000))
+			logging.Debugf("get_control_mode received")
 			if guestSession != nil && push.Data.ControlID != "" {
 				updatedShare, err := uploadGuestShareCode(client, guestSession, share, push.Data.ControlID, push.Data.Salt, shareOptions)
 				if err != nil {
-					log.Printf("upload pushed guest share sign failed: %v", err)
+					logging.Errorf("upload pushed guest share sign failed: %v", err)
 					return
 				}
 				share = updatedShare
 				controlModeRequest := api.NewGuestShareUploadControlModeRequest(push.Data.ControlID, true, shareOptions.AuthMode)
 				if _, err := client.GuestShareUploadControlMode(guestSession, controlModeRequest); err != nil {
-					log.Printf("upload pushed control mode failed: %v", err)
+					logging.Errorf("upload pushed control mode failed: %v", err)
 				} else {
-					log.Printf("uploaded pushed control mode: control_id_length=%d", len(push.Data.ControlID))
+					logging.Debugf("uploaded pushed control mode")
 				}
 				share.ControlID = push.Data.ControlID
 				if roomFile != "" {
 					if err := saveGuestShareFile(roomFile, share); err != nil {
-						log.Printf("update guest share control_id file failed: %v", err)
+						logging.Errorf("update guest share control_id file failed: %v", err)
 					} else {
-						log.Printf("updated guest share control_id file: control_id_length=%d", len(push.Data.ControlID))
+						logging.Debugf("updated guest share control_id file")
 					}
 				}
 			}
 			return
 		}
 
-		log.Printf("[signaling] controlled bmsg_push type=%q", push.Type)
+		logging.Debugf("[signaling] controlled bmsg_push type=%q", push.Type)
 	})
 
 	if guestSession != nil {
@@ -675,16 +664,15 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			if err := saveGuestShareFile(roomFile, share); err != nil {
 				log.Fatalf("save guest share file: %v", err)
 			}
-			log.Printf("saved guest share info to %s", roomFile)
+			logging.Debugf("saved guest share info to %s", roomFile)
 		}
-		log.Printf("guest share ready: connect_id=%s code_length=%d", share.ConnectID, len(share.ConnectCode))
+		logging.Infof("guest share ready: connect_id=%s code_length=%d", share.ConnectID, len(share.ConnectCode))
 	}
 
 	var tun *tunnel.Tunnel
 	p, err := peer.NewControlled(&peer.Config{
 		Signal: sig,
 		OnSignalData: func(data []byte) {
-			log.Printf("[pb-recv] %s", truncateStr(string(data), 200))
 			if tun != nil {
 				tun.HandleMessage(data)
 			}
@@ -697,23 +685,25 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 
 	if room.ReportURL != "" && room.ReportToken != "" {
 		if _, err := client.ReportIP(room); err != nil {
-			log.Printf("report relay IP: %v", err)
-		} else {
-			log.Printf("reported relay IP")
+			logging.Debugf("report relay IP: %v", err)
 		}
 		if _, err := client.ReportEchoServers(room); err != nil {
-			log.Printf("report relay echo servers: %v", err)
-		} else {
-			log.Printf("reported relay echo servers")
+			logging.Debugf("report relay echo servers: %v", err)
 		}
 	}
 
 	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p, sig: sig})
+	tun.SetSecurityPolicy(policy)
 	p.OnFileChannelOpen(func() {
-		if err := tun.Start(); err != nil {
-			log.Fatalf("start tunnel: %v", err)
+		if len(rules) > 0 {
+			if err := tun.Start(); err != nil {
+				log.Fatalf("start tunnel: %v", err)
+			}
+			logActiveMappings("reverse port forwarding active", rules)
+		} else {
+			logging.Infof("inbound port mapping active (no reverse mappings configured)")
 		}
-		logActiveMappings("reverse port forwarding active", rules)
+		logSecurityPolicy(policy)
 	})
 	defer tun.Stop()
 
@@ -721,9 +711,9 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case <-interrupt:
-		log.Println("interrupted, shutting down...")
+		logging.Infof("interrupted, shutting down")
 	case <-sig.Done():
-		log.Println("signaling connection closed, shutting down...")
+		logging.Infof("signaling connection closed, shutting down")
 	}
 }
 
@@ -780,7 +770,7 @@ func ensureGuestShareCode(client *api.Client, session *api.GuestSession, share *
 	if refreshed.ConnectCode != "" {
 		temporaryCode = refreshed.ConnectCode
 	}
-	log.Printf("guest share code refresh: uploaded_len=%d returned_len=%d changed=%v",
+	logging.Debugf("guest share code refresh: uploaded_len=%d returned_len=%d changed=%v",
 		len(uploadedCode), len(refreshed.ConnectCode), refreshed.ConnectCode != uploadedCode)
 	refreshed.ConnectID = share.ConnectID
 	refreshed.TemporaryCode = temporaryCode
@@ -815,7 +805,7 @@ func uploadGuestShareCode(client *api.Client, session *api.GuestSession, share *
 	var request *api.GuestShareUploadSignRequest
 	if salt != "" {
 		request = api.NewGuestShareUploadSignRequestWithSalt(controlID, salt, temporaryCode, customCode, shareOptions.AuthMode)
-		log.Printf("uploading salted guest share sign: control_id_len=%d salt_len=%d", len(controlID), len(salt))
+		logging.Debugf("uploading salted guest share sign: control_id_len=%d salt_len=%d", len(controlID), len(salt))
 	} else {
 		request = api.NewGuestShareUploadSignRequest(controlID, temporaryCode, customCode, shareOptions.AuthMode)
 	}
@@ -833,7 +823,7 @@ func uploadGuestShareCode(client *api.Client, session *api.GuestSession, share *
 	if refreshed.ConnectCode != "" {
 		temporaryCode = refreshed.ConnectCode
 	}
-	log.Printf("pushed guest share code refresh: uploaded_len=%d returned_len=%d changed=%v",
+	logging.Debugf("pushed guest share code refresh: uploaded_len=%d returned_len=%d changed=%v",
 		len(uploadedCode), len(refreshed.ConnectCode), refreshed.ConnectCode != uploadedCode)
 	refreshed.ConnectID = share.ConnectID
 	refreshed.TemporaryCode = temporaryCode
@@ -967,7 +957,7 @@ func configuredRules(cfg *auth.Config, ruleIDFlag, localHost string, localPort i
 
 func logActiveMappings(prefix string, rules []tunnel.Rule) {
 	for _, rule := range rules {
-		log.Printf("%s: %s:%d -> peer-target %s:%d (rule %s)",
+		logging.Infof("%s: %s:%d -> peer-target %s:%d (rule %s)",
 			prefix, rule.LocalHost, rule.LocalPort, rule.TargetHost, rule.TargetPort, rule.ID)
 	}
 }
@@ -1294,10 +1284,6 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func truncateStr(s string, n int) string {
-	return truncate(s, n)
-}
-
 func hexPreview(data []byte, n int) string {
 	if len(data) > n {
 		data = data[:n]
@@ -1340,4 +1326,43 @@ func firstHostCandidate(cands []string) *net.UDPAddr {
 		}
 	}
 	return nil
+}
+
+func buildSecurityPolicy(cfg *auth.Config, allowLAN bool, allowedPortsFlag string) (tunnel.SecurityPolicy, error) {
+	policy := tunnel.SecurityPolicy{
+		AllowLAN: allowLAN || cfg.AllowLAN,
+	}
+	if allowedPortsFlag != "" {
+		ports, err := tunnel.ParseAllowedPorts(allowedPortsFlag)
+		if err != nil {
+			return tunnel.SecurityPolicy{}, fmt.Errorf("parse -allowed-ports: %w", err)
+		}
+		policy.AllowedPorts = ports
+	} else if len(cfg.AllowedPorts) > 0 {
+		ports := make(map[int]bool, len(cfg.AllowedPorts))
+		for _, p := range cfg.AllowedPorts {
+			if p <= 0 || p > 65535 {
+				return tunnel.SecurityPolicy{}, fmt.Errorf("config allowed_ports: invalid port %d", p)
+			}
+			ports[p] = true
+		}
+		policy.AllowedPorts = ports
+	}
+	return policy, nil
+}
+
+func logSecurityPolicy(policy tunnel.SecurityPolicy) {
+	if policy.AllowLAN {
+		logging.Warnf("security policy: LAN/WAN target access enabled (-allow-lan)")
+	} else {
+		logging.Infof("security policy: target restricted to loopback (localhost/127.0.0.1)")
+	}
+	if len(policy.AllowedPorts) > 0 {
+		ports := make([]int, 0, len(policy.AllowedPorts))
+		for p := range policy.AllowedPorts {
+			ports = append(ports, p)
+		}
+		sort.Ints(ports)
+		logging.Infof("security policy: allowed target ports whitelist: %v", ports)
+	}
 }

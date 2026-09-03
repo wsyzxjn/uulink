@@ -10,13 +10,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/user/uulink/pkg/logging"
 	"github.com/user/uulink/pkg/proto/gvpb"
 )
 
@@ -39,15 +40,86 @@ const SessionID = "1"
 
 const connectTimeout = 10 * time.Second
 
+// SecurityPolicy defines inbound dial restrictions for CONNECT frames.
+type SecurityPolicy struct {
+	AllowLAN     bool
+	AllowedPorts map[int]bool // nil or empty allows all ports on permitted hosts
+}
+
+// ValidateTarget checks whether target host and port are permitted.
+func (p SecurityPolicy) ValidateTarget(host string, port int) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid port %d", port)
+	}
+	if !p.AllowLAN && !isLoopbackHost(host) {
+		return fmt.Errorf("non-loopback target host %q is blocked by default (enable -allow-lan to permit)", host)
+	}
+	if len(p.AllowedPorts) > 0 && !p.AllowedPorts[port] {
+		return fmt.Errorf("target port %d is not in allowed ports whitelist", port)
+	}
+	return nil
+}
+
+// ParseAllowedPorts parses a comma-separated list of ports or port ranges.
+// Examples: "8080", "22,80,443", "8000-8010,9000"
+func ParseAllowedPorts(s string) (map[int]bool, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	ports := make(map[int]bool)
+	parts := strings.Split(s, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			rangeParts := strings.SplitN(part, "-", 2)
+			startStr := strings.TrimSpace(rangeParts[0])
+			endStr := strings.TrimSpace(rangeParts[1])
+			start, err1 := strconv.Atoi(startStr)
+			end, err2 := strconv.Atoi(endStr)
+			if err1 != nil || err2 != nil || start <= 0 || end > 65535 || start > end {
+				return nil, fmt.Errorf("invalid port range %q", part)
+			}
+			for p := start; p <= end; p++ {
+				ports[p] = true
+			}
+		} else {
+			p, err := strconv.Atoi(part)
+			if err != nil || p <= 0 || p > 65535 {
+				return nil, fmt.Errorf("invalid port %q", part)
+			}
+			ports[p] = true
+		}
+	}
+	return ports, nil
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	h = strings.Trim(h, "[]")
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	if ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // Tunnel manages one or more local mapping rules and all PM streams.
 type Tunnel struct {
-	sender    FrameSender
-	rules     map[string]Rule
-	listeners map[string]net.Listener
-	streams   sync.Map // stream key -> *stream
-	nextIDs   map[string]uint32
-	mu        sync.Mutex
-	done      chan struct{}
+	sender         FrameSender
+	rules          map[string]Rule
+	listeners      map[string]net.Listener
+	streams        sync.Map // stream key -> *stream
+	nextIDs        map[string]uint32
+	mu             sync.Mutex
+	done           chan struct{}
+	securityPolicy SecurityPolicy
 }
 
 type stream struct {
@@ -79,7 +151,7 @@ func NewTunnelWithRules(rules []Rule, sender FrameSender) *Tunnel {
 			continue
 		}
 		if _, exists := t.rules[rule.ID]; exists {
-			log.Printf("[tunnel] duplicate rule ID %s ignored", rule.ID)
+			logging.Debugf("[tunnel] duplicate rule ID %s ignored", rule.ID)
 			continue
 		}
 		if rule.LocalHost == "" {
@@ -121,7 +193,7 @@ func (t *Tunnel) Start() error {
 	for id, ln := range opened {
 		rule := t.rules[id]
 		t.listeners[id] = ln
-		log.Printf("[tunnel] rule %s: listening on %s -> peer-target %s:%d",
+		logging.Infof("[tunnel] rule %s: listening on %s -> peer-target %s:%d",
 			rule.ID, ln.Addr().String(), rule.TargetHost, rule.TargetPort)
 		go t.acceptLoop(rule, ln)
 	}
@@ -137,6 +209,20 @@ func (t *Tunnel) ListenerAddr(ruleID string) (net.Addr, error) {
 		return nil, fmt.Errorf("rule %s has no listener", ruleID)
 	}
 	return ln.Addr(), nil
+}
+
+// SetSecurityPolicy configures inbound connection restrictions.
+func (t *Tunnel) SetSecurityPolicy(policy SecurityPolicy) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.securityPolicy = policy
+}
+
+// SecurityPolicy returns the active security policy.
+func (t *Tunnel) SecurityPolicy() SecurityPolicy {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.securityPolicy
 }
 
 // Stop closes all listeners and active streams.
@@ -172,7 +258,7 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 			case <-t.done:
 				return
 			default:
-				log.Printf("[tunnel] rule %s accept error: %v", rule.ID, err)
+				logging.Errorf("[tunnel] rule %s accept error: %v", rule.ID, err)
 				continue
 			}
 		}
@@ -180,17 +266,14 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 		streamID := t.nextStreamID(rule.ID)
 		s := &stream{ruleID: rule.ID, id: streamID, conn: conn, tunnel: t, ready: make(chan struct{})}
 		t.streams.Store(streamKey(rule.ID, streamID), s)
-		log.Printf("[tunnel] rule %s accepted local connection, streamId=%s", rule.ID, streamID)
-
 		msg, err := newConnectMsg(rule.ID, streamID, rule.TargetHost, rule.TargetPort)
 		if err != nil {
-			log.Printf("[tunnel] build connect error: %v", err)
+			logging.Errorf("[tunnel] build connect error: %v", err)
 			t.closeStream(rule.ID, streamID, false)
 			continue
 		}
-		log.Printf("[tunnel] CONNECT wire: %x", truncateBytesForLog(msg))
 		if err := t.sender.SendFrame(msg); err != nil {
-			log.Printf("[tunnel] send connect error: %v", err)
+			logging.Errorf("[tunnel] send connect error: %v", err)
 			t.closeStream(rule.ID, streamID, false)
 			continue
 		}
@@ -202,12 +285,9 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 func (t *Tunnel) HandleMessage(data []byte) {
 	frame := decodeFrameForTunnel(data)
 	if frame == nil {
-		log.Printf("[tunnel] message contained no PortMappingFrame: %x", truncateBytesForLog(data))
+		logging.Debugf("[tunnel] message contained no port mapping frame (%d bytes)", len(data))
 		return
 	}
-
-	log.Printf("[tunnel] inbound PM frame: type=%s rule=%s stream=%s payload=%d bytes",
-		frame.Type, frame.RuleID, frame.StreamID, len(frame.Payload))
 
 	key := streamKey(frame.RuleID, frame.StreamID)
 	v, streamExists := t.streams.Load(key)
@@ -215,7 +295,7 @@ func (t *Tunnel) HandleMessage(data []byte) {
 	switch frame.Type {
 	case gvpb.TypeConnect:
 		if streamExists {
-			log.Printf("[tunnel] duplicate CONNECT for rule %s stream %s", frame.RuleID, frame.StreamID)
+			logging.Debugf("[tunnel] duplicate CONNECT for rule %s stream %s", frame.RuleID, frame.StreamID)
 			return
 		}
 		t.handleConnect(frame)
@@ -230,13 +310,12 @@ func (t *Tunnel) HandleMessage(data []byte) {
 			Version int  `json:"version"`
 		}
 		if err := json.Unmarshal(frame.Payload, &ack); err == nil && !ack.OK {
-			log.Printf("[tunnel] connect refused for rule %s stream %s", frame.RuleID, frame.StreamID)
+			logging.Warnf("[tunnel] connect refused for rule %s stream %s", frame.RuleID, frame.StreamID)
 			t.closeStream(frame.RuleID, frame.StreamID, false)
 			s.markReady()
 			return
 		}
 		s.markReady()
-		log.Printf("[tunnel] SYN_ACK received for rule %s stream %s", frame.RuleID, frame.StreamID)
 
 	case gvpb.TypeData:
 		if !streamExists {
@@ -244,7 +323,7 @@ func (t *Tunnel) HandleMessage(data []byte) {
 		}
 		s := v.(*stream)
 		if _, err := s.conn.Write(frame.Payload); err != nil {
-			log.Printf("[tunnel] local write error: %v", err)
+			logging.Errorf("[tunnel] local write error: %v", err)
 			t.closeStream(frame.RuleID, frame.StreamID, true)
 			return
 		}
@@ -258,10 +337,10 @@ func (t *Tunnel) HandleMessage(data []byte) {
 			return
 		}
 		t.closeStream(frame.RuleID, frame.StreamID, false)
-		log.Printf("[tunnel] remote FIN, rule %s stream %s closed", frame.RuleID, frame.StreamID)
+		logging.Infof("[tunnel] stream closed: rule=%s stream=%s reason=remote-fin", frame.RuleID, frame.StreamID)
 
 	default:
-		log.Printf("[tunnel] unknown frame type %q ignored", frame.Type)
+		logging.Debugf("[tunnel] unknown frame type %q ignored", frame.Type)
 	}
 }
 
@@ -272,12 +351,23 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 		Version    int    `json:"version"`
 	}
 	if err := json.Unmarshal(frame.Payload, &target); err != nil {
-		log.Printf("[tunnel] connect payload parse error: %v", err)
+		logging.Errorf("[tunnel] connect payload parse error: %v", err)
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
 	if target.TargetHost == "" || target.TargetPort <= 0 {
-		log.Printf("[tunnel] connect payload missing target for rule %s", frame.RuleID)
+		logging.Errorf("[tunnel] connect payload missing target for rule %s", frame.RuleID)
+		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
+		return
+	}
+
+	t.mu.Lock()
+	policy := t.securityPolicy
+	t.mu.Unlock()
+
+	if err := policy.ValidateTarget(target.TargetHost, target.TargetPort); err != nil {
+		logging.Warnf("[tunnel] rule %s stream %s: connect target %s:%d rejected by security policy: %v",
+			frame.RuleID, frame.StreamID, target.TargetHost, target.TargetPort, err)
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
@@ -285,7 +375,7 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	addr := net.JoinHostPort(target.TargetHost, strconv.Itoa(target.TargetPort))
 	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
 	if err != nil {
-		log.Printf("[tunnel] connect target %s error: %v", addr, err)
+		logging.Errorf("[tunnel] connect target %s error: %v", addr, err)
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
@@ -300,8 +390,7 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
 	t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, true))
 	s.markReady()
-	log.Printf("[tunnel] connected target %s for rule %s stream %s",
-		addr, frame.RuleID, frame.StreamID)
+	logging.Infof("[tunnel] stream connected: rule=%s stream=%s target=%s", frame.RuleID, frame.StreamID, addr)
 	go s.readLoop()
 }
 
@@ -318,11 +407,11 @@ func (t *Tunnel) sendFIN(ruleID, streamID string) {
 
 func (t *Tunnel) sendBuiltMsg(msg []byte, err error) {
 	if err != nil {
-		log.Printf("[tunnel] build message error: %v", err)
+		logging.Errorf("[tunnel] build message error: %v", err)
 		return
 	}
 	if err := t.sender.SendFrame(msg); err != nil {
-		log.Printf("[tunnel] send message error: %v", err)
+		logging.Errorf("[tunnel] send message error: %v", err)
 	}
 }
 
@@ -355,18 +444,17 @@ func (s *stream) readLoop() {
 			copy(payload, buf[:n])
 			msg, msgErr := newDataMsg(s.ruleID, s.id, payload)
 			if msgErr != nil {
-				log.Printf("[tunnel] build data error: %v", msgErr)
+				logging.Errorf("[tunnel] build data error: %v", msgErr)
 				return
 			}
-			log.Printf("[tunnel] DATA wire: %x", truncateBytesForLog(msg))
 			if err := s.tunnel.sender.SendFrame(msg); err != nil {
-				log.Printf("[tunnel] send data error: %v", err)
+				logging.Errorf("[tunnel] send data error: %v", err)
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("[tunnel] local read error: %v", err)
+				logging.Debugf("[tunnel] local stream ended: %v", err)
 			}
 			return
 		}
@@ -394,7 +482,7 @@ func decodeFrameForTunnel(data []byte) *gvpb.PortMappingFrame {
 		} `json:"portMappingFrame"`
 	}
 	if err := json.Unmarshal(data, &jmsg); err != nil {
-		log.Printf("[tunnel] message parse error: %v", err)
+		logging.Debugf("[tunnel] message parse error: %v", err)
 		return nil
 	}
 	if jmsg.Frame.RuleID == "" && jmsg.Frame.StreamID == "" {
@@ -411,18 +499,4 @@ func decodeFrameForTunnel(data []byte) *gvpb.PortMappingFrame {
 
 func streamKey(ruleID, streamID string) string {
 	return ruleID + "\x00" + streamID
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
-
-func truncateBytesForLog(b []byte) []byte {
-	if len(b) > 256 {
-		return b[:256]
-	}
-	return b
 }

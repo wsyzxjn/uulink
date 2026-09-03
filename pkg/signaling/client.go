@@ -13,9 +13,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/user/uulink/pkg/logging"
 )
 
 // EIO4 packet types
@@ -162,7 +164,7 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 	c.pingInterval = time.Duration(openData.PingInterval) * time.Millisecond
 	c.pingTimeout = time.Duration(openData.PingTimeout) * time.Millisecond
 
-	log.Printf("[signaling] connected, sid=%s, pingInterval=%v", openData.SID, c.pingInterval)
+	logging.Infof("[signaling] connected")
 
 	go c.readLoop()
 	go c.pingLoop()
@@ -257,7 +259,7 @@ func (c *Client) RequestRoomInfo() (*RoomInfo, error) {
 			} `json:"you"`
 		}
 		if err := json.Unmarshal(arr[0], &raw); err != nil {
-			log.Printf("[signaling] room_info parse error: %v", err)
+			logging.Errorf("[signaling] room_info parse error: %v", err)
 			ch <- nil
 			return
 		}
@@ -335,7 +337,7 @@ func (c *Client) RefreshReconnectKey() (string, error) {
 		if result.err != nil {
 			return "", result.err
 		}
-		log.Printf("[signaling] refresh_reconnect_key succeeded (key length %d)", len(result.key))
+		logging.Debugf("[signaling] refresh_reconnect_key succeeded (key length %d)", len(result.key))
 		return result.key, nil
 	case <-c.Done():
 		return "", fmt.Errorf("signaling closed while waiting for refresh_reconnect_key")
@@ -439,7 +441,11 @@ func (c *Client) readLoop() {
 		msgType, msg, err := c.conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				log.Printf("[signaling] read error: %v", err)
+				if errors.Is(err, net.ErrClosed) {
+					logging.Debugf("[signaling] read loop ended: %v", err)
+				} else {
+					logging.Errorf("[signaling] read error: %v", err)
+				}
 			}
 			return
 		}
@@ -459,7 +465,7 @@ func (c *Client) readLoop() {
 		case eioPong:
 			// server pong, ignore
 		case eioClose:
-			log.Printf("[signaling] server closed connection")
+			logging.Infof("[signaling] server closed connection")
 			return
 		case eioMessage:
 			c.handleSIOPacket(msg[1:])
@@ -476,7 +482,7 @@ func (c *Client) handleBinaryFrame(msg []byte) {
 	c.amu.Unlock()
 
 	if pending == nil {
-		log.Printf("[signaling] unexpected binary frame (%d bytes)", len(msg))
+		logging.Debugf("[signaling] unexpected binary frame (%d bytes)", len(msg))
 		return
 	}
 
@@ -510,7 +516,7 @@ func (c *Client) dispatchBinaryEvent(packet []byte, attachments [][]byte) {
 
 	var arr []json.RawMessage
 	if err := json.Unmarshal(rest, &arr); err != nil {
-		log.Printf("[signaling] parse binary event error: %v (packet: %s)", err, string(packet)[:min(len(packet), 100)])
+		logging.Errorf("[signaling] parse binary event error: %v", err)
 		return
 	}
 	if len(arr) == 0 {
@@ -602,16 +608,16 @@ func (c *Client) handleSIOPacket(data []byte) {
 
 	switch data[0] {
 	case sioConnect:
-		log.Printf("[signaling] namespace connected: %s", string(data[1:]))
+		logging.Infof("[signaling] namespace connected")
 		select {
 		case <-c.readyCh:
 		default:
 			close(c.readyCh)
 		}
 	case sioDisconnect:
-		log.Printf("[signaling] namespace disconnected")
+		logging.Infof("[signaling] namespace disconnected")
 	case sioConnectError:
-		log.Printf("[signaling] namespace connect error: %s", string(data[1:]))
+		logging.Errorf("[signaling] namespace connect error: %s", string(data[1:]))
 	case sioEvent:
 		c.handleEventPacket(data[1:])
 	case sioAck, sioBinaryAck:
@@ -624,7 +630,7 @@ func (c *Client) handleSIOPacket(data []byte) {
 func (c *Client) handleEventPacket(data []byte) {
 	var arr []json.RawMessage
 	if err := json.Unmarshal(data, &arr); err != nil {
-		log.Printf("[signaling] parse event error: %v", err)
+		logging.Errorf("[signaling] parse event error: %v", err)
 		return
 	}
 	if len(arr) == 0 {
@@ -662,7 +668,7 @@ func (c *Client) handleAckPacket(data []byte) {
 	if handler != nil {
 		handler(arr)
 	} else {
-		log.Printf("[signaling] unhandled ack %d: %s", ackID, string(rest)[:min(len(rest), 150)])
+		logging.Debugf("[signaling] unhandled ack %d", ackID)
 	}
 }
 
@@ -675,7 +681,7 @@ func (c *Client) handleBinaryEventPacket(data []byte) {
 		rest = rest[1:]
 	}
 	if len(rest) == 0 || rest[0] != '-' {
-		log.Printf("[signaling] malformed binary event: %s", string(data)[:min(len(data), 80)])
+		logging.Debugf("[signaling] malformed binary event (%d bytes)", len(data))
 		return
 	}
 	rest = rest[1:]
@@ -702,7 +708,7 @@ func (c *Client) dispatchEvent(ev *Event) {
 	if ok {
 		handler(ev)
 	} else {
-		log.Printf("[signaling] unhandled event: %s", ev.Name)
+		logging.Debugf("[signaling] unhandled event: %s", ev.Name)
 	}
 }
 
@@ -716,7 +722,7 @@ func (c *Client) pingLoop() {
 			return
 		case <-ticker.C:
 			if err := c.send(string([]byte{eioPing})); err != nil {
-				log.Printf("[signaling] ping error: %v", err)
+				logging.Errorf("[signaling] ping error: %v", err)
 				return
 			}
 		}

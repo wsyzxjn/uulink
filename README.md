@@ -187,6 +187,8 @@ Field details:
 - `local_port`: Local port to bind and listen on.
 - `remote_host`: Destination host on the remote end. Typically `127.0.0.1`.
 - `remote_port`: Destination port on the remote end.
+- `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only).
+- `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When set, incoming connections to other ports are rejected.
 
 ## Command-Line Options
 
@@ -204,6 +206,9 @@ Field details:
 | `-remote-port <port>` | Target port on remote host | - |
 | `-remote-host <ip>` | Target host on remote end | `127.0.0.1` |
 | `-force-relay` | Force WebRTC to use TURN relay only | off |
+| `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
+| `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
+| `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
 | `-guest-serve` | Run assistance server and print share code | - |
 | `-share` | Enable share code client mode | - |
 | `-share-id <id>` | Remote assistance connect ID | - |

@@ -9,12 +9,11 @@
 package mixsend
 
 import (
-	"encoding/hex"
 	"fmt"
-	"log"
 	"net"
 	"time"
 
+	"github.com/user/uulink/pkg/logging"
 	"github.com/user/uulink/pkg/tunnel/mixkcp"
 )
 
@@ -47,8 +46,7 @@ func (s *Sender) SendPMFrame(cmd byte, payload []byte) error {
 	if n != len(wire) {
 		return fmt.Errorf("mixsend short write: %d/%d", n, len(wire))
 	}
-	log.Printf("[mixkcp] sent frame to %s: cmd=%#x len=%d hex=%s",
-		s.peer, cmd, len(wire), hex.EncodeToString(wire))
+	logging.Debugf("[mixkcp] sent frame to %s: cmd=%#x len=%d", s.peer, cmd, len(wire))
 	return nil
 }
 
@@ -63,8 +61,7 @@ func (s *Sender) ReceivePMFrame() (*mixkcp.Frame, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mixsend parse (%d bytes): %w", n, err)
 	}
-	log.Printf("[mixkcp] received frame: cmd=%#x session=%s len=%d hex=%s",
-		f.Cmd, hex.EncodeToString(f.Session), n, hex.EncodeToString(buf[:n]))
+	logging.Debugf("[mixkcp] received frame: cmd=%#x len=%d", f.Cmd, n)
 	return f, nil
 }
 

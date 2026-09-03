@@ -99,13 +99,15 @@ func BuildHeaders(cfg *Config, ts string) map[string]string {
 
 // Config holds credentials and identifiers for UU Remote API auth.
 type Config struct {
-	JWT      string        `json:"jwt"`
-	ClientID string        `json:"client_id"` // IOPlatformUUID
-	DeviceID string        `json:"device_id"` // this device id
-	UserID   string        `json:"user_id"`
-	Hostname string        `json:"hostname,omitempty"`
-	GuestID  string        `json:"guest_id,omitempty"`
-	Mappings []PortMapping `json:"mappings,omitempty"`
+	JWT          string        `json:"jwt"`
+	ClientID     string        `json:"client_id"` // IOPlatformUUID
+	DeviceID     string        `json:"device_id"` // this device id
+	UserID       string        `json:"user_id"`
+	Hostname     string        `json:"hostname,omitempty"`
+	GuestID      string        `json:"guest_id,omitempty"`
+	Mappings     []PortMapping `json:"mappings,omitempty"`
+	AllowLAN     bool          `json:"allow_lan,omitempty"`
+	AllowedPorts []int         `json:"allowed_ports,omitempty"`
 }
 
 // PortMapping declares one UULink listener and its peer-side target.

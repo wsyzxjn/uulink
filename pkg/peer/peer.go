@@ -18,13 +18,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/user/uulink/pkg/logging"
 	"github.com/user/uulink/pkg/signaling"
 )
 
@@ -53,23 +54,6 @@ var controlledSTUNServers = []webrtc.ICEServer{
 	{URLs: []string{"stun:61.174.14.99:2580"}},
 	{URLs: []string{"stun:61.153.100.69:2480"}},
 	{URLs: []string{"stun:61.153.100.70:2480"}},
-}
-
-func logSelectedCandidatePair(role string, pair *webrtc.ICECandidatePair) {
-	if pair == nil || pair.Local == nil || pair.Remote == nil {
-		log.Printf("[%s peer] selected candidate pair unavailable", role)
-		return
-	}
-
-	mode := "direct"
-	if pair.Local.Typ == webrtc.ICECandidateTypeRelay ||
-		pair.Remote.Typ == webrtc.ICECandidateTypeRelay {
-		mode = "relay"
-	}
-	log.Printf("[%s peer] selected candidate pair: mode=%s local=%s:%d/%s(%s) remote=%s:%d/%s(%s)",
-		role, mode,
-		pair.Local.Address, pair.Local.Port, pair.Local.Protocol, pair.Local.Typ,
-		pair.Remote.Address, pair.Remote.Port, pair.Remote.Protocol, pair.Remote.Typ)
 }
 
 // ControlAckData is the server's response to the control event.
@@ -144,6 +128,9 @@ type Peer struct {
 	pendingSOAC       []*signaling.Event
 	remoteDescSet     bool
 	pendingCandidates []webrtc.ICECandidateInit
+	selectedPair      *webrtc.ICECandidatePair
+	statsDone         chan struct{}
+	statsRunning      bool
 }
 
 type soacEvent struct {
@@ -182,6 +169,7 @@ func NewController(cfg *Config) (*Peer, error) {
 		onBinaryData:  cfg.OnBinaryData,
 		onSignalData:  cfg.OnSignalData,
 		ackCh:         make(chan *ControlAckData, 1),
+		statsDone:     make(chan struct{}),
 	}
 
 	// Register soac handler before starting
@@ -211,7 +199,7 @@ func NewController(cfg *Config) (*Peer, error) {
 		p.clientID = info.ClientID
 		p.routingClientID = info.ClientID
 		p.iceID = info.ClientID
-		log.Printf("[peer] passive controller room info: room_id=%s client_id=%s",
+		logging.Debugf("[peer] passive controller room info: room_id=%s client_id=%s",
 			info.RoomID, info.ClientID)
 		return p, nil
 	}
@@ -233,7 +221,7 @@ func NewController(cfg *Config) (*Peer, error) {
 		p.routingClientID = ack.ClientID
 		p.iceID = ack.IceID
 		p.ack = ack
-		log.Printf("[peer] control ack: client_id=%s ice_id=%s force_relay=%v (%d ice servers)",
+		logging.Debugf("[peer] control ack: client_id=%s ice_id=%s force_relay=%v ice_servers=%d",
 			ack.ClientID, ack.IceID, ack.ForceRelay, len(ack.ICEServers))
 		return p, nil
 	case <-cfg.Signal.Done():
@@ -249,6 +237,7 @@ func NewControlled(cfg *Config) (*Peer, error) {
 		onBinaryData:    cfg.OnBinaryData,
 		onSignalData:    cfg.OnSignalData,
 		controlledReady: make(chan struct{}),
+		statsDone:       make(chan struct{}),
 	}
 
 	// A controller can emit its offer immediately after room/create returns,
@@ -278,7 +267,7 @@ func NewControlled(cfg *Config) (*Peer, error) {
 		return nil, fmt.Errorf("refresh reconnect key: %w", err)
 	}
 	p.clientID = info.ClientID
-	log.Printf("[peer] controlled room info: room_id=%s client_id=%s device_id=%s",
+	logging.Debugf("[peer] controlled room info: room_id=%s client_id=%s device_id=%s",
 		info.RoomID, info.ClientID, info.DeviceID)
 
 	p.mu.Lock()
@@ -412,20 +401,20 @@ func (p *Peer) sendControl(deviceID string) error {
 	return p.sig.EmitBinaryWithAcks("control", payload, pb, []int{3, 4}, func(arr []json.RawMessage) {
 		// arr = ["success", {data}]
 		if len(arr) < 2 {
-			log.Printf("[peer] control ack malformed: %v", arr)
+			logging.Debugf("[peer] control ack malformed: %v", arr)
 			return
 		}
 		var probe struct {
 			ReconnectKey string `json:"reconnect_key"`
 		}
 		if err := json.Unmarshal(arr[1], &probe); err == nil && probe.ReconnectKey != "" {
-			log.Printf("[peer] control reconnect key refreshed (key length %d)", len(probe.ReconnectKey))
+			logging.Debugf("[peer] control reconnect key refreshed (key length %d)", len(probe.ReconnectKey))
 			return
 		}
 		var data ControlAckData
 		if err := json.Unmarshal(arr[1], &data); err != nil {
 			// some acks are ["success", {"reconnect_key":...}] - not our ack
-			log.Printf("[peer] control ack parse: %v (%s)", err, string(arr[1])[:min(len(string(arr[1])), 100)])
+			logging.Debugf("[peer] control ack parse: %v (%s)", err, string(arr[1])[:min(len(string(arr[1])), 100)])
 			return
 		}
 		p.ackCh <- &data
@@ -437,12 +426,12 @@ func (p *Peer) sendControl(deviceID string) error {
 func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	if iceServers == nil && p.ack != nil {
 		iceServers = p.ack.WebRTCICEServers()
-		log.Printf("[peer] using %d ICE servers from control ack", len(iceServers))
+		logging.Debugf("[peer] using %d ICE servers from control ack", len(iceServers))
 	}
 	rtcCfg := webrtc.Configuration{ICEServers: iceServers}
 	if p.forceRelay || (p.ack != nil && p.ack.ForceRelay) {
 		rtcCfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
-		log.Printf("[peer] ICE transport policy forced to relay")
+		logging.Infof("[peer] ICE transport policy forced to relay")
 	}
 
 	pc, err := webrtc.NewPeerConnection(rtcCfg)
@@ -453,19 +442,20 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 
 	pc.OnICECandidate(p.onICECandidate)
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("[peer] connection state: %s", state.String())
+		logging.Infof("[peer] connection state: %s", state.String())
+		p.logConnectionStats(pc, "controller")
 	})
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("[peer] ICE state: %s", state.String())
+		logging.Debugf("[peer] ICE state: %s", state.String())
 		if state == webrtc.ICEConnectionStateConnected && p.onICEConnected != nil {
 			go p.onICEConnected()
 		}
 	})
 	pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
-		logSelectedCandidatePair("controller", pair)
+		p.setSelectedCandidatePair(pc, "controller", pair)
 	})
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		log.Printf("[peer] remote data channel: %s", dc.Label())
+		logging.Debugf("[peer] remote data channel: %s", dc.Label())
 		if dc.Label() == LabelBinary {
 			p.mu.Lock()
 			p.binaryDC = dc
@@ -492,11 +482,10 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	p.controlDC = controlDC
 	p.mu.Unlock()
 	controlDC.OnOpen(func() {
-		log.Printf("[peer] control channel open")
+		logging.Debugf("[peer] control channel open")
 		p.sendControlHandshake()
 	})
 	controlDC.OnMessage(func(msg webrtc.DataChannelMessage) {
-		log.Printf("[peer] control message: %x", msg.Data)
 		p.handleControlEcho(msg.Data)
 	})
 
@@ -508,10 +497,7 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	p.textDC = textDC
 	p.mu.Unlock()
 	textDC.OnOpen(func() {
-		log.Printf("[peer] text channel open")
-	})
-	textDC.OnMessage(func(msg webrtc.DataChannelMessage) {
-		log.Printf("[peer] text message: %x", msg.Data)
+		logging.Debugf("[peer] text channel open")
 	})
 
 	// FILE_DATA_CHANNEL carries the pb channel (PortMappingFrame messages)
@@ -523,7 +509,7 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	p.fileDC = fileDC
 	p.mu.Unlock()
 	fileDC.OnOpen(func() {
-		log.Printf("[peer] file channel open (pb transport)")
+		logging.Infof("[peer] file data channel open")
 		p.mu.Lock()
 		fn := p.onFileOpen
 		p.mu.Unlock()
@@ -563,8 +549,6 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 		},
 	}
 
-	log.Printf("[peer] OFFER SDP:\n%s", offer.SDP)
-
 	if p.sdpOfferFile != "" {
 		// File-based SDP exchange: wait for ICE gathering to finish so the
 		// serialized local description contains all candidates, then write
@@ -582,7 +566,7 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 		if err := os.WriteFile(p.sdpOfferFile, offerData, 0600); err != nil {
 			return fmt.Errorf("write offer file: %w", err)
 		}
-		log.Printf("[peer] wrote file offer to %s (sdp %d bytes)", p.sdpOfferFile, len(complete.SDP))
+		logging.Debugf("[peer] wrote file offer to %s (sdp %d bytes)", p.sdpOfferFile, len(complete.SDP))
 
 		answerData, err := waitForFile(p.sdpAnswerFile, 90*time.Second)
 		if err != nil {
@@ -602,11 +586,11 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 		if err := pc.SetRemoteDescription(answer); err != nil {
 			return fmt.Errorf("set file answer: %w", err)
 		}
-		log.Printf("[peer] applied file answer from %s (sdp %d bytes)", p.sdpAnswerFile, len(answerDesc.SDP))
+		logging.Debugf("[peer] applied file answer from %s (sdp %d bytes)", p.sdpAnswerFile, len(answerDesc.SDP))
 		return nil
 	}
 
-	log.Printf("[peer] sending soac offer (sdp %d bytes, gzip %d)", len(offer.SDP), len(gz))
+	logging.Debugf("[peer] sending soac offer (sdp %d bytes, gzip %d)", len(offer.SDP), len(gz))
 	return p.sig.EmitBinary("soac", payload, gz)
 }
 
@@ -651,7 +635,7 @@ func (p *Peer) onICECandidate(candidate *webrtc.ICECandidate) {
 	}
 
 	if err := p.sig.Emit("soac", payload); err != nil {
-		log.Printf("[peer] send candidate error: %v", err)
+		logging.Errorf("[peer] send candidate error: %v", err)
 	}
 }
 
@@ -659,7 +643,7 @@ func (p *Peer) onICECandidate(candidate *webrtc.ICECandidate) {
 func (p *Peer) handleSOAC(ev *signaling.Event) {
 	msg, ok := parseSOACEvent(ev)
 	if !ok {
-		log.Printf("[peer] soac parse error")
+		logging.Errorf("[peer] soac parse error")
 		return
 	}
 
@@ -671,15 +655,14 @@ func (p *Peer) handleSOAC(ev *signaling.Event) {
 			sdp = msg.Data.GzipSDP
 		}
 		if sdp == "" {
-			log.Printf("[peer] answer with empty sdp, gzip_sdp=%q", msg.Data.GzipSDP[:min(len(msg.Data.GzipSDP), 80)])
+			logging.Errorf("[peer] answer with empty sdp")
 			return
 		}
 		answer := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}
-		log.Printf("[peer] ANSWER SDP:\n%s", sdp)
 		if err := p.pc.SetRemoteDescription(answer); err != nil {
-			log.Printf("[peer] set remote answer error: %v", err)
+			logging.Errorf("[peer] set remote answer error: %v", err)
 		} else {
-			log.Printf("[peer] remote answer set (sdp %d bytes)", len(sdp))
+			logging.Debugf("[peer] remote answer set (sdp %d bytes)", len(sdp))
 			p.drainPendingCandidates()
 		}
 
@@ -691,7 +674,7 @@ func (p *Peer) handleSOAC(ev *signaling.Event) {
 		})
 
 	default:
-		log.Printf("[peer] soac type=%s ignored", msg.Data.Type)
+		logging.Debugf("[peer] soac type=%s ignored", msg.Data.Type)
 	}
 }
 
@@ -712,14 +695,14 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 
 	msg, ok := parseSOACEvent(ev)
 	if !ok {
-		log.Printf("[peer] controlled soac parse error")
+		logging.Errorf("[peer] controlled soac parse error")
 		return
 	}
 
 	switch msg.Data.Type {
 	case "offer":
 		if p.pc != nil {
-			log.Printf("[peer] controlled peer already has an offer; ignoring duplicate")
+			logging.Debugf("[peer] controlled peer already has an offer; ignoring duplicate")
 			return
 		}
 		p.appControlID = msg.Data.AppControlID
@@ -732,22 +715,23 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 			ICEServers: controlledSTUNServers,
 		})
 		if err != nil {
-			log.Printf("[peer] controlled new peer connection error: %v", err)
+			logging.Errorf("[peer] controlled new peer connection error: %v", err)
 			return
 		}
 		p.pc = pc
 		pc.OnICECandidate(p.onICECandidate)
 		pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-			log.Printf("[peer] controlled connection state: %s", state.String())
+			logging.Infof("[peer] connection state: %s", state.String())
+			p.logConnectionStats(pc, "controlled")
 		})
 		pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-			log.Printf("[peer] controlled ICE state: %s", state.String())
+			logging.Debugf("[peer] ICE state: %s", state.String())
 			if state == webrtc.ICEConnectionStateConnected && p.onICEConnected != nil {
 				go p.onICEConnected()
 			}
 		})
 		pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
-			logSelectedCandidatePair("controlled", pair)
+			p.setSelectedCandidatePair(pc, "controlled", pair)
 		})
 		pc.OnDataChannel(p.setupControlledDataChannel)
 
@@ -756,29 +740,28 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 			offer.SDP = msg.Data.GzipSDP
 		}
 		if offer.SDP == "" {
-			log.Printf("[peer] controlled offer with empty SDP")
+			logging.Errorf("[peer] controlled offer with empty SDP")
 			return
 		}
-		log.Printf("[peer] CONTROLLED OFFER SDP:\n%s", offer.SDP)
 		if err := pc.SetRemoteDescription(offer); err != nil {
-			log.Printf("[peer] controlled set remote offer error: %v", err)
+			logging.Errorf("[peer] controlled set remote offer error: %v", err)
 			return
 		}
 		p.drainPendingCandidates()
 
 		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
-			log.Printf("[peer] controlled create answer error: %v", err)
+			logging.Errorf("[peer] controlled create answer error: %v", err)
 			return
 		}
 		if err := pc.SetLocalDescription(answer); err != nil {
-			log.Printf("[peer] controlled set local answer error: %v", err)
+			logging.Errorf("[peer] controlled set local answer error: %v", err)
 			return
 		}
 
 		gz, err := gzipCompress([]byte(answer.SDP))
 		if err != nil {
-			log.Printf("[peer] controlled gzip answer error: %v", err)
+			logging.Errorf("[peer] controlled gzip answer error: %v", err)
 			return
 		}
 		payload := map[string]any{
@@ -792,15 +775,15 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 				"type":             "answer",
 			},
 		}
-		log.Printf("[peer] sending controlled soac answer (sdp %d bytes, gzip %d)",
+		logging.Debugf("[peer] sending controlled soac answer (sdp %d bytes, gzip %d)",
 			len(answer.SDP), len(gz))
 		if err := p.sig.EmitBinary("soac", payload, gz); err != nil {
-			log.Printf("[peer] send controlled answer error: %v", err)
+			logging.Errorf("[peer] send controlled answer error: %v", err)
 		}
 
 	case "candidate":
 		if p.pc == nil {
-			log.Printf("[peer] controlled candidate before offer ignored")
+			logging.Debugf("[peer] controlled candidate before offer ignored")
 			return
 		}
 		p.addRemoteCandidate(webrtc.ICECandidateInit{
@@ -810,7 +793,7 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 		})
 
 	default:
-		log.Printf("[peer] controlled soac type=%s ignored", msg.Data.Type)
+		logging.Debugf("[peer] controlled soac type=%s ignored", msg.Data.Type)
 	}
 }
 
@@ -828,7 +811,7 @@ func (p *Peer) addRemoteCandidate(cand webrtc.ICECandidateInit) {
 		return
 	}
 	if err := pc.AddICECandidate(cand); err != nil {
-		log.Printf("[peer] add candidate error: %v", err)
+		logging.Errorf("[peer] add candidate error: %v", err)
 	}
 }
 
@@ -844,13 +827,13 @@ func (p *Peer) drainPendingCandidates() {
 	}
 	for _, cand := range pending {
 		if err := pc.AddICECandidate(cand); err != nil {
-			log.Printf("[peer] add pending candidate error: %v", err)
+			logging.Errorf("[peer] add pending candidate error: %v", err)
 		}
 	}
 }
 
 func (p *Peer) setupControlledDataChannel(dc *webrtc.DataChannel) {
-	log.Printf("[peer] controlled remote data channel: %s", dc.Label())
+	logging.Debugf("[peer] controlled remote data channel: %s", dc.Label())
 	switch dc.Label() {
 	case LabelBinary:
 		p.mu.Lock()
@@ -861,19 +844,18 @@ func (p *Peer) setupControlledDataChannel(dc *webrtc.DataChannel) {
 		p.mu.Lock()
 		p.controlDC = dc
 		p.mu.Unlock()
-		dc.OnOpen(func() { log.Printf("[peer] controlled control channel open") })
+		dc.OnOpen(func() { logging.Debugf("[peer] controlled control channel open") })
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) { p.handleControlEcho(msg.Data) })
 	case LabelText:
 		p.mu.Lock()
 		p.textDC = dc
 		p.mu.Unlock()
-		dc.OnOpen(func() { log.Printf("[peer] controlled text channel open") })
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) { log.Printf("[peer] controlled text message: %x", msg.Data) })
+		dc.OnOpen(func() { logging.Debugf("[peer] controlled text channel open") })
 	case LabelFile:
 		p.mu.Lock()
 		p.fileDC = dc
 		p.mu.Unlock()
-		dc.OnOpen(func() { log.Printf("[peer] controlled file channel open (pb transport)") })
+		dc.OnOpen(func() { logging.Infof("[peer] file data channel open") })
 		dc.OnOpen(func() {
 			p.mu.Lock()
 			fn := p.onFileOpen
@@ -920,7 +902,7 @@ func (p *Peer) sendControlHandshake() {
 	}
 	for _, frame := range frames {
 		if err := p.SendControl(frame); err != nil {
-			log.Printf("[peer] control handshake send error: %v", err)
+			logging.Errorf("[peer] control handshake send error: %v", err)
 			return
 		}
 	}
@@ -929,7 +911,7 @@ func (p *Peer) sendControlHandshake() {
 func (p *Peer) sendTextHandshake() {
 	frame := mustHex("080410c4d8d1d4066a040a020102")
 	if err := p.SendText(frame); err != nil {
-		log.Printf("[peer] text handshake send error: %v", err)
+		logging.Errorf("[peer] text handshake send error: %v", err)
 	}
 }
 
@@ -948,9 +930,8 @@ func (p *Peer) handleControlEcho(data []byte) {
 		out = appendPBVarintField(out, 2, uint64(time.Now().Unix()))
 		out = appendPBBytesField(out, 3, inner)
 
-		log.Printf("[peer] control echo wire: %x", out)
 		if err := p.SendControl(out); err != nil {
-			log.Printf("[peer] control echo send error: %v", err)
+			logging.Errorf("[peer] control echo send error: %v", err)
 			return
 		}
 		p.sendTextHandshake()
@@ -1162,8 +1143,81 @@ func (p *Peer) BinaryChannelOpen() bool {
 	return dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen
 }
 
+func candidatePairMode(pair *webrtc.ICECandidatePair) string {
+	if pair != nil && pair.Local != nil && pair.Remote != nil &&
+		(pair.Local.Typ == webrtc.ICECandidateTypeRelay || pair.Remote.Typ == webrtc.ICECandidateTypeRelay) {
+		return "relay"
+	}
+	return "direct"
+}
+
+func (p *Peer) setSelectedCandidatePair(pc *webrtc.PeerConnection, role string, pair *webrtc.ICECandidatePair) {
+	if pair == nil || pair.Local == nil || pair.Remote == nil {
+		logging.Warnf("[peer] selected candidate pair unavailable")
+		return
+	}
+
+	p.mu.Lock()
+	p.selectedPair = pair
+	running := p.statsRunning
+	p.statsRunning = true
+	p.mu.Unlock()
+	if !running {
+		go p.statsLoop(pc, role)
+	}
+	p.logConnectionStats(pc, role)
+}
+
+func (p *Peer) statsLoop(pc *webrtc.PeerConnection, role string) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.statsDone:
+			return
+		case <-ticker.C:
+			p.logConnectionStats(pc, role)
+		}
+	}
+}
+
+func (p *Peer) logConnectionStats(pc *webrtc.PeerConnection, role string) {
+	p.mu.Lock()
+	pair := p.selectedPair
+	p.mu.Unlock()
+	if pair == nil || pair.Local == nil || pair.Remote == nil {
+		return
+	}
+
+	rtt := "unavailable"
+	var bytesSent, bytesReceived uint64
+	if stats, ok := pc.GetStats().GetICECandidatePairStats(pair); ok {
+		if stats.CurrentRoundTripTime > 0 {
+			rtt = strconv.FormatFloat(stats.CurrentRoundTripTime*1000, 'f', 1, 64) + "ms"
+		}
+		bytesSent = stats.BytesSent
+		bytesReceived = stats.BytesReceived
+	}
+
+	logging.Infof(
+		"[%s peer] connection status: state=%s mode=%s local=%s:%d/%s remote=%s:%d/%s rtt=%s sent=%dB received=%dB",
+		role, pc.ConnectionState().String(), candidatePairMode(pair),
+		pair.Local.Address, pair.Local.Port, pair.Local.Typ,
+		pair.Remote.Address, pair.Remote.Port, pair.Remote.Typ,
+		rtt, bytesSent, bytesReceived,
+	)
+}
+
 // Close shuts down the peer connection.
 func (p *Peer) Close() error {
+	p.mu.Lock()
+	select {
+	case <-p.statsDone:
+	default:
+		close(p.statsDone)
+	}
+	p.mu.Unlock()
+
 	p.soacMu.Lock()
 	pc := p.pc
 	p.soacMu.Unlock()
@@ -1175,7 +1229,7 @@ func (p *Peer) Close() error {
 
 func (p *Peer) setupBinaryChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
-		log.Printf("[peer] binary data channel OPEN")
+		logging.Debugf("[peer] binary data channel open")
 		p.mu.Lock()
 		fn := p.onBinaryOpen
 		p.mu.Unlock()
@@ -1184,7 +1238,7 @@ func (p *Peer) setupBinaryChannel(dc *webrtc.DataChannel) {
 		}
 	})
 	dc.OnClose(func() {
-		log.Printf("[peer] binary data channel closed")
+		logging.Debugf("[peer] binary data channel closed")
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if p.onBinaryData != nil {
