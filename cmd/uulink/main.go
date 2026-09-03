@@ -682,8 +682,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 
 	var tun *tunnel.Tunnel
 	p, err := peer.NewControlled(&peer.Config{
-		Signal:     sig,
-		ForceRelay: forceRelay,
+		Signal: sig,
 		OnSignalData: func(data []byte) {
 			log.Printf("[pb-recv] %s", truncateStr(string(data), 200))
 			if tun != nil {

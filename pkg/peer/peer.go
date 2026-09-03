@@ -246,7 +246,6 @@ func NewController(cfg *Config) (*Peer, error) {
 func NewControlled(cfg *Config) (*Peer, error) {
 	p := &Peer{
 		sig:             cfg.Signal,
-		forceRelay:      cfg.ForceRelay,
 		onBinaryData:    cfg.OnBinaryData,
 		onSignalData:    cfg.OnSignalData,
 		controlledReady: make(chan struct{}),
@@ -729,12 +728,9 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 		// peer echoes that ID rather than using its own room_info client_id.
 		p.routingClientID = msg.ClientID
 
-		rtcCfg := webrtc.Configuration{ICEServers: controlledSTUNServers}
-		if p.forceRelay {
-			rtcCfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
-			log.Printf("[peer] controlled ICE transport policy forced to relay")
-		}
-		pc, err := webrtc.NewPeerConnection(rtcCfg)
+		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+			ICEServers: controlledSTUNServers,
+		})
 		if err != nil {
 			log.Printf("[peer] controlled new peer connection error: %v", err)
 			return
