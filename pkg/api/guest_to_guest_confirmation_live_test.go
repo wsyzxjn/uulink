@@ -69,10 +69,12 @@ func TestLiveGuestToGuestConfirmationJoin(t *testing.T) {
 	}
 	sign := SharePassCodeSign(controllerShare.ConnectID, passCode)
 	uploadResp, uploadErr := controlledClient.GuestShareUploadSign(controlledGuest, &GuestShareUploadSignRequest{
-		CanControl: true,
-		ControlID:  controllerShare.ConnectID,
-		Sign:       sign,
-		BackupSign: sign,
+		CanControl:       true,
+		ControlID:        controllerShare.ConnectID,
+		Sign:             sign,
+		BackupSign:       sign,
+		ControlMode:      "by_confirmation",
+		NeedConfirmation: true,
 	})
 	if uploadErr != nil {
 		var responseErr *ResponseError

@@ -36,6 +36,10 @@ func main() {
 	controlDeviceID := flag.String("control-device-id", "", "device ID sent in the control ConnectOptions attachment (defaults to config device_id)")
 	serveMode := flag.Bool("serve", false, "create a room and answer a UULink controller")
 	guestServe := flag.Bool("guest-serve", false, "create a guest-controlled room and answer a logged-in UULink controller")
+	unboundGuestServe := flag.Bool("unbound-guest-serve", false, "register a new accountless device, then create a guest-controlled room (avoids same-account self-assist blocks)")
+	guestControlID := flag.String("guest-control-id", "", "controller control ID used for the guest share verification sign (defaults to connect_id)")
+	shareAuthMode := flag.String("share-auth-mode", "temporary", "guest share authorization mode: temporary, custom, or both")
+	guestCustomCode := flag.String("guest-custom-code", "", "custom guest share code for custom or both modes (generated when omitted)")
 	roomFile := flag.String("room-file", "", "share room connection or guest share info through a file (same-host debug E2E)")
 	listDevices := flag.Bool("list", false, "list available devices and exit")
 	guestTest := flag.Bool("guest", false, "run guest identity/share smoke test and exit")
@@ -44,11 +48,15 @@ func main() {
 	refreshLogin := flag.Bool("refresh-login", false, "validate the current JWT and refresh it by QR-code login only if needed")
 	loginQRCodeTimeout := flag.Duration("login-qrcode-timeout", 5*time.Minute, "maximum time to wait for QR-code login confirmation")
 	shareJoin := flag.Bool("share", false, "join a remote-assistance share by ID and code")
+	shareConfirmation := flag.Bool("share-confirmation", false, "join a remote-assistance share by confirmation")
+	shareControlMode := flag.Bool("share-control-mode", false, "query a remote-assistance share control mode and exit")
+	shareControlID := flag.String("share-control-id", "", "controller control ID for by_confirmation (generated when omitted)")
 	shareGuest := flag.Bool("share-guest", false, "join a remote-assistance share using a guest identity")
 	shareID := flag.String("share-id", "", "remote-assistance connect ID")
 	shareCode := flag.String("share-code", "", "remote-assistance verification code")
 	ruleIDFlag := flag.String("rule-id", "", "registered rule ID on the remote device (must match)")
 	capFlag := flag.String("cap", "", "override ConnectOptions capability blob (hex, e.g. 08061002180120023002380240024801)")
+	forceRelay := flag.Bool("force-relay", false, "force WebRTC to use TURN relay only")
 	pckSweep := flag.Bool("pck-sweep", false, "sweep PCK.V3 channels with CONNECT frames after setup")
 	mixkcpMode := flag.Bool("mixkcp", false, "send PM frames over mix-kcp UDP to the ICE peer (raw frame format, crypto layout preserved)")
 	localPort := flag.Int("local", 0, "local port to listen on")
@@ -56,6 +64,16 @@ func main() {
 	remoteHost := flag.String("remote-host", "127.0.0.1", "remote target host")
 	remotePort := flag.Int("remote-port", 0, "remote target port")
 	flag.Parse()
+
+	authMode, err := api.ParseShareAuthMode(*shareAuthMode)
+	if err != nil {
+		log.Fatalf("parse share auth mode: %v", err)
+	}
+	if *guestCustomCode != "" && authMode != api.ShareAuthTemporary {
+		if err := api.ValidateCustomShareCode(*guestCustomCode); err != nil {
+			log.Fatalf("validate guest custom code: %v", err)
+		}
+	}
 
 	cfg, err := auth.LoadConfigFile(*configPath)
 	if err != nil {
@@ -84,20 +102,56 @@ func main() {
 		doLoginQRCode(client, cfg, *configPath, *loginQRCodeTimeout)
 		return
 	}
+	if *shareControlMode {
+		if *shareID == "" {
+			log.Fatal("-share-id is required")
+		}
+		response, err := client.GetShareControlMode(*shareID)
+		if err != nil {
+			log.Fatalf("query share control mode: %v", err)
+		}
+		log.Printf("share control mode query complete: code=%v", response["code"])
+		return
+	}
 
-	usesShareRoom := *shareJoin || *shareGuest
-	if usesShareRoom && (*shareID == "" || *shareCode == "") {
-		log.Fatal("both -share-id and -share-code are required")
+	usesShareRoom := *shareJoin || *shareGuest || *shareConfirmation
+	if usesShareRoom && *shareID == "" {
+		log.Fatal("-share-id is required")
+	}
+	if (*shareJoin || *shareGuest) && *shareCode == "" {
+		log.Fatal("-share-code is required")
 	}
 	if *serveMode && *guestServe {
 		log.Fatal("-serve and -guest-serve cannot be combined")
+	}
+	if *serveMode && *unboundGuestServe {
+		log.Fatal("-serve and -unbound-guest-serve cannot be combined")
+	}
+	if *guestServe && *unboundGuestServe {
+		log.Fatal("-guest-serve and -unbound-guest-serve cannot be combined")
+	}
+	if *unboundGuestServe {
+		rules, err := configuredRules(cfg, *ruleIDFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		if err != nil {
+			log.Fatalf("configure mappings: %v", err)
+		}
+		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
+			ControlID:  *guestControlID,
+			AuthMode:   authMode,
+			CustomCode: *guestCustomCode,
+		})
+		return
 	}
 	if *guestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
-		doGuestServe(client, cfg, rules, *roomFile)
+		doGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
+			ControlID:  *guestControlID,
+			AuthMode:   authMode,
+			CustomCode: *guestCustomCode,
+		})
 		return
 	}
 	if *serveMode {
@@ -108,7 +162,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
-		doServe(client, cfg, rules, *roomFile)
+		doServe(client, cfg, rules, *roomFile, *forceRelay)
 		return
 	}
 
@@ -127,11 +181,62 @@ func main() {
 
 	// Step 1: join the room created by the target device's server
 	var room *api.RoomConnectionInfo
+	controllerAppControlID := ""
+	if *shareJoin || *shareConfirmation {
+		log.Printf("using configured controller device_id=%s client_id_len=%d", cfg.DeviceID, len(cfg.ClientID))
+	}
 	switch {
+	case *shareConfirmation:
+		log.Println("joining room by confirmation...")
+		if *shareControlID == "" {
+			controlMode, controlModeErr := client.GetShareControlMode(*shareID)
+			if controlModeErr != nil {
+				log.Printf("share control mode query failed: %v", controlModeErr)
+			} else {
+				log.Printf("share control mode response keys=%v", mapKeys(controlMode))
+				if data, ok := controlMode["data"].(map[string]any); ok {
+					for key, value := range data {
+						if text, ok := value.(string); ok {
+							log.Printf("share control mode field=%s length=%d", key, len(text))
+						}
+					}
+				}
+			}
+		}
+		controlID := *shareControlID
+		if *shareControlID != "" {
+			log.Printf("using explicit share control_id=%s", controlID)
+		} else {
+			var err error
+			controlID, err = generateAppControlID()
+			if err != nil {
+				log.Fatalf("generate share control id: %v", err)
+			}
+			log.Printf("generated share control_id_length=%d", len(controlID))
+		}
+		controllerAppControlID = controlID
+		room, err = client.JoinRoomByConfirmation(*shareID, controlID)
+		if err != nil {
+			if responseErr, ok := err.(*api.ResponseError); ok {
+				data, _ := responseErr.Response["data"].(map[string]any)
+				log.Printf("join room by confirmation error data keys=%v", mapKeys(data))
+				for key, value := range data {
+					log.Printf("join room by confirmation error field=%s type=%T", key, value)
+				}
+			}
+			log.Fatalf("join room by confirmation: %v", err)
+		}
 	case *shareJoin:
 		log.Println("joining room by share code...")
 		room, err = client.JoinRoomByShareCode(*shareID, *shareCode)
 		if err != nil {
+			if responseErr, ok := err.(*api.ResponseError); ok {
+				data, _ := responseErr.Response["data"].(map[string]any)
+				log.Printf("join room by share code error data keys=%v", mapKeys(data))
+				for key, value := range data {
+					log.Printf("join room by share code error field=%s type=%T", key, value)
+				}
+			}
 			log.Fatalf("join share room: %v", err)
 		}
 	case *shareGuest:
@@ -150,6 +255,11 @@ func main() {
 			log.Fatalf("load room file: %v", err)
 		}
 		log.Printf("loaded room from %s", *roomFile)
+		// The room-file controller reuses the guest's signaling token. The
+		// passive peer skips the controller-role events that the gateway
+		// rejects for this token, while Controlling=true prevents the gateway
+		// from treating the second connection as a duplicate controlled session.
+		room.IsRoomFileController = true
 	default:
 		log.Printf("joining room for device %s...", targetDevID)
 		room, err = client.JoinRoomByDevice(targetDevID, false)
@@ -210,8 +320,11 @@ func main() {
 		log.Printf("control ConnectOptions device_id=%s (auth device_id=%s)", peerDeviceID, cfg.DeviceID)
 	}
 	p, err := peer.NewController(&peer.Config{
-		Signal:   sig,
-		DeviceID: peerDeviceID,
+		Signal:       sig,
+		DeviceID:     peerDeviceID,
+		AppControlID: controllerAppControlID,
+		Passive:      room.IsRoomFileController,
+		ForceRelay:   *forceRelay,
 		OnSignalData: func(data []byte) {
 			// Port mapping frames arrive on the room's pb channel
 			log.Printf("[pb-recv] %s", truncateStr(string(data), 200))
@@ -355,9 +468,13 @@ func main() {
 	}
 }
 
-func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string) {
-	log.Println("registering controlled device...")
-	if _, err := client.InitMacDevice("UULink"); err != nil {
+func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool) {
+	hostname, err := cfg.EffectiveHostname()
+	if err != nil {
+		log.Fatalf("resolve hostname: %v", err)
+	}
+	log.Printf("registering controlled device %q...", hostname)
+	if _, err := client.InitMacDevice(hostname); err != nil {
 		log.Fatalf("register controlled device: %v", err)
 	}
 	if _, err := client.SetMacControllable(true); err != nil {
@@ -369,10 +486,16 @@ func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile
 	if err != nil {
 		log.Fatalf("create room: %v", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, nil)
+	serveRoom(client, cfg, rules, room, roomFile, nil, forceRelay, guestShareOptions{})
 }
 
-func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string) {
+type guestShareOptions struct {
+	ControlID  string
+	AuthMode   api.ShareAuthMode
+	CustomCode string
+}
+
+func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions) {
 	log.Println("creating guest-controlled room...")
 	session, err := client.CreateGuest()
 	if err != nil {
@@ -383,18 +506,45 @@ func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roo
 		log.Fatalf("create guest room: %v", err)
 	}
 	log.Printf("guest room created: signaling=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
-	serveRoom(client, cfg, rules, room, roomFile, session)
+	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions)
 }
 
-func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession) {
+func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions) {
+	log.Println("registering a new accountless device and creating a guest session...")
+	hostname, err := cfg.EffectiveHostname()
+	if err != nil {
+		log.Fatalf("resolve hostname: %v", err)
+	}
+	session, identity, err := client.CreateUnboundGuest(hostname)
+	if err != nil {
+		log.Fatalf("create unbound guest: %v", err)
+	}
+	cfg.ClientID = identity.ClientID
+	cfg.DeviceID = identity.DeviceID
+	log.Printf("unbound guest identity: client_id=%s device_id=%s guest_id=%s",
+		identity.ClientID, identity.DeviceID, session.GuestID)
+
+	room, err := client.CreateGuestRoom(session)
+	if err != nil {
+		log.Fatalf("create guest room: %v", err)
+	}
+	log.Printf("guest room created: signaling=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
+	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions)
+}
+
+func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, forceRelay bool, shareOptions guestShareOptions) {
 	log.Printf("signaling_server=%s (%d gateways)", room.SignalingServer, len(room.SignalingList))
 	log.Printf("server device_id=%s", cfg.DeviceID)
 	logActiveMappings("server mappings configured", rules)
-	if roomFile != "" && guestSession == nil {
-		if err := saveRoomFile(roomFile, room); err != nil {
+	if roomFile != "" {
+		roomInfoFile := roomFile
+		if guestSession != nil {
+			roomInfoFile = roomFile + ".room"
+		}
+		if err := saveRoomFile(roomInfoFile, room); err != nil {
 			log.Fatalf("save room file: %v", err)
 		}
-		log.Printf("saved room connection info to %s", roomFile)
+		log.Printf("saved room connection info to %s", roomInfoFile)
 	}
 
 	gateway := room.SignalingServer
@@ -420,15 +570,107 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		log.Fatal("signaling closed")
 	}
 
+	var share *api.GuestShareInfo
 	if guestSession != nil {
-		share, err := waitForGuestConnectID(client, guestSession)
+		if _, err := client.GuestSetDeviceControllable(guestSession, true); err != nil {
+			log.Fatalf("set guest device controllable: %v", err)
+		}
+		share, err = waitForGuestConnectID(client, guestSession)
 		if err != nil {
 			log.Fatalf("get guest share info: %v", err)
 		}
-		share, err = ensureGuestShareCode(client, guestSession, share)
+		share, err = ensureGuestShareCode(client, guestSession, share, shareOptions)
 		if err != nil {
 			log.Fatalf("prepare guest share code: %v", err)
 		}
+		controlModeID := shareOptions.ControlID
+		if controlModeID == "" {
+			controlModeID = share.ConnectID
+		}
+		if _, err := client.GuestShareUploadControlMode(guestSession,
+			api.NewGuestShareUploadControlModeRequest(controlModeID, true, shareOptions.AuthMode)); err != nil {
+			log.Fatalf("upload guest control mode: %v", err)
+		}
+	}
+
+	sig.On("bmsg_push", func(ev *signaling.Event) {
+		if len(ev.Args) == 0 {
+			return
+		}
+
+		var push struct {
+			Type string `json:"type"`
+			Data struct {
+				ControlID string `json:"control_id"`
+				Salt      string `json:"salt"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(ev.Args[0], &push); err != nil {
+			log.Printf("[signaling] controlled bmsg_push parse error: %v", err)
+			return
+		}
+
+		if guestSession != nil && push.Type == "remote_control" {
+			if push.Data.ControlID == "" {
+				log.Printf("remote control push has no control_id (salt_length=%d)", len(push.Data.Salt))
+				return
+			}
+			updatedShare, err := uploadGuestShareCode(client, guestSession, share, push.Data.ControlID, push.Data.Salt, shareOptions)
+			if err != nil {
+				log.Printf("upload remote-control guest share sign failed: %v", err)
+				return
+			}
+			share = updatedShare
+			if roomFile != "" {
+				if err := saveGuestShareFile(roomFile, share); err != nil {
+					log.Printf("update remote-control guest share file failed: %v", err)
+				}
+			}
+			_, err = client.GuestShareConfirmation(guestSession, &api.GuestShareConfirmationRequest{
+				ControlID:    push.Data.ControlID,
+				AllowControl: true,
+				NeedPassword: shareOptions.AuthMode != api.ShareAuthCustom,
+			})
+			if err != nil {
+				log.Printf("confirm remote control failed: %v", err)
+				return
+			}
+			log.Printf("remote control confirmed: control_id_length=%d salt_length=%d",
+				len(push.Data.ControlID), len(push.Data.Salt))
+			return
+		}
+
+		if push.Type == "get_control_mode" {
+			log.Printf("[signaling] get_control_mode payload: %s", truncate(string(ev.Args[0]), 1000))
+			if guestSession != nil && push.Data.ControlID != "" {
+				updatedShare, err := uploadGuestShareCode(client, guestSession, share, push.Data.ControlID, push.Data.Salt, shareOptions)
+				if err != nil {
+					log.Printf("upload pushed guest share sign failed: %v", err)
+					return
+				}
+				share = updatedShare
+				controlModeRequest := api.NewGuestShareUploadControlModeRequest(push.Data.ControlID, true, shareOptions.AuthMode)
+				if _, err := client.GuestShareUploadControlMode(guestSession, controlModeRequest); err != nil {
+					log.Printf("upload pushed control mode failed: %v", err)
+				} else {
+					log.Printf("uploaded pushed control mode: control_id_length=%d", len(push.Data.ControlID))
+				}
+				share.ControlID = push.Data.ControlID
+				if roomFile != "" {
+					if err := saveGuestShareFile(roomFile, share); err != nil {
+						log.Printf("update guest share control_id file failed: %v", err)
+					} else {
+						log.Printf("updated guest share control_id file: control_id_length=%d", len(push.Data.ControlID))
+					}
+				}
+			}
+			return
+		}
+
+		log.Printf("[signaling] controlled bmsg_push type=%q", push.Type)
+	})
+
+	if guestSession != nil {
 		if roomFile != "" {
 			if err := saveGuestShareFile(roomFile, share); err != nil {
 				log.Fatalf("save guest share file: %v", err)
@@ -438,15 +680,10 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		log.Printf("guest share ready: connect_id=%s code_length=%d", share.ConnectID, len(share.ConnectCode))
 	}
 
-	sig.On("bmsg_push", func(ev *signaling.Event) {
-		if len(ev.Args) > 0 {
-			log.Printf("[signaling] controlled bmsg_push: %s", truncate(string(ev.Args[0]), 800))
-		}
-	})
-
 	var tun *tunnel.Tunnel
 	p, err := peer.NewControlled(&peer.Config{
-		Signal: sig,
+		Signal:     sig,
+		ForceRelay: forceRelay,
 		OnSignalData: func(data []byte) {
 			log.Printf("[pb-recv] %s", truncateStr(string(data), 200))
 			if tun != nil {
@@ -507,24 +744,32 @@ func waitForGuestConnectID(client *api.Client, session *api.GuestSession) (*api.
 	return nil, lastErr
 }
 
-func ensureGuestShareCode(client *api.Client, session *api.GuestSession, share *api.GuestShareInfo) (*api.GuestShareInfo, error) {
-	if share.ConnectCode != "" {
-		return share, nil
+func ensureGuestShareCode(client *api.Client, session *api.GuestSession, share *api.GuestShareInfo, shareOptions guestShareOptions) (*api.GuestShareInfo, error) {
+	controlID := share.ConnectID
+	if shareOptions.ControlID != "" {
+		controlID = shareOptions.ControlID
 	}
-
-	passCode, err := api.GenerateSharePassCode()
-	if err != nil {
-		return nil, err
+	temporaryCode := share.ConnectCode
+	if temporaryCode == "" {
+		var err error
+		temporaryCode, err = api.GenerateSharePassCode()
+		if err != nil {
+			return nil, err
+		}
 	}
-	request := &api.GuestShareUploadSignRequest{
-		CanControl: true,
-		ControlID:  share.ConnectID,
-		Sign:       api.SharePassCodeSign(share.ConnectID, passCode),
-		BackupSign: "",
+	customCode := shareOptions.CustomCode
+	if customCode == "" && shareOptions.AuthMode != api.ShareAuthTemporary {
+		var err error
+		customCode, err = api.GenerateCustomShareCode()
+		if err != nil {
+			return nil, err
+		}
 	}
+	request := api.NewGuestShareUploadSignRequest(controlID, temporaryCode, customCode, shareOptions.AuthMode)
 	if _, err := client.GuestShareUploadSign(session, request); err != nil {
 		return nil, err
 	}
+	uploadedCode := temporaryCode
 
 	refreshed, err := client.GetGuestShareInfo(session)
 	if err != nil {
@@ -534,11 +779,68 @@ func ensureGuestShareCode(client *api.Client, session *api.GuestSession, share *
 		return nil, fmt.Errorf("connect_id changed after upload sign")
 	}
 	if refreshed.ConnectCode != "" {
-		return refreshed, nil
+		temporaryCode = refreshed.ConnectCode
 	}
-
+	log.Printf("guest share code refresh: uploaded_len=%d returned_len=%d changed=%v",
+		len(uploadedCode), len(refreshed.ConnectCode), refreshed.ConnectCode != uploadedCode)
 	refreshed.ConnectID = share.ConnectID
-	refreshed.ConnectCode = passCode
+	refreshed.TemporaryCode = temporaryCode
+	refreshed.CustomCode = customCode
+	refreshed.ConnectCode = api.ShareJoinCode(temporaryCode, customCode, shareOptions.AuthMode)
+	if shareOptions.ControlID != "" {
+		refreshed.ControlID = shareOptions.ControlID
+	}
+	return refreshed, nil
+}
+
+func uploadGuestShareCode(client *api.Client, session *api.GuestSession, share *api.GuestShareInfo, controlID, salt string, shareOptions guestShareOptions) (*api.GuestShareInfo, error) {
+	temporaryCode := share.TemporaryCode
+	if temporaryCode == "" && shareOptions.AuthMode != api.ShareAuthCustom {
+		temporaryCode = share.ConnectCode
+	}
+	if temporaryCode == "" {
+		var err error
+		temporaryCode, err = api.GenerateSharePassCode()
+		if err != nil {
+			return nil, err
+		}
+	}
+	customCode := share.CustomCode
+	if customCode == "" && shareOptions.AuthMode != api.ShareAuthTemporary {
+		var err error
+		customCode, err = api.GenerateCustomShareCode()
+		if err != nil {
+			return nil, err
+		}
+	}
+	var request *api.GuestShareUploadSignRequest
+	if salt != "" {
+		request = api.NewGuestShareUploadSignRequestWithSalt(controlID, salt, temporaryCode, customCode, shareOptions.AuthMode)
+		log.Printf("uploading salted guest share sign: control_id_len=%d salt_len=%d", len(controlID), len(salt))
+	} else {
+		request = api.NewGuestShareUploadSignRequest(controlID, temporaryCode, customCode, shareOptions.AuthMode)
+	}
+	if _, err := client.GuestShareUploadSign(session, request); err != nil {
+		return nil, err
+	}
+	uploadedCode := temporaryCode
+	refreshed, err := client.GetGuestShareInfo(session)
+	if err != nil {
+		return nil, fmt.Errorf("refresh after pushed upload sign: %w", err)
+	}
+	if refreshed.ConnectID != "" && refreshed.ConnectID != share.ConnectID {
+		return nil, fmt.Errorf("connect_id changed after pushed upload sign")
+	}
+	if refreshed.ConnectCode != "" {
+		temporaryCode = refreshed.ConnectCode
+	}
+	log.Printf("pushed guest share code refresh: uploaded_len=%d returned_len=%d changed=%v",
+		len(uploadedCode), len(refreshed.ConnectCode), refreshed.ConnectCode != uploadedCode)
+	refreshed.ConnectID = share.ConnectID
+	refreshed.TemporaryCode = temporaryCode
+	refreshed.CustomCode = customCode
+	refreshed.ConnectCode = api.ShareJoinCode(temporaryCode, customCode, shareOptions.AuthMode)
+	refreshed.ControlID = controlID
 	return refreshed, nil
 }
 
@@ -549,14 +851,20 @@ type roomFileInfo struct {
 }
 
 type guestShareFileInfo struct {
-	ConnectID   string `json:"connect_id"`
-	ConnectCode string `json:"connect_code"`
+	ConnectID     string `json:"connect_id"`
+	ConnectCode   string `json:"connect_code"`
+	TemporaryCode string `json:"temporary_code,omitempty"`
+	CustomCode    string `json:"custom_code,omitempty"`
+	ControlID     string `json:"control_id,omitempty"`
 }
 
 func saveGuestShareFile(path string, share *api.GuestShareInfo) error {
 	data, err := json.Marshal(guestShareFileInfo{
-		ConnectID:   share.ConnectID,
-		ConnectCode: share.ConnectCode,
+		ConnectID:     share.ConnectID,
+		ConnectCode:   share.ConnectCode,
+		TemporaryCode: share.TemporaryCode,
+		CustomCode:    share.CustomCode,
+		ControlID:     share.ControlID,
 	})
 	if err != nil {
 		return err
@@ -675,6 +983,14 @@ func generateRuleID() string {
 		v = uint64(time.Now().UnixNano())
 	}
 	return strconv.FormatUint(v, 10)
+}
+
+func generateAppControlID() (string, error) {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // peerSender adapts peer.Peer to tunnel.FrameSender, wrapping frames in
@@ -924,7 +1240,7 @@ func doGuestTest(client *api.Client) {
 
 	if share.ConnectCode == "" {
 		log.Printf("connect_code is empty; uploading generated share pass code")
-		share, err = ensureGuestShareCode(client, session, share)
+		share, err = ensureGuestShareCode(client, session, share, guestShareOptions{AuthMode: api.ShareAuthTemporary})
 		if err != nil {
 			log.Fatalf("upload guest share sign: %v", err)
 		}

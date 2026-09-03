@@ -2,7 +2,7 @@
 // the PM (port mapping) UDP transport.
 //
 // Wire layout (reverse-engineered from official client captures, 2026-08-30;
-// see workspace/uulink-findings.md section 9.8):
+// see doc/uulink-findings.md section 9.8):
 //
 //	byte 0      : rolling command/checksum byte (differs per frame and per
 //	              session even for identical message sizes)

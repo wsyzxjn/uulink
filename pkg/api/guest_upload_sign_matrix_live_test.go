@@ -63,12 +63,9 @@ func TestLiveGuestShareUploadSignMatrix(t *testing.T) {
 			"reverse": SharePassCodeSign(passCode, controlID),
 		}
 		for signName, sign := range signs {
-			resp, err := controlledClient.GuestShareUploadSign(controlledGuest, &GuestShareUploadSignRequest{
-				CanControl: true,
-				ControlID:  controlID,
-				Sign:       sign,
-				BackupSign: sign,
-			})
+			request := NewGuestShareUploadSignRequest(controlID, passCode, "", ShareAuthTemporary)
+			request.Sign = sign
+			resp, err := controlledClient.GuestShareUploadSign(controlledGuest, request)
 			if err != nil {
 				var responseErr *ResponseError
 				if !errors.As(err, &responseErr) {

@@ -7,6 +7,22 @@ import (
 	"path/filepath"
 )
 
+// EffectiveHostname returns the configured hostname, or the current system
+// hostname when the config leaves it unset.
+func (c *Config) EffectiveHostname() (string, error) {
+	if c.Hostname != "" {
+		return c.Hostname, nil
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("read system hostname: %w", err)
+	}
+	if hostname == "" {
+		return "", fmt.Errorf("system hostname is empty")
+	}
+	return hostname, nil
+}
+
 // SaveConfigFile atomically writes cfg as JSON with owner-only permissions.
 func SaveConfigFile(path string, cfg *Config) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")

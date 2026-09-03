@@ -13,6 +13,7 @@ func TestSaveConfigFileIsAtomicAndOwnerOnly(t *testing.T) {
 		ClientID: "client",
 		DeviceID: "device",
 		UserID:   "user",
+		Hostname: "hostname",
 		Mappings: []PortMapping{{
 			LocalHost:  "127.0.0.1",
 			LocalPort:  18080,
@@ -29,7 +30,7 @@ func TestSaveConfigFileIsAtomicAndOwnerOnly(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 	if loaded.JWT != cfg.JWT || loaded.ClientID != cfg.ClientID ||
-		loaded.DeviceID != cfg.DeviceID || loaded.UserID != cfg.UserID {
+		loaded.DeviceID != cfg.DeviceID || loaded.UserID != cfg.UserID || loaded.Hostname != cfg.Hostname {
 		t.Fatalf("loaded config mismatch: %+v", loaded)
 	}
 	if len(loaded.Mappings) != 1 || loaded.Mappings[0] != cfg.Mappings[0] {
@@ -50,5 +51,33 @@ func TestSaveConfigFileIsAtomicAndOwnerOnly(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("config directory has %d entries, want only config.json", len(entries))
+	}
+}
+
+func TestEffectiveHostnameUsesConfiguredValue(t *testing.T) {
+	cfg := &Config{Hostname: "custom-host"}
+
+	hostname, err := cfg.EffectiveHostname()
+	if err != nil {
+		t.Fatalf("EffectiveHostname() error: %v", err)
+	}
+	if hostname != "custom-host" {
+		t.Fatalf("EffectiveHostname() = %q, want custom-host", hostname)
+	}
+}
+
+func TestEffectiveHostnameFallsBackToSystemHostname(t *testing.T) {
+	cfg := &Config{}
+
+	got, err := cfg.EffectiveHostname()
+	if err != nil {
+		t.Fatalf("EffectiveHostname() error: %v", err)
+	}
+	want, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("os.Hostname() error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("EffectiveHostname() = %q, want %q", got, want)
 	}
 }

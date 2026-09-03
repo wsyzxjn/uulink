@@ -103,6 +103,7 @@ type Config struct {
 	ClientID string        `json:"client_id"` // IOPlatformUUID
 	DeviceID string        `json:"device_id"` // this device id
 	UserID   string        `json:"user_id"`
+	Hostname string        `json:"hostname,omitempty"`
 	GuestID  string        `json:"guest_id,omitempty"`
 	Mappings []PortMapping `json:"mappings,omitempty"`
 }

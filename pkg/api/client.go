@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"strconv"
 	"time"
 
@@ -34,10 +35,11 @@ func (e *ResponseError) Error() string {
 
 // NewClient creates an API client with the given auth config.
 func NewClient(cfg *auth.Config) *Client {
+	jar, _ := cookiejar.New(nil)
 	return &Client{
 		cfg: cfg,
 		// The official QR-code login status request is a 60 second long poll.
-		http: &http.Client{Timeout: 60 * time.Second},
+		http: &http.Client{Timeout: 60 * time.Second, Jar: jar},
 	}
 }
 

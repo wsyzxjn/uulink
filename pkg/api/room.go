@@ -12,7 +12,11 @@ type RoomConnectionInfo struct {
 	SignalingList   []string // all gateway URLs
 	ReportURL       string   // relay report URL
 	ReportToken     string   // relay report token
-	Raw             map[string]any
+	// IsRoomFileController marks a controller that loaded the room from a
+	// file written by the guest. Its signaling token was issued for the
+	// controlled role, so the controller must connect with Controlling=false.
+	IsRoomFileController bool
+	Raw                  map[string]any
 }
 
 // CreateRoom calls POST /api/v1/room/create (server/controlled side).

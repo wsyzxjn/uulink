@@ -1,19 +1,44 @@
+# Binaries
 /uulink
 /uulink.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Config with credentials
 config.json
+
+# Reverse-engineering workspace (debug scripts, captures, findings)
+/workspace/
+
+# Local documentation
+/doc/
+
+# Temporary debug command
+/cmd/tmpcontrolid/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+/dist/
+*.zip
+*.tar.gz
+
+# Logs and dumps
+*.log
 *.jsonl
-/workspace/.secrets/
-/workspace/__pycache__/
-/workspace/*.exe
-/workspace/*.exe.xz
-/workspace/uulink-windows-amd64.zip
-/workspace/ocr_screen
-/workspace/decrypt_nrd.py
-/workspace/dumps/
-/workspace/*config*.json
-/workspace/login-qrcode.json
-/workspace/login-qrcode-status.json
-/workspace/login-qrcode-jwt.json
-/workspace/login-qrcode.png
-/workspace/qwq-login*
-/workspace/*.log
+
+# Go
+*.test
+*.out
+coverage.*

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -52,6 +53,29 @@ func (c *Client) CreateGuest() (*GuestSession, error) {
 	}
 
 	return &GuestSession{GuestID: guestID, Token: token, UserID: userID, DeviceID: deviceID}, nil
+}
+
+// CreateUnboundGuest registers a new device without a user account and then
+// creates a guest session for it. The resulting session is not associated
+// with any logged-in user, which avoids the server's same-account
+// self-assist restriction.
+func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceIdentity, error) {
+	identity, err := c.InitWindowsDeviceWithoutAuth(name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create unbound device: %w", err)
+	}
+
+	cfg := *c.cfg
+	cfg.JWT = ""
+	cfg.UserID = ""
+	cfg.GuestID = ""
+	cfg.ClientID = identity.ClientID
+	cfg.DeviceID = identity.DeviceID
+	session, err := NewClient(&cfg).CreateGuest()
+	if err != nil {
+		return nil, identity, fmt.Errorf("create guest for unbound device: %w", err)
+	}
+	return session, identity, nil
 }
 
 func jwtClaims(token string) (userID string, deviceID string, err error) {
@@ -105,10 +129,13 @@ func (c *Client) CreateGuestRoom(session *GuestSession) (*RoomConnectionInfo, er
 
 // GuestShareInfo holds the temporary share code returned to a guest.
 type GuestShareInfo struct {
-	Alias       string
-	ConnectID   string
-	ConnectCode string
-	Raw         map[string]any
+	Alias         string
+	ConnectID     string
+	ConnectCode   string
+	TemporaryCode string
+	CustomCode    string
+	ControlID     string
+	Raw           map[string]any
 }
 
 // GetGuestShareInfo calls POST /api/v1/guest/share/info with a guest session.
@@ -145,6 +172,53 @@ func GenerateSharePassCode() (string, error) {
 	return string(out), nil
 }
 
+// GenerateCustomShareCode creates an eight-character code that satisfies the
+// official custom-code rule of containing both letters and digits.
+func GenerateCustomShareCode() (string, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		code, err := GenerateSharePassCode()
+		if err != nil {
+			return "", err
+		}
+		hasLetter := false
+		hasDigit := false
+		for _, char := range code {
+			if char >= '0' && char <= '9' {
+				hasDigit = true
+			} else {
+				hasLetter = true
+			}
+		}
+		if hasLetter && hasDigit {
+			return code, nil
+		}
+	}
+	return "", errors.New("generate custom share code: unable to satisfy code alphabet")
+}
+
+// ValidateCustomShareCode enforces the official custom-code format.
+func ValidateCustomShareCode(code string) error {
+	if len(code) < 8 || len(code) > 16 {
+		return fmt.Errorf("custom share code length is %d, want 8-16", len(code))
+	}
+	hasLetter := false
+	hasDigit := false
+	for _, char := range code {
+		switch {
+		case char >= '0' && char <= '9':
+			hasDigit = true
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z':
+			hasLetter = true
+		default:
+			return fmt.Errorf("custom share code contains invalid character %q", char)
+		}
+	}
+	if !hasLetter || !hasDigit {
+		return errors.New("custom share code must contain both letters and digits")
+	}
+	return nil
+}
+
 // SharePassCodeSign returns the lowercase SHA-256 hex digest used by the guest
 // share upload-sign endpoint.
 func SharePassCodeSign(controlID, passCode string) string {
@@ -152,13 +226,149 @@ func SharePassCodeSign(controlID, passCode string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// SharePassCodeSignWithSalt returns the SHA-256 digest that incorporates the
+// server-provided salt from the remote-control push. The official flow uses
+// a challenge-response: the server sends a salt, the guest re-signs the pass
+// code with it, and the server validates the controller's submitted code
+// against that salted digest.
+func SharePassCodeSignWithSalt(controlID, salt, passCode string) string {
+	digest := sha256.Sum256([]byte(controlID + salt + passCode))
+	return hex.EncodeToString(digest[:])
+}
+
+// ShareAuthMode selects the official guest share authorization mode.
+type ShareAuthMode string
+
+const (
+	// ShareAuthTemporary maps to the official by_password control mode and
+	// requires the generated temporary verification code.
+	ShareAuthTemporary ShareAuthMode = "temporary"
+	// ShareAuthCustom maps to the official by_confirmation control mode and
+	// requires a caller-selected custom verification code.
+	ShareAuthCustom ShareAuthMode = "custom"
+	// ShareAuthBoth maps to the official password_confirmation control mode
+	// and requires both the temporary and custom verification codes.
+	ShareAuthBoth ShareAuthMode = "both"
+)
+
+// ParseShareAuthMode converts the CLI mode name to a ShareAuthMode.
+func ParseShareAuthMode(value string) (ShareAuthMode, error) {
+	switch value {
+	case "temporary":
+		return ShareAuthTemporary, nil
+	case "custom":
+		return ShareAuthCustom, nil
+	case "both":
+		return ShareAuthBoth, nil
+	default:
+		return "", fmt.Errorf("invalid share auth mode %q (want temporary, custom, or both)", value)
+	}
+}
+
+// OfficialControlMode returns the control_mode string used by the official API.
+func (mode ShareAuthMode) OfficialControlMode() string {
+	switch mode {
+	case ShareAuthTemporary:
+		return "by_password"
+	case ShareAuthCustom:
+		return "by_confirmation"
+	case ShareAuthBoth:
+		return "password_confirmation"
+	default:
+		return ""
+	}
+}
+
+// NeedsConfirmation returns the need_confirmation value used with the mode.
+func (mode ShareAuthMode) NeedsConfirmation() bool {
+	return mode == ShareAuthCustom || mode == ShareAuthBoth
+}
+
+// ShareJoinCode returns the verification string submitted by the controller.
+func ShareJoinCode(temporaryCode, customCode string, mode ShareAuthMode) string {
+	switch mode {
+	case ShareAuthTemporary:
+		return temporaryCode
+	case ShareAuthCustom:
+		return customCode
+	case ShareAuthBoth:
+		return temporaryCode + customCode
+	default:
+		return ""
+	}
+}
+
 // GuestShareUploadSignRequest is the request body for the recipient-side
 // verification-code upload.
 type GuestShareUploadSignRequest struct {
-	CanControl bool   `json:"can_remote_control"`
-	ControlID  string `json:"control_id"`
-	Sign       string `json:"sign"`
-	BackupSign string `json:"backup_sign"`
+	CanControl       bool   `json:"can_remote_control"`
+	ControlID        string `json:"control_id"`
+	Sign             string `json:"sign"`
+	BackupSign       string `json:"backup_sign"`
+	ControlMode      string `json:"control_mode"`
+	NeedConfirmation bool   `json:"need_confirmation"`
+}
+
+// NewGuestShareUploadSignRequest builds the official upload-sign body for a
+// share authorization mode. The temporary code is signed in sign and the
+// custom code is signed in backup_sign.
+func NewGuestShareUploadSignRequest(controlID, temporaryCode, customCode string, mode ShareAuthMode) *GuestShareUploadSignRequest {
+	request := &GuestShareUploadSignRequest{
+		CanControl:       true,
+		ControlID:        controlID,
+		ControlMode:      mode.OfficialControlMode(),
+		NeedConfirmation: mode.NeedsConfirmation(),
+	}
+	if mode == ShareAuthTemporary || mode == ShareAuthBoth {
+		request.Sign = SharePassCodeSign(controlID, temporaryCode)
+	}
+	if mode == ShareAuthCustom || mode == ShareAuthBoth {
+		request.BackupSign = SharePassCodeSign(controlID, customCode)
+	}
+	return request
+}
+
+// NewGuestShareUploadSignRequestWithSalt builds the upload-sign body using
+// the salted digest from the remote-control push.
+func NewGuestShareUploadSignRequestWithSalt(controlID, salt, temporaryCode, customCode string, mode ShareAuthMode) *GuestShareUploadSignRequest {
+	request := &GuestShareUploadSignRequest{
+		CanControl:       true,
+		ControlID:        controlID,
+		ControlMode:      mode.OfficialControlMode(),
+		NeedConfirmation: mode.NeedsConfirmation(),
+	}
+	if mode == ShareAuthTemporary || mode == ShareAuthBoth {
+		request.Sign = SharePassCodeSignWithSalt(controlID, salt, temporaryCode)
+	}
+	if mode == ShareAuthCustom || mode == ShareAuthBoth {
+		request.BackupSign = SharePassCodeSignWithSalt(controlID, salt, customCode)
+	}
+	return request
+}
+
+// GuestShareUploadControlModeRequest is the request body used by a guest
+// controlled endpoint to publish its remote-assistance control mode.
+type GuestShareUploadControlModeRequest struct {
+	ControlID    string `json:"control_id"`
+	AllowControl bool   `json:"allow_control"`
+	ControlMode  string `json:"control_mode"`
+}
+
+// NewGuestShareUploadControlModeRequest builds a control-mode upload request.
+func NewGuestShareUploadControlModeRequest(controlID string, allowControl bool, mode ShareAuthMode) *GuestShareUploadControlModeRequest {
+	return &GuestShareUploadControlModeRequest{
+		ControlID:    controlID,
+		AllowControl: allowControl,
+		ControlMode:  mode.OfficialControlMode(),
+	}
+}
+
+// GuestShareConfirmationRequest is the request body used by a guest
+// controlled endpoint to accept a remote-control confirmation push.
+type GuestShareConfirmationRequest struct {
+	ControlID    string `json:"control_id"`
+	AllowControl bool   `json:"allow_control"`
+	NeedPassword bool   `json:"need_password"`
 }
 
 // GuestShareUploadSign calls POST /api/v1/guest/room/share/upload/sign.
@@ -174,19 +384,113 @@ func (c *Client) GuestShareUploadSign(session *GuestSession, request *GuestShare
 	return resp, nil
 }
 
-// JoinRoomByShareCode calls POST /api/v1/room/join/share/by_code with a
+// GuestShareUploadSignV2 calls POST /api/v2/room/share/upload_sign. The
+// official controller join also uses v2 endpoints, so the guest-side sign
+// upload must use the same API generation for the server to associate them.
+func (c *Client) GuestShareUploadSignV2(session *GuestSession, request *GuestShareUploadSignRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/share/upload_sign", request)
+	if err != nil {
+		return nil, fmt.Errorf("guest share upload sign v2: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	return resp, nil
+}
+
+// GuestShareUploadControlMode calls POST /api/v1/guest/room/share/upload_control_mode.
+func (c *Client) GuestShareUploadControlMode(session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/upload_control_mode", request)
+	if err != nil {
+		return nil, fmt.Errorf("guest share upload control mode: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	return resp, nil
+}
+
+// GuestShareUploadControlModeV2 calls POST /api/v2/room/share/upload_control_mode.
+func (c *Client) GuestShareUploadControlModeV2(session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/share/upload_control_mode", request)
+	if err != nil {
+		return nil, fmt.Errorf("guest share upload control mode v2: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	return resp, nil
+}
+
+// GuestSetDeviceControllable marks a guest-controlled device as available for
+// remote assistance.
+func (c *Client) GuestSetDeviceControllable(session *GuestSession, controllable bool) (map[string]any, error) {
+	resp, err := c.guestClient(session).Do("POST", "/api/v1/device/controllable", map[string]bool{
+		"controllable": controllable,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("guest set device controllable: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	return resp, nil
+}
+
+// GetShareControlMode queries the controller-side remote-assistance control
+// mode for a share.
+func (c *Client) GetShareControlMode(connectID string) (map[string]any, error) {
+	resp, err := c.Do("POST", "/api/v2/room/share/control_mode", map[string]string{
+		"connect_id": connectID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get share control mode: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	return resp, nil
+}
+
+// GuestShareConfirmation calls the guest-side confirmation endpoint. It must
+// be sent after the controlling side triggers the remote_control push.
+func (c *Client) GuestShareConfirmation(session *GuestSession, request *GuestShareConfirmationRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/confirmation", request)
+	if err != nil {
+		return nil, fmt.Errorf("guest share confirmation: %w", err)
+	}
+	if code, ok := resp["code"].(float64); ok && code != 0 {
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	}
+	return resp, nil
+}
+
+// JoinRoomByShareCodeRequest is the official v2 by_code request body.
+type JoinRoomByShareCodeRequest struct {
+	ConnectID   string `json:"connect_id"`
+	ConnectCode string `json:"connect_code"`
+}
+
+// JoinRoomByShareCode calls POST /api/v2/room/join/share/by_code with a
 // logged-in controller identity.
 func (c *Client) JoinRoomByShareCode(connectID, deviceCode string) (*RoomConnectionInfo, error) {
-	body := map[string]any{
-		"connect_id":  connectID,
-		"device_code": deviceCode,
+	body := &JoinRoomByShareCodeRequest{
+		ConnectID:   connectID,
+		ConnectCode: deviceCode,
 	}
-	resp, err := c.Do("POST", "/api/v1/room/join/share/by_code", body)
+	resp, err := c.Do("POST", "/api/v2/room/join/share/by_code", body)
 	if err != nil {
 		return nil, fmt.Errorf("join share room: %w", err)
 	}
 	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("join share room failed, code %v: %v", code, resp["msg"])
+		message, _ := resp["msg"].(string)
+		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
 	}
 	data, ok := resp["data"].(map[string]any)
 	if !ok {
@@ -198,11 +502,11 @@ func (c *Client) JoinRoomByShareCode(connectID, deviceCode string) (*RoomConnect
 // JoinRoomByShareCodeWithGuest joins a remote-assistance share using a guest
 // identity instead of the configured user JWT.
 func (c *Client) JoinRoomByShareCodeWithGuest(session *GuestSession, connectID, deviceCode string) (*RoomConnectionInfo, error) {
-	body := map[string]any{
-		"connect_id":  connectID,
-		"device_code": deviceCode,
+	body := &JoinRoomByShareCodeRequest{
+		ConnectID:   connectID,
+		ConnectCode: deviceCode,
 	}
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/room/join/share/by_code", body)
+	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/join/share/by_code", body)
 	if err != nil {
 		return nil, fmt.Errorf("join share room with guest: %w", err)
 	}
