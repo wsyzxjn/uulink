@@ -169,6 +169,44 @@ INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
 
 Once connected, bidirectional port forwarding between the two endpoints is active immediately.
 
+### Method 4: Remote Configuration Distribution (tslink-Compatible Zero-Config Mode)
+
+Use this method for zero-friction distribution to friends or community players. The client fetches share credentials and mapping rules automatically from an HTTP(S) URL without requiring local configuration files or user logins.
+
+1. Publish or host a remote JSON configuration (e.g. on a web server, Cloudflare Worker, or GitHub Gist):
+
+```json
+{
+  "share_id": "266444253",
+  "share_code": "6W44YBPL",
+  "mappings": [
+    { "local_port": 25565, "remote_port": 25565 }
+  ],
+  "lan_motd": "Minecraft Server via uulink",
+  "lan_port": 25565
+}
+```
+
+The server can also automatically push updated share codes on startup using the `-publish-url` webhook:
+
+```bash
+./uulink -unbound-guest-serve -publish-url "https://example.com/sync" -publish-secret "mysecret" -mapping 25565:25565
+```
+
+2. Connect from the client using the configuration URL:
+
+```bash
+./uulink -config-url https://example.com/room.json
+```
+
+Or build a dedicated zero-argument client binary with the URL embedded via ldflags:
+
+```bash
+go build -ldflags="-X main.DefaultConfigURL=https://example.com/room.json" -o mc-link ./cmd/uulink
+```
+
+Users can simply run `./mc-link` without passing any arguments or maintaining a local `config.json`.
+
 ## Configuration Reference
 
 `config.json` structure:
@@ -239,6 +277,11 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-share` | Connect to an assistance server by share ID and code | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
+| `-config-url <url>` | Fetch remote share configuration and run in client mode | - |
+| `-publish-url <url>` | Webhook URL to publish share info on room start | - |
+| `-publish-secret <token>` | Optional bearer token for publish webhook | - |
+| `-lan-discovery` | Enable Minecraft LAN discovery broadcast for forwarded ports | off |
+| `-lan-motd <text>` | Override MOTD text for LAN discovery broadcast | - |
 
 ## FAQ
 

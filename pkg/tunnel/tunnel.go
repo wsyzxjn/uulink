@@ -7,6 +7,8 @@
 package tunnel
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -228,6 +230,19 @@ func isLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// GenerateRuleID generates an 8-byte numeric rule identifier string.
+func GenerateRuleID() string {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	v := binary.BigEndian.Uint64(b[:]) & ((1 << 63) - 1)
+	if v == 0 {
+		v = uint64(time.Now().UnixNano())
+	}
+	return strconv.FormatUint(v, 10)
 }
 
 // Tunnel manages one or more local mapping rules and all PM streams.

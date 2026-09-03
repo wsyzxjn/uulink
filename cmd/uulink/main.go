@@ -24,12 +24,18 @@ import (
 
 	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
+	"github.com/user/uulink/pkg/landiscover"
+	"github.com/user/uulink/pkg/remoteconfig"
 	"github.com/user/uulink/pkg/logging"
 	"github.com/user/uulink/pkg/peer"
 	"github.com/user/uulink/pkg/signaling"
 	"github.com/user/uulink/pkg/tunnel"
 	"github.com/user/uulink/pkg/tunnel/mixsend"
 )
+
+// DefaultConfigURL can be injected at compile time via -ldflags:
+// -ldflags="-X main.DefaultConfigURL=https://example.com/room.json"
+var DefaultConfigURL string
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to config file")
@@ -72,6 +78,11 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
+	configURL := flag.String("config-url", DefaultConfigURL, "URL to fetch remote share configuration from (tslink-compatible mode)")
+	publishURL := flag.String("publish-url", "", "webhook URL to publish share info on room start (guest serve modes)")
+	publishSecret := flag.String("publish-secret", "", "optional bearer token for publish webhook")
+	lanDiscovery := flag.Bool("lan-discovery", false, "enable Minecraft LAN discovery broadcast for forwarded ports")
+	lanMotd := flag.String("lan-motd", "", "override MOTD text for LAN discovery broadcast")
 	flag.Parse()
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
@@ -92,7 +103,11 @@ func main() {
 
 	cfg, err := auth.LoadConfigFile(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		if os.IsNotExist(err) && *configURL != "" {
+			cfg = &auth.Config{}
+		} else {
+			log.Fatalf("load config: %v", err)
+		}
 	}
 
 	secPolicy, err := buildSecurityPolicy(cfg, *allowLAN, *allowedPortsFlag)
@@ -158,15 +173,20 @@ func main() {
 	if *guestServe && *unboundGuestServe {
 		log.Fatal("-guest-serve and -unbound-guest-serve cannot be combined")
 	}
+	if *configURL != "" && (*serveMode || *guestServe || *unboundGuestServe) {
+		log.Fatal("-config-url cannot be combined with server modes (-serve, -guest-serve, -unbound-guest-serve)")
+	}
 	if *unboundGuestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
 		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
-			ControlID:  *guestControlID,
-			AuthMode:   authMode,
-			CustomCode: *guestCustomCode,
+			ControlID:     *guestControlID,
+			AuthMode:      authMode,
+			CustomCode:    *guestCustomCode,
+			PublishURL:    *publishURL,
+			PublishSecret: *publishSecret,
 		}, secPolicy)
 		return
 	}
@@ -176,9 +196,11 @@ func main() {
 			log.Fatalf("configure mappings: %v", err)
 		}
 		doGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
-			ControlID:  *guestControlID,
-			AuthMode:   authMode,
-			CustomCode: *guestCustomCode,
+			ControlID:     *guestControlID,
+			AuthMode:      authMode,
+			CustomCode:    *guestCustomCode,
+			PublishURL:    *publishURL,
+			PublishSecret: *publishSecret,
 		}, secPolicy)
 		return
 	}
@@ -194,17 +216,39 @@ func main() {
 		return
 	}
 
+	usesRemoteConfig := *configURL != ""
 	targetDevID := *deviceID
 	if targetDevID == "" {
 		targetDevID = cfg.DeviceID
 	}
 
-	if *roomFile == "" && !usesShareRoom && (targetDevID == "" || (targetDevID == cfg.DeviceID && !*allowSelf)) {
+	if *roomFile == "" && !usesShareRoom && !usesRemoteConfig && (targetDevID == "" || (targetDevID == cfg.DeviceID && !*allowSelf)) {
 		log.Fatal("target device must differ from this machine (use -device)")
 	}
-	rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
-	if err != nil {
-		log.Fatalf("configure mappings: %v", err)
+
+	var rules []tunnel.Rule
+	var remoteCfg *remoteconfig.RemoteShareConfig
+	if usesRemoteConfig {
+		logging.Infof("fetching remote share configuration from %s", *configURL)
+		var err error
+		remoteCfg, err = remoteconfig.Fetch(*configURL, 15*time.Second)
+		if err != nil {
+			log.Fatalf("fetch remote configuration: %v", err)
+		}
+		logging.Infof("remote configuration loaded: share_id=%s share_code=%s",
+			remoteCfg.EffectiveShareID(), remoteCfg.EffectiveShareCode())
+		if remoteCfg.ForceRelay {
+			*forceRelay = true
+		}
+		rules, err = remoteCfg.Rules(*ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		if err != nil {
+			log.Fatalf("configure mappings from remote config: %v", err)
+		}
+	} else {
+		rules, err = configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		if err != nil {
+			log.Fatalf("configure mappings: %v", err)
+		}
 	}
 
 	// Step 1: join the room created by the target device's server
@@ -249,6 +293,15 @@ func main() {
 				logging.Debugf("join room by share code error data keys=%v", mapKeys(data))
 			}
 			log.Fatalf("join share room: %v", err)
+		}
+	case usesRemoteConfig:
+		guestSession, guestErr := client.CreateGuest()
+		if guestErr != nil {
+			log.Fatalf("create guest: %v", guestErr)
+		}
+		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, remoteCfg.EffectiveShareID(), remoteCfg.EffectiveShareCode())
+		if err != nil {
+			log.Fatalf("join share room via remote config: %v", err)
 		}
 	case *shareGuest:
 		guestSession, guestErr := client.CreateGuest()
@@ -365,6 +418,27 @@ func main() {
 				log.Fatalf("start tunnel: %v", err)
 			}
 			logActiveMappings("port forwarding active", rules)
+
+			motd := ""
+			lanPort := 0
+			if remoteCfg != nil {
+				motd = remoteCfg.LANMOTD
+				lanPort = remoteCfg.LANPort
+			}
+			if *lanMotd != "" {
+				motd = *lanMotd
+			}
+			if lanPort <= 0 && len(rules) > 0 {
+				lanPort = rules[0].LocalPort
+			}
+			if (*lanDiscovery || (remoteCfg != nil && remoteCfg.LANMOTD != "")) && lanPort > 0 {
+				service, err := landiscover.Start(motd, lanPort, 1500*time.Millisecond)
+				if err != nil {
+					logging.Warnf("start lan discovery: %v", err)
+				} else {
+					defer service.Stop()
+				}
+			}
 		} else {
 			logging.Infof("inbound port mapping active (no local listeners configured)")
 		}
@@ -508,9 +582,11 @@ func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile
 }
 
 type guestShareOptions struct {
-	ControlID  string
-	AuthMode   api.ShareAuthMode
-	CustomCode string
+	ControlID     string
+	AuthMode      api.ShareAuthMode
+	CustomCode    string
+	PublishURL    string
+	PublishSecret string
 }
 
 func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
@@ -688,6 +764,9 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			logging.Debugf("saved guest share info to %s", roomFile)
 		}
 		logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
+		if shareOptions.PublishURL != "" {
+			publishShareInfo(shareOptions.PublishURL, shareOptions.PublishSecret, share, rules)
+		}
 	}
 
 	var tun *tunnel.Tunnel
@@ -1570,4 +1649,27 @@ func formatAllowedPorts(ports map[int]bool) string {
 	}
 	flush(previous)
 	return out.String()
+}
+
+func publishShareInfo(publishURL, secret string, share *api.GuestShareInfo, rules []tunnel.Rule) {
+	payload := &remoteconfig.RemoteShareConfig{
+		ShareID:     share.ConnectID,
+		ConnectID:   share.ConnectID,
+		ShareCode:   share.ConnectCode,
+		ConnectCode: share.ConnectCode,
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	for _, r := range rules {
+		payload.Mappings = append(payload.Mappings, auth.PortMapping{
+			LocalHost:  r.LocalHost,
+			LocalPort:  r.LocalPort,
+			RemoteHost: r.TargetHost,
+			RemotePort: r.TargetPort,
+		})
+	}
+	if err := remoteconfig.Publish(publishURL, secret, payload, 10*time.Second); err != nil {
+		logging.Errorf("publish share info failed: %v", err)
+	} else {
+		logging.Infof("published share info to %s", publishURL)
+	}
 }

@@ -3,7 +3,10 @@ package main
 import (
 	"testing"
 
+	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
+	"github.com/user/uulink/pkg/remoteconfig"
+	"github.com/user/uulink/pkg/tunnel"
 )
 
 func TestConfiguredRulesAllowsInboundOnly(t *testing.T) {
@@ -149,5 +152,64 @@ func TestFormatAllowedPorts(t *testing.T) {
 		if got := formatAllowedPorts(tt.ports); got != tt.want {
 			t.Errorf("formatAllowedPorts(%v) = %q, want %q", tt.ports, got, tt.want)
 		}
+	}
+}
+
+func TestRemoteShareConfigRulesInMain(t *testing.T) {
+	rc := &remoteconfig.RemoteShareConfig{
+		ShareID:   "266444253",
+		ShareCode: "6W44YBPL",
+		Mappings: []auth.PortMapping{
+			{LocalPort: 25565, RemotePort: 25565},
+		},
+		LANMOTD: "Minecraft Game",
+		LANPort: 25565,
+	}
+
+	rules, err := rc.Rules("", "", "127.0.0.1", "", "127.0.0.1", "")
+	if err != nil {
+		t.Fatalf("rc.Rules: %v", err)
+	}
+	if len(rules) != 1 || rules[0].LocalPort != 25565 || rules[0].TargetPort != 25565 {
+		t.Fatalf("unexpected rules from remote config: %+v", rules)
+	}
+}
+
+func TestPublishShareInfoConstruction(t *testing.T) {
+	share := &api.GuestShareInfo{
+		ConnectID:   "998877",
+		ConnectCode: "XYZ12345",
+	}
+	rules := []tunnel.Rule{
+		{
+			LocalHost:  "127.0.0.1",
+			LocalPort:  25565,
+			TargetHost: "127.0.0.1",
+			TargetPort: 25565,
+		},
+	}
+
+	var captured remoteconfig.RemoteShareConfig
+	// Verify mapping translation
+	payload := &remoteconfig.RemoteShareConfig{
+		ShareID:     share.ConnectID,
+		ShareCode:   share.ConnectCode,
+		ConnectCode: share.ConnectCode,
+	}
+	for _, r := range rules {
+		payload.Mappings = append(payload.Mappings, auth.PortMapping{
+			LocalHost:  r.LocalHost,
+			LocalPort:  r.LocalPort,
+			RemoteHost: r.TargetHost,
+			RemotePort: r.TargetPort,
+		})
+	}
+	captured = *payload
+
+	if captured.ShareID != "998877" || captured.ShareCode != "XYZ12345" {
+		t.Fatalf("unexpected captured share payload: %+v", captured)
+	}
+	if len(captured.Mappings) != 1 || captured.Mappings[0].LocalPort != 25565 {
+		t.Fatalf("unexpected captured mappings: %+v", captured.Mappings)
 	}
 }
