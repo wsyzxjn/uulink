@@ -183,11 +183,12 @@ Field details:
 - `user_id`: Registered account user identifier.
 - `hostname`: Optional device name exposed to UU Remote. If omitted, the system hostname is used.
 - `mappings`: Array of port forwarding rules.
+- Mappings are optional. When no mappings are configured, the process accepts only peer-initiated inbound port mappings.
 - `local_host`: Local IP address to bind to. Defaults to `127.0.0.1`. Set to `0.0.0.0` to allow other devices on the local network to connect.
 - `local_port`: Local port to bind and listen on.
 - `remote_host`: Destination host on the remote end. Typically `127.0.0.1`.
 - `remote_port`: Destination port on the remote end.
-- `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only).
+- `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When set, incoming connections to other ports are rejected.
 
 ## Command-Line Options

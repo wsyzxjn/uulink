@@ -2,7 +2,9 @@ package tunnel
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/user/uulink/pkg/proto/gvpb"
 )
@@ -28,6 +30,8 @@ func TestIsLoopbackHost(t *testing.T) {
 		{"::", false},
 		{"example.com", false},
 		{"", false},
+		{"127.0.0.1\n", false},
+		{"127.0.0.1\x00", false},
 	}
 
 	for _, tt := range tests {
@@ -45,7 +49,9 @@ func TestParseAllowedPorts(t *testing.T) {
 		wantErr bool
 	}{
 		{"", nil, false},
-		{"   ", nil, false},
+		{"   ", nil, true},
+		{",", nil, true},
+		{"8080,,443", nil, true},
 		{"8080", []int{8080}, false},
 		{"22, 80, 443", []int{22, 80, 443}, false},
 		{"8000-8003, 9000", []int{8000, 8001, 8002, 8003, 9000}, false},
@@ -93,6 +99,12 @@ func TestSecurityPolicyValidateTarget(t *testing.T) {
 	if err := defaultPolicy.ValidateTarget("127.0.0.1", 70000); err == nil {
 		t.Errorf("defaultPolicy.ValidateTarget with port 70000 expected error")
 	}
+	if err := defaultPolicy.ValidateTarget("127.0.0.1\nfake-log", 80); err == nil {
+		t.Error("defaultPolicy.ValidateTarget expected control characters in host to be rejected")
+	}
+	if err := defaultPolicy.ValidateTarget(strings.Repeat("a", 254), 80); err == nil {
+		t.Error("defaultPolicy.ValidateTarget expected an oversized host to be rejected")
+	}
 
 	// AllowLAN enabled
 	lanPolicy := SecurityPolicy{AllowLAN: true}
@@ -113,6 +125,10 @@ func TestSecurityPolicyValidateTarget(t *testing.T) {
 	}
 	if err := portPolicy.ValidateTarget("127.0.0.1", 3389); err == nil {
 		t.Errorf("portPolicy.ValidateTarget(127.0.0.1:3389) expected error for port not in whitelist")
+	}
+	denyPolicy := SecurityPolicy{AllowedPorts: map[int]bool{}}
+	if err := denyPolicy.ValidateTarget("127.0.0.1", 8080); err == nil {
+		t.Error("denyPolicy.ValidateTarget expected an empty whitelist to reject every port")
 	}
 }
 
@@ -171,5 +187,42 @@ func TestHandleConnectSecurityRejection(t *testing.T) {
 	}
 	if ack2.OK {
 		t.Errorf("expected syn ack ok=false for blocked port, got true")
+	}
+}
+
+func TestHandleConnectRejectsInvalidRemoteFrameIDs(t *testing.T) {
+	sender := newChannelSender()
+	defer sender.Close()
+	tun := NewTunnelWithRules(nil, sender)
+
+	payload := gvpb.NewConnect("127.0.0.1", 8080)
+	msg, err := json.Marshal(map[string]any{
+		"portMappingFrame": map[string]any{
+			"sessionId": SessionID,
+			"ruleId":    strings.Repeat("9", 21),
+			"streamId":  "1",
+			"type":      string(gvpb.TypeConnect),
+			"payload":   payload,
+		},
+	})
+	if err != nil {
+		t.Fatalf("build JSON connect msg: %v", err)
+	}
+	tun.HandleMessage(msg)
+
+	select {
+	case <-sender.ch:
+		t.Fatal("invalid remote rule ID unexpectedly produced a response")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestRemoteLogLimiter(t *testing.T) {
+	tun := NewTunnelWithRules(nil, newChannelSender())
+	if !tun.allowRemoteLog() {
+		t.Fatal("first remote log should be allowed")
+	}
+	if tun.allowRemoteLog() {
+		t.Fatal("second remote log in the same window should be suppressed")
 	}
 }

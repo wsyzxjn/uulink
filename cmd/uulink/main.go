@@ -305,8 +305,15 @@ func main() {
 		}
 		logging.Debugf("capability blob overridden: %s", *capFlag)
 	}
-	debugRule := rules[0]
-	ruleID := debugRule.ID
+	var debugRule tunnel.Rule
+	var ruleID string
+	if len(rules) > 0 {
+		debugRule = rules[0]
+		ruleID = debugRule.ID
+	}
+	if (*pckSweep || *mixkcpMode) && len(rules) == 0 {
+		log.Fatal("-pck-sweep and -mixkcp require at least one port mapping")
+	}
 
 	// Step 4: control handshake (gets client_id, ice_id, TURN servers)
 	var tun *tunnel.Tunnel
@@ -949,9 +956,6 @@ func configuredRules(cfg *auth.Config, ruleIDFlag, localHost string, localPort i
 			return nil, err
 		}
 	}
-	if len(rules) == 0 {
-		return nil, fmt.Errorf("no mappings configured; use mappings in the config file or -local/-remote-port")
-	}
 	return rules, nil
 }
 
@@ -1338,7 +1342,7 @@ func buildSecurityPolicy(cfg *auth.Config, allowLAN bool, allowedPortsFlag strin
 			return tunnel.SecurityPolicy{}, fmt.Errorf("parse -allowed-ports: %w", err)
 		}
 		policy.AllowedPorts = ports
-	} else if len(cfg.AllowedPorts) > 0 {
+	} else if cfg.AllowedPorts != nil {
 		ports := make(map[int]bool, len(cfg.AllowedPorts))
 		for _, p := range cfg.AllowedPorts {
 			if p <= 0 || p > 65535 {
@@ -1355,14 +1359,47 @@ func logSecurityPolicy(policy tunnel.SecurityPolicy) {
 	if policy.AllowLAN {
 		logging.Warnf("security policy: LAN/WAN target access enabled (-allow-lan)")
 	} else {
-		logging.Infof("security policy: target restricted to loopback (localhost/127.0.0.1)")
+		logging.Infof("security policy: target restricted to trusted loopback services (localhost/127.0.0.1)")
 	}
-	if len(policy.AllowedPorts) > 0 {
-		ports := make([]int, 0, len(policy.AllowedPorts))
-		for p := range policy.AllowedPorts {
-			ports = append(ports, p)
+	if policy.AllowedPorts != nil {
+		if len(policy.AllowedPorts) == 0 {
+			logging.Warnf("security policy: allowed target ports whitelist is empty; all target ports are denied")
+		} else {
+			logging.Infof("security policy: allowed target ports whitelist: %s", formatAllowedPorts(policy.AllowedPorts))
 		}
-		sort.Ints(ports)
-		logging.Infof("security policy: allowed target ports whitelist: %v", ports)
 	}
+}
+
+func formatAllowedPorts(ports map[int]bool) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	sorted := make([]int, 0, len(ports))
+	for port := range ports {
+		sorted = append(sorted, port)
+	}
+	sort.Ints(sorted)
+
+	var out strings.Builder
+	rangeStart := sorted[0]
+	previous := sorted[0]
+	flush := func(end int) {
+		if out.Len() > 0 {
+			out.WriteByte(',')
+		}
+		if rangeStart == end {
+			fmt.Fprintf(&out, "%d", rangeStart)
+			return
+		}
+		fmt.Fprintf(&out, "%d-%d", rangeStart, end)
+	}
+	for _, port := range sorted[1:] {
+		if port != previous+1 {
+			flush(previous)
+			rangeStart = port
+		}
+		previous = port
+	}
+	flush(previous)
+	return out.String()
 }

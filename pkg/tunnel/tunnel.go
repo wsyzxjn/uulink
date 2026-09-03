@@ -40,10 +40,20 @@ const SessionID = "1"
 
 const connectTimeout = 10 * time.Second
 
+const (
+	maxFrameIDLength = 20
+	maxTargetHostLen = 253
+	remoteLogLimit   = time.Second
+)
+
 // SecurityPolicy defines inbound dial restrictions for CONNECT frames.
+//
+// Loopback services are intentionally trusted. A local proxy listening on
+// loopback can still reach non-loopback networks; use AllowedPorts to narrow
+// the services exposed through a tunnel.
 type SecurityPolicy struct {
 	AllowLAN     bool
-	AllowedPorts map[int]bool // nil or empty allows all ports on permitted hosts
+	AllowedPorts map[int]bool // nil allows all ports; an empty map allows none
 }
 
 // ValidateTarget checks whether target host and port are permitted.
@@ -51,10 +61,13 @@ func (p SecurityPolicy) ValidateTarget(host string, port int) error {
 	if port <= 0 || port > 65535 {
 		return fmt.Errorf("invalid port %d", port)
 	}
-	if !p.AllowLAN && !isLoopbackHost(host) {
-		return fmt.Errorf("non-loopback target host %q is blocked by default (enable -allow-lan to permit)", host)
+	if !isValidTargetHost(host) {
+		return fmt.Errorf("invalid target host")
 	}
-	if len(p.AllowedPorts) > 0 && !p.AllowedPorts[port] {
+	if !p.AllowLAN && !isLoopbackHost(host) {
+		return fmt.Errorf("non-loopback target host is blocked by default (enable -allow-lan to permit)")
+	}
+	if p.AllowedPorts != nil && !p.AllowedPorts[port] {
 		return fmt.Errorf("target port %d is not in allowed ports whitelist", port)
 	}
 	return nil
@@ -63,8 +76,12 @@ func (p SecurityPolicy) ValidateTarget(host string, port int) error {
 // ParseAllowedPorts parses a comma-separated list of ports or port ranges.
 // Examples: "8080", "22,80,443", "8000-8010,9000"
 func ParseAllowedPorts(s string) (map[int]bool, error) {
-	s = strings.TrimSpace(s)
+	raw := s
+	s = strings.TrimSpace(raw)
 	if s == "" {
+		if raw != "" {
+			return nil, fmt.Errorf("port specification is empty")
+		}
 		return nil, nil
 	}
 	ports := make(map[int]bool)
@@ -72,7 +89,7 @@ func ParseAllowedPorts(s string) (map[int]bool, error) {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			continue
+			return nil, fmt.Errorf("empty port entry")
 		}
 		if strings.Contains(part, "-") {
 			rangeParts := strings.SplitN(part, "-", 2)
@@ -97,8 +114,36 @@ func ParseAllowedPorts(s string) (map[int]bool, error) {
 	return ports, nil
 }
 
+func isValidTargetHost(host string) bool {
+	if host == "" || len(host) > maxTargetHostLen {
+		return false
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '-', c == ':', c == '[', c == ']':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isValidFrameID(id string) bool {
+	if id == "" || len(id) > maxFrameIDLength {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func isLoopbackHost(host string) bool {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	h := strings.TrimSuffix(strings.ToLower(host), ".")
 	h = strings.Trim(h, "[]")
 	if h == "localhost" {
 		return true
@@ -120,6 +165,8 @@ type Tunnel struct {
 	mu             sync.Mutex
 	done           chan struct{}
 	securityPolicy SecurityPolicy
+	remoteLogTime  time.Time
+	remoteLogged   bool
 }
 
 type stream struct {
@@ -285,7 +332,9 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 func (t *Tunnel) HandleMessage(data []byte) {
 	frame := decodeFrameForTunnel(data)
 	if frame == nil {
-		logging.Debugf("[tunnel] message contained no port mapping frame (%d bytes)", len(data))
+		return
+	}
+	if !isValidFrameID(frame.RuleID) || !isValidFrameID(frame.StreamID) {
 		return
 	}
 
@@ -295,7 +344,6 @@ func (t *Tunnel) HandleMessage(data []byte) {
 	switch frame.Type {
 	case gvpb.TypeConnect:
 		if streamExists {
-			logging.Debugf("[tunnel] duplicate CONNECT for rule %s stream %s", frame.RuleID, frame.StreamID)
 			return
 		}
 		t.handleConnect(frame)
@@ -310,7 +358,6 @@ func (t *Tunnel) HandleMessage(data []byte) {
 			Version int  `json:"version"`
 		}
 		if err := json.Unmarshal(frame.Payload, &ack); err == nil && !ack.OK {
-			logging.Warnf("[tunnel] connect refused for rule %s stream %s", frame.RuleID, frame.StreamID)
 			t.closeStream(frame.RuleID, frame.StreamID, false)
 			s.markReady()
 			return
@@ -337,10 +384,10 @@ func (t *Tunnel) HandleMessage(data []byte) {
 			return
 		}
 		t.closeStream(frame.RuleID, frame.StreamID, false)
-		logging.Infof("[tunnel] stream closed: rule=%s stream=%s reason=remote-fin", frame.RuleID, frame.StreamID)
+		logging.Debugf("[tunnel] stream closed: rule=%s stream=%s reason=remote-fin", frame.RuleID, frame.StreamID)
 
 	default:
-		logging.Debugf("[tunnel] unknown frame type %q ignored", frame.Type)
+		logging.Debugf("[tunnel] unknown frame type ignored")
 	}
 }
 
@@ -351,12 +398,16 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 		Version    int    `json:"version"`
 	}
 	if err := json.Unmarshal(frame.Payload, &target); err != nil {
-		logging.Errorf("[tunnel] connect payload parse error: %v", err)
+		if t.allowRemoteLog() {
+			logging.Warnf("[tunnel] connect payload parse error: %v", err)
+		}
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
 	if target.TargetHost == "" || target.TargetPort <= 0 {
-		logging.Errorf("[tunnel] connect payload missing target for rule %s", frame.RuleID)
+		if t.allowRemoteLog() {
+			logging.Warnf("[tunnel] connect payload missing target for rule %s", frame.RuleID)
+		}
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
@@ -366,8 +417,10 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	t.mu.Unlock()
 
 	if err := policy.ValidateTarget(target.TargetHost, target.TargetPort); err != nil {
-		logging.Warnf("[tunnel] rule %s stream %s: connect target %s:%d rejected by security policy: %v",
-			frame.RuleID, frame.StreamID, target.TargetHost, target.TargetPort, err)
+		if t.allowRemoteLog() {
+			logging.Warnf("[tunnel] rule %s stream %s: connect target=%q port=%d rejected by security policy: %v",
+				frame.RuleID, frame.StreamID, target.TargetHost, target.TargetPort, err)
+		}
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
@@ -375,7 +428,9 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	addr := net.JoinHostPort(target.TargetHost, strconv.Itoa(target.TargetPort))
 	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
 	if err != nil {
-		logging.Errorf("[tunnel] connect target %s error: %v", addr, err)
+		if t.allowRemoteLog() {
+			logging.Warnf("[tunnel] connect target=%q error: %v", target.TargetHost, err)
+		}
 		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
 		return
 	}
@@ -390,8 +445,23 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
 	t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, true))
 	s.markReady()
-	logging.Infof("[tunnel] stream connected: rule=%s stream=%s target=%s", frame.RuleID, frame.StreamID, addr)
+	logging.Debugf("[tunnel] stream connected: rule=%s stream=%s target=%q", frame.RuleID, frame.StreamID, target.TargetHost)
 	go s.readLoop()
+}
+
+func (t *Tunnel) allowRemoteLog() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	if t.remoteLogTime.IsZero() || now.Sub(t.remoteLogTime) >= remoteLogLimit {
+		t.remoteLogTime = now
+		t.remoteLogged = false
+	}
+	if t.remoteLogged {
+		return false
+	}
+	t.remoteLogged = true
+	return true
 }
 
 func (t *Tunnel) nextStreamID(ruleID string) string {
