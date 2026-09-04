@@ -70,9 +70,10 @@ List all devices registered under your account:
 Example output:
 
 ```text
-DEVICE_ID                NAME             STATUS         PLAT     VERSION
-aeawqa5txeafoxl4         MyMac            CONNECTED      4        4.38.0
-aeawn7l56uabjgfc         HomePC           CONNECTED      1        2.2.2.2400
+DEVICE_ID                NAME             STATUS         PLAT     CLIENT_ID    VERSION
+--------                 ----             ------         ----     ---------    -------
+aeawqa5txeafoxl4         MyMac            CONNECTED      4        c1a2b3c4     4.38.0
+aeawn7l56uabjgfc         HomePC           CONNECTED      1        d5e6f7a8     2.2.2.2400
 ```
 
 Note the `DEVICE_ID` of the target machine you want to connect to.
@@ -165,6 +166,12 @@ INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
 
 ```bash
 ./uulink -share -share-id 266444253 -share-code 6W44YBPL -local 19090 -remote-port 18091
+```
+
+Alternatively, connect using an ephemeral guest identity (no login required on the controller machine either):
+
+```bash
+./uulink -share-guest -share-id 266444253 -share-code 6W44YBPL -local 19090 -remote-port 18091
 ```
 
 Once connected, bidirectional port forwarding between the two endpoints is active immediately.
@@ -260,12 +267,23 @@ Users can simply run `./mc-link` without passing any arguments; a `config.json` 
   "hostname": "Optional device name exposed during registration",
   "allow_lan": false,
   "allowed_ports": [22, 8080],
+  "sessions": 4,
+  "custom_code": "Optional fixed verification code for custom assistance",
+  "share_id": "Optional default remote assistance connect ID",
+  "share_code": "Optional default remote assistance verification code",
   "mappings": [
     {
       "local_host": "127.0.0.1",
       "local_port": 18080,
       "remote_host": "127.0.0.1",
       "remote_port": 8080
+    },
+    {
+      "local_port": "9000-9005",
+      "remote_port": "8000-8005"
+    },
+    {
+      "range": "7000-7002:6000-6002"
     }
   ]
 }
@@ -281,9 +299,10 @@ Field details:
 - `mappings`: Array of port forwarding rules.
 - Mappings are optional. When no mappings are configured, the process accepts only peer-initiated inbound port mappings.
 - `local_host`: Local IP address to bind to. Defaults to `127.0.0.1`. Set to `0.0.0.0` to allow other devices on the local network to connect.
-- `local_port`: Local port to bind and listen on.
+- `local_port`: Local port or port range to bind and listen on (e.g. `18080` or `"9000-9005"`).
 - `remote_host`: Destination host on the remote end. Typically `127.0.0.1`.
-- `remote_port`: Destination port on the remote end.
+- `remote_port`: Destination port or port range on the remote end (e.g. `8080` or `"8000-8005"`).
+- `range`: Optional compact port range mapping specifier (e.g. `"7000-7002:6000-6002"`).
 - `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
 - `sessions`: Optional relay session pool size for `-unbound-guest-serve`. Defaults to `4`; set `1` to serve a single session. The `-sessions` flag overrides it.
@@ -299,6 +318,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-config <path>` | Path to configuration file | `config.json` |
 | `-login` | Interactively select login method (QR code or SMS code) | - |
 | `-login-qrcode` | Generate a login QR code and update credentials | - |
+| `-login-qrcode-timeout <dur>` | Maximum time to wait for QR-code login confirmation | `5m0s` |
 | `-login-mobile <number>` | Mobile phone number for SMS verification code login | - |
 | `-login-country-code <code>` | Country code for mobile login (default `+86`) | `+86` |
 | `-refresh-login` | Validate current session and refresh if expired | - |
@@ -311,6 +331,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-remote-port <port/range>` | Target port or port range (e.g. `8080` or `9000-9010`) | - |
 | `-remote-host <ip>` | Target host on remote end | `127.0.0.1` |
 | `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
+| `-rule-id <id>` | Target registered rule ID on remote device | - |
 | `-transport <mode>` | WebRTC transport policy for controller sessions: `auto` or `relay` | `auto` |
 | `-sessions <n>` | Relay session pool size for `-unbound-guest-serve` (`1` disables pooling) | `4` |
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
@@ -318,7 +339,12 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
 | `-unbound-guest-serve` | Register an accountless guest device and print share code | - |
 | `-guest-serve` | Run assistance server on current device and print share code | - |
+| `-share-auth-mode <mode>` | Guest share authorization mode: `temporary`, `custom`, or `both` | `temporary` |
+| `-guest-custom-code <code>` | Custom guest share code for `custom` or `both` modes | - |
 | `-share` | Connect to an assistance server by share ID and code | - |
+| `-share-guest` | Join remote assistance using an accountless guest identity | - |
+| `-share-confirmation` | Join remote assistance by server-side confirmation | - |
+| `-share-control-mode` | Query remote assistance control mode and exit | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
 | `-custom-serve` | Run assistance server with custom verification code mode | - |
