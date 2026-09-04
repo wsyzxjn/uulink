@@ -331,7 +331,12 @@ func doMultiSessionUnboundGuestServe(client *api.Client, cfg *auth.Config, rules
 	shares := make([]*api.GuestShareInfo, 0, targetSessions)
 	for index := 0; index < targetSessions; index++ {
 		sessionID := fmt.Sprintf("session-%d", index+1)
-		rt, share, err := startPooledGuestServer(client, tun, pool, set, sessionID, fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
+		sessionCfg := *cfg
+		if index > 0 {
+			sessionCfg.UnboundClientID = ""
+			sessionCfg.UnboundDeviceID = ""
+		}
+		rt, share, err := startPooledGuestServer(api.NewClient(&sessionCfg), tun, pool, set, sessionID, fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
 		if err != nil {
 			return fmt.Errorf("%s: %w", sessionID, err)
 		}

@@ -110,6 +110,9 @@ func (c *Client) guestClient(session *GuestSession) *Client {
 	}
 	if session.ClientID != "" {
 		cfg.ClientID = session.ClientID
+		if strings.HasPrefix(session.ClientID, "MG-") {
+			cfg.Platform = 1
+		}
 	}
 	return c.withConfig(&cfg)
 }

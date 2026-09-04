@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,7 +113,7 @@ func run() error {
 
 	// Accountless modes create their own identity, so a missing config file
 	// is initialized instead of being an error.
-	accountless := *customServe || *customConnect != "" || *unboundGuestServe || *configURL != ""
+	accountless := *customServe || *customConnect != "" || *unboundGuestServe || *configURL != "" || *shareGuest
 	var cfg *auth.Config
 	if accountless {
 		cfg, err = auth.LoadOrInitConfigFile(*configPath)
@@ -161,6 +162,9 @@ func run() error {
 
 	client := api.NewClient(cfg)
 	targetSessions := determineTargetSessions(*sessionsFlag, cfg.Sessions)
+	if *customServe && *sessionsFlag <= 0 {
+		targetSessions = 1
+	}
 
 	if *refreshLogin {
 		return doRefreshLogin(client, cfg, *configPath, *loginQRCodeTimeout)
@@ -198,7 +202,11 @@ func run() error {
 	// -custom-connect is a share join whose ID/code may also come from the
 	// config file, so a distributed client can start without any flags.
 	if *customConnect != "" {
-		*shareJoin = true
+		if cfg.JWT != "" {
+			*shareJoin = true
+		} else {
+			*shareGuest = true
+		}
 		*shareID = *customConnect
 	}
 	usesShareRoom := *shareJoin || *shareGuest || *shareConfirmation
@@ -210,6 +218,10 @@ func run() error {
 		}
 		if (*shareJoin || *shareGuest) && *shareCode == "" {
 			return fmt.Errorf("-share-code is required")
+		}
+		if *shareJoin && cfg.JWT == "" {
+			*shareJoin = false
+			*shareGuest = true
 		}
 	}
 
@@ -321,6 +333,7 @@ func run() error {
 		targetSessions:    targetSessions,
 		lanDiscovery:      *lanDiscovery,
 		lanMotd:           *lanMotd,
+		configPath:        *configPath,
 	}); err != nil {
 		return err
 	}
@@ -363,6 +376,7 @@ type controllerOptions struct {
 	// server once the tunnel is up.
 	lanDiscovery bool
 	lanMotd      string
+	configPath   string
 }
 
 const relayTransportTimeout = 30 * time.Second
@@ -439,7 +453,23 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 			return fmt.Errorf("join share room: %w", err)
 		}
 	case options.shareGuest:
-		guestSession, guestErr := client.CreateGuest()
+		var guestSession *api.GuestSession
+		var guestErr error
+		if cfg.DeviceID != "" && cfg.ClientID != "" && (cfg.Platform == 1 || runtime.GOOS == "windows") {
+			guestSession, guestErr = client.CreateGuest()
+		}
+		if guestSession == nil {
+			var identity *api.UnboundDeviceIdentity
+			guestSession, identity, guestErr = client.CreateUnboundGuest("guest-controller")
+			if guestErr == nil && identity != nil {
+				cfg.ClientID = identity.ClientID
+				cfg.DeviceID = identity.DeviceID
+				cfg.Platform = 1
+				if options.configPath != "" {
+					_ = auth.SaveConfigFile(options.configPath, cfg)
+				}
+			}
+		}
 		if guestErr != nil {
 			return fmt.Errorf("create guest: %w", guestErr)
 		}
