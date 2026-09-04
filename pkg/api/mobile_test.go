@@ -31,7 +31,6 @@ func TestLoginByMobileRequestBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
 	}
-	const want = `{"code":"123456","country_code":"+86","mobile":"19300000000"}`
 	var decoded map[string]any
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)

@@ -4,6 +4,11 @@ import (
 	"fmt"
 )
 
+// LoginResult is the credential returned by a successful user login.
+type LoginResult struct {
+	Token string
+}
+
 // RequestMobileCode sends an SMS verification code to the specified phone number.
 func (c *Client) RequestMobileCode(countryCode, mobile string) (map[string]any, error) {
 	if countryCode == "" {
@@ -18,15 +23,11 @@ func (c *Client) RequestMobileCode(countryCode, mobile string) (map[string]any, 
 	if err != nil {
 		return nil, fmt.Errorf("request mobile code: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
 	return resp, nil
 }
 
 // LoginByMobile exchanges a mobile number and SMS verification code for a user JWT.
-func (c *Client) LoginByMobile(countryCode, mobile, code string) (map[string]any, error) {
+func (c *Client) LoginByMobile(countryCode, mobile, code string) (*LoginResult, error) {
 	if countryCode == "" {
 		countryCode = "+86"
 	}
@@ -39,9 +40,13 @@ func (c *Client) LoginByMobile(countryCode, mobile, code string) (map[string]any
 	if err != nil {
 		return nil, fmt.Errorf("login by mobile: %w", err)
 	}
-	if codeNum, ok := resp["code"].(float64); ok && codeNum != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(codeNum), Message: message, Response: resp}
+	data, err := responseData(resp, "mobile login")
+	if err != nil {
+		return nil, err
 	}
-	return resp, nil
+	token, _ := data["token"].(string)
+	if token == "" {
+		return nil, fmt.Errorf("mobile login response has no token")
+	}
+	return &LoginResult{Token: token}, nil
 }

@@ -29,17 +29,13 @@ func (c *Client) CreateGuest() (*GuestSession, error) {
 	cfg.UserID = ""
 	cfg.GuestID = ""
 
-	resp, err := NewClient(&cfg).Do("POST", "/api/v1/guest/create", map[string]any{})
+	resp, err := c.withConfig(&cfg).Do("POST", "/api/v1/guest/create", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("guest create: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("guest create failed, code %v: %v", code, resp["msg"])
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("guest create response has no data: %v", resp)
+	data, err := responseData(resp, "guest create")
+	if err != nil {
+		return nil, err
 	}
 	guestID, _ := data["guest_id"].(string)
 	token, _ := data["token"].(string)
@@ -72,7 +68,7 @@ func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceI
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
 	cfg.Platform = 1
-	session, err := NewClient(&cfg).CreateGuest()
+	session, err := c.withConfig(&cfg).CreateGuest()
 	if err != nil {
 		return nil, identity, fmt.Errorf("create guest for unbound device: %w", err)
 	}
@@ -109,7 +105,7 @@ func (c *Client) guestClient(session *GuestSession) *Client {
 	if session.DeviceID != "" {
 		cfg.DeviceID = session.DeviceID
 	}
-	return NewClient(&cfg)
+	return c.withConfig(&cfg)
 }
 
 // CreateGuestRoom calls POST /api/v1/guest/room/create with a guest session.
@@ -118,12 +114,9 @@ func (c *Client) CreateGuestRoom(session *GuestSession) (*RoomConnectionInfo, er
 	if err != nil {
 		return nil, fmt.Errorf("guest room create: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("guest room create failed, code %v: %v", code, resp["msg"])
-	}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("guest room create response has no data: %v", resp)
+	data, err := responseData(resp, "guest room create")
+	if err != nil {
+		return nil, err
 	}
 	return parseRoomConnectionInfo(data), nil
 }
@@ -145,12 +138,9 @@ func (c *Client) GetGuestShareInfo(session *GuestSession) (*GuestShareInfo, erro
 	if err != nil {
 		return nil, fmt.Errorf("guest share info: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("guest share info failed, code %v: %v", code, resp["msg"])
-	}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("guest share info response has no data: %v", resp)
+	data, err := responseData(resp, "guest share info")
+	if err != nil {
+		return nil, err
 	}
 
 	info := &GuestShareInfo{Raw: data}
@@ -367,10 +357,6 @@ func (c *Client) GuestShareUploadSign(session *GuestSession, request *GuestShare
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload sign: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
 	return resp, nil
 }
 
@@ -382,10 +368,6 @@ func (c *Client) GuestShareUploadSignV2(session *GuestSession, request *GuestSha
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload sign v2: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
 	return resp, nil
 }
 
@@ -395,10 +377,6 @@ func (c *Client) GuestShareUploadControlMode(session *GuestSession, request *Gue
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload control mode: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
 	return resp, nil
 }
 
@@ -407,10 +385,6 @@ func (c *Client) GuestShareUploadControlModeV2(session *GuestSession, request *G
 	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/share/upload_control_mode", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload control mode v2: %w", err)
-	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
 	}
 	return resp, nil
 }
@@ -424,10 +398,6 @@ func (c *Client) GuestSetDeviceControllable(session *GuestSession, controllable 
 	if err != nil {
 		return nil, fmt.Errorf("guest set device controllable: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
 	return resp, nil
 }
 
@@ -440,10 +410,6 @@ func (c *Client) GetShareControlMode(connectID string) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get share control mode: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
 	return resp, nil
 }
 
@@ -453,10 +419,6 @@ func (c *Client) GuestShareConfirmation(session *GuestSession, request *GuestSha
 	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/confirmation", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share confirmation: %w", err)
-	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
 	}
 	return resp, nil
 }
@@ -478,13 +440,9 @@ func (c *Client) JoinRoomByShareCode(connectID, deviceCode string) (*RoomConnect
 	if err != nil {
 		return nil, fmt.Errorf("join share room: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("join share room response has no data: %v", resp)
+	data, err := responseData(resp, "join share room")
+	if err != nil {
+		return nil, err
 	}
 	return parseRoomConnectionInfo(data), nil
 }
@@ -500,12 +458,9 @@ func (c *Client) JoinRoomByShareCodeWithGuest(session *GuestSession, connectID, 
 	if err != nil {
 		return nil, fmt.Errorf("join share room with guest: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("join share room with guest failed, code %v: %v", code, resp["msg"])
-	}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("join share room with guest response has no data: %v", resp)
+	data, err := responseData(resp, "join share room with guest")
+	if err != nil {
+		return nil, err
 	}
 	return parseRoomConnectionInfo(data), nil
 }
@@ -521,13 +476,9 @@ func (c *Client) JoinRoomByConfirmation(connectID, controlID string) (*RoomConne
 	if err != nil {
 		return nil, fmt.Errorf("join room by confirmation: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("join room by confirmation response has no data: %v", resp)
+	data, err := responseData(resp, "join room by confirmation")
+	if err != nil {
+		return nil, err
 	}
 	return parseRoomConnectionInfo(data), nil
 }
@@ -543,13 +494,9 @@ func (c *Client) JoinRoomByConfirmationWithGuest(session *GuestSession, connectI
 	if err != nil {
 		return nil, fmt.Errorf("join room by confirmation with guest: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("join room by confirmation with guest response has no data: %v", resp)
+	data, err := responseData(resp, "join room by confirmation with guest")
+	if err != nil {
+		return nil, err
 	}
 	return parseRoomConnectionInfo(data), nil
 }

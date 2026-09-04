@@ -40,14 +40,9 @@ func (c *Client) generateQRCodeLogin() (*QRCodeLoginInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("generate QR code login: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("generate QR code login response has no data: %v", resp)
+	data, err := responseData(resp, "generate QR code login")
+	if err != nil {
+		return nil, err
 	}
 
 	info := &QRCodeLoginInfo{}
@@ -89,14 +84,9 @@ func (c *Client) qrCodeLoginStatus(info *QRCodeLoginInfo) (*QRCodeLoginStatusRes
 	if err != nil {
 		return nil, fmt.Errorf("query QR code login status: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("QR code login status response has no data: %v", resp)
+	data, err := responseData(resp, "QR code login status")
+	if err != nil {
+		return nil, err
 	}
 
 	result := &QRCodeLoginStatusResult{Raw: data}
@@ -109,7 +99,7 @@ func (c *Client) qrCodeLoginStatus(info *QRCodeLoginInfo) (*QRCodeLoginStatusRes
 }
 
 // LoginByQRCodeWithGuest exchanges a confirmed QR-code login for a user JWT.
-func (c *Client) LoginByQRCodeWithGuest(session *GuestSession, info *QRCodeLoginInfo) (map[string]any, error) {
+func (c *Client) LoginByQRCodeWithGuest(session *GuestSession, info *QRCodeLoginInfo) (*LoginResult, error) {
 	if session == nil || session.Token == "" || session.GuestID == "" {
 		return nil, fmt.Errorf("guest session is incomplete")
 	}
@@ -125,9 +115,13 @@ func (c *Client) LoginByQRCodeWithGuest(session *GuestSession, info *QRCodeLogin
 	if err != nil {
 		return nil, fmt.Errorf("login by QR code: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
+	data, err := responseData(resp, "QR code login")
+	if err != nil {
+		return nil, err
 	}
-	return resp, nil
+	token, _ := data["token"].(string)
+	if token == "" {
+		return nil, fmt.Errorf("QR code login response has no token")
+	}
+	return &LoginResult{Token: token}, nil
 }

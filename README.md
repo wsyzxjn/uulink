@@ -230,7 +230,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-remote-port <port/range>` | Target port or port range (e.g. `8080` or `9000-9010`) | - |
 | `-remote-host <ip>` | Target host on remote end | `127.0.0.1` |
 | `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
-| `-force-relay` | Force WebRTC to use TURN relay only | off |
+| `-transport <mode>` | WebRTC transport policy for controller sessions: `auto` or `relay` | `auto` |
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
@@ -239,6 +239,8 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-share` | Connect to an assistance server by share ID and code | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
+
+`-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. Server modes reject `-transport relay`; a server-side relay requirement is represented by the signaling response, not by a local server flag.
 
 ## FAQ
 

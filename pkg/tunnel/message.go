@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"sync/atomic"
@@ -73,10 +72,4 @@ func buildMsg(ruleID, streamID string, frameType gvpb.FrameType, payload []byte)
 // decodeMsg parses a protobuf wire-format Message from the remote peer.
 func decodeMsg(data []byte) (*gvpb.Message, error) {
 	return gvpb.DecodeMessage(data)
-}
-
-// unused helper retained for potential JSON debugging
-func _jsonDebug(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
 }

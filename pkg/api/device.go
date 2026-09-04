@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -48,9 +49,6 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init mac device: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("init mac device failed, code %v: %v", code, resp["msg"])
-	}
 	return resp, nil
 }
 
@@ -88,18 +86,13 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 	cfg.ClientID = clientID
 	cfg.DeviceID = ""
 	cfg.Platform = 1
-	resp, err := NewClient(&cfg).Do("POST", "/api/v1/device/windows/init", body)
+	resp, err := c.withConfig(&cfg).Do("POST", "/api/v1/device/windows/init", body)
 	if err != nil {
 		return nil, fmt.Errorf("init windows device without auth: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("init windows device response has no data: %v", resp)
+	data, err := responseData(resp, "init windows device")
+	if err != nil {
+		return nil, err
 	}
 	deviceID, _ := data["device_id"].(string)
 	if deviceID == "" {
@@ -117,23 +110,30 @@ func (c *Client) SetMacControllable(controllable bool) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("set mac controllable: %w", err)
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("set mac controllable failed, code %v: %v", code, resp["msg"])
-	}
 	return resp, nil
 }
 
 // ReportIP performs the controlled client's relay IP report.
 func (c *Client) ReportIP(room *RoomConnectionInfo) (map[string]any, error) {
-	return c.reportRequest("GET", room.ReportURL, "/api/v1/ip", room.ReportToken, nil)
+	return c.ReportIPContext(context.Background(), room)
+}
+
+// ReportIPContext performs the controlled client's relay IP report using ctx.
+func (c *Client) ReportIPContext(ctx context.Context, room *RoomConnectionInfo) (map[string]any, error) {
+	return c.reportRequest(ctx, http.MethodGet, room.ReportURL, "/api/v1/ip", room.ReportToken, nil)
 }
 
 // ReportEchoServers performs the controlled client's relay echo-server report.
 func (c *Client) ReportEchoServers(room *RoomConnectionInfo) (map[string]any, error) {
-	return c.reportRequest("GET", room.ReportURL, "/api/v1/echo_server", room.ReportToken, nil)
+	return c.ReportEchoServersContext(context.Background(), room)
 }
 
-func (c *Client) reportRequest(method, baseURL, path, reportToken string, body any) (map[string]any, error) {
+// ReportEchoServersContext performs the relay echo-server report using ctx.
+func (c *Client) ReportEchoServersContext(ctx context.Context, room *RoomConnectionInfo) (map[string]any, error) {
+	return c.reportRequest(ctx, http.MethodGet, room.ReportURL, "/api/v1/echo_server", room.ReportToken, nil)
+}
+
+func (c *Client) reportRequest(ctx context.Context, method, baseURL, path, reportToken string, body any) (map[string]any, error) {
 	var bodyBytes []byte
 	var bodyStr string
 	if body != nil {
@@ -164,7 +164,9 @@ func (c *Client) reportRequest(method, baseURL, path, reportToken string, body a
 		bodyReader = bytes.NewReader(bodyBytes)
 		headers["Content-Type"] = "application/json"
 	}
-	req, err := http.NewRequest(method, fullURL, bodyReader)
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("new report request: %w", err)
 	}
@@ -173,21 +175,12 @@ func (c *Client) reportRequest(method, baseURL, path, reportToken string, body a
 	}
 	req.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("report http do: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read report response: %w", err)
-	}
-	var result map[string]any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("report status %d, unmarshal: %w", resp.StatusCode, err)
-	}
-	return result, nil
+	return decodeJSONResponse(resp, "report request")
 }
 
 func randomHex(n int) (string, error) {

@@ -26,13 +26,9 @@ func (c *Client) CreateRoom() (*RoomConnectionInfo, error) {
 		return nil, fmt.Errorf("room create: %w", err)
 	}
 
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("room create failed, code %v: %v", code, resp["msg"])
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("no data in room create response: %v", resp)
+	data, err := responseData(resp, "room create")
+	if err != nil {
+		return nil, err
 	}
 
 	return parseRoomConnectionInfo(data), nil
@@ -46,13 +42,9 @@ func (c *Client) JoinRoomByDevice(deviceID string, forceJoin bool) (*RoomConnect
 		return nil, fmt.Errorf("room join: %w", err)
 	}
 
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("room join failed, code %v: %v", code, resp["msg"])
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("no data in room join response: %v", resp)
+	data, err := responseData(resp, "room join")
+	if err != nil {
+		return nil, err
 	}
 
 	return parseRoomConnectionInfo(data), nil
@@ -65,13 +57,9 @@ func (c *Client) RefetchRoomJoin(token string) (*RoomConnectionInfo, error) {
 		return nil, fmt.Errorf("room join refetch: %w", err)
 	}
 
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		return nil, fmt.Errorf("room join refetch failed, code %v: %v", code, resp["msg"])
-	}
-
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("no data in room join refetch response")
+	data, err := responseData(resp, "room join refetch")
+	if err != nil {
+		return nil, err
 	}
 
 	return parseRoomConnectionInfo(data), nil

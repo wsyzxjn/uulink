@@ -4,7 +4,6 @@ package main
 import (
 	"bufio"
 	crand "crypto/rand"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -12,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -28,10 +26,15 @@ import (
 	"github.com/user/uulink/pkg/peer"
 	"github.com/user/uulink/pkg/signaling"
 	"github.com/user/uulink/pkg/tunnel"
-	"github.com/user/uulink/pkg/tunnel/mixsend"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	configPath := flag.String("config", "config.json", "path to config file")
 	deviceID := flag.String("device", "", "device ID to connect to (overrides config)")
 	allowSelf := flag.Bool("allow-self", false, "allow controller and server to share one configured device ID (same-host integration test)")
@@ -61,7 +64,7 @@ func main() {
 	shareCode := flag.String("share-code", "", "remote-assistance verification code")
 	ruleIDFlag := flag.String("rule-id", "", "registered rule ID on the remote device (must match)")
 	capFlag := flag.String("cap", "", "override ConnectOptions capability blob (hex, e.g. 08061002180120023002380240024801)")
-	forceRelay := flag.Bool("force-relay", false, "force WebRTC to use TURN relay only")
+	transportFlag := flag.String("transport", "auto", "WebRTC transport policy for controller sessions: auto or relay")
 	pckSweep := flag.Bool("pck-sweep", false, "sweep PCK.V3 channels with CONNECT frames after setup")
 	mixkcpMode := flag.Bool("mixkcp", false, "send PM frames over mix-kcp UDP to the ICE peer (raw frame format, crypto layout preserved)")
 	localPort := flag.String("local", "", "local port or port range to listen on (e.g. 8080 or 9000-9010)")
@@ -76,195 +79,262 @@ func main() {
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
 	if err != nil {
-		log.Fatalf("parse log level: %v", err)
+		return fmt.Errorf("parse log level: %w", err)
 	}
 	logging.SetLevel(parsedLogLevel)
 
+	transportMode, err := peer.ParseTransportMode(*transportFlag)
+	if err != nil {
+		return fmt.Errorf("parse transport mode: %w", err)
+	}
+	if err := validateTransportForServer(transportMode, *serveMode || *guestServe || *unboundGuestServe); err != nil {
+		return err
+	}
+
 	authMode, err := api.ParseShareAuthMode(*shareAuthMode)
 	if err != nil {
-		log.Fatalf("parse share auth mode: %v", err)
+		return fmt.Errorf("parse share auth mode: %w", err)
 	}
 	if *guestCustomCode != "" && authMode != api.ShareAuthTemporary {
 		if err := api.ValidateCustomShareCode(*guestCustomCode); err != nil {
-			log.Fatalf("validate guest custom code: %v", err)
+			return fmt.Errorf("validate guest custom code: %w", err)
 		}
 	}
 
 	cfg, err := auth.LoadConfigFile(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	secPolicy, err := buildSecurityPolicy(cfg, *allowLAN, *allowedPortsFlag)
 	if err != nil {
-		log.Fatalf("configure security policy: %v", err)
+		return fmt.Errorf("configure security policy: %w", err)
 	}
 
 	client := api.NewClient(cfg)
 
 	if *refreshLogin {
-		doRefreshLogin(client, cfg, *configPath, *loginQRCodeTimeout)
-		return
+		return doRefreshLogin(client, cfg, *configPath, *loginQRCodeTimeout)
 	}
 	if *listDevices {
-		doListDevices(client)
-		return
+		return doListDevices(client)
 	}
 	if *guestTest {
-		doGuestTest(client)
-		return
+		return doGuestTest(client)
 	}
 	if *userInfo {
-		doUserInfo(client)
-		return
+		return doUserInfo(client)
 	}
 	if *interactiveLogin {
-		doInteractiveLogin(client, cfg, *configPath, *loginQRCodeTimeout, *loginCountryCode)
-		return
+		return doInteractiveLogin(client, cfg, *configPath, *loginQRCodeTimeout, *loginCountryCode)
 	}
 	if *loginMobile != "" {
-		doMobileLogin(client, cfg, *configPath, *loginCountryCode, *loginMobile)
-		return
+		return doMobileLogin(client, cfg, *configPath, *loginCountryCode, *loginMobile)
 	}
 	if *loginQRCode {
-		doLoginQRCode(client, cfg, *configPath, *loginQRCodeTimeout)
-		return
+		return doLoginQRCode(client, cfg, *configPath, *loginQRCodeTimeout)
 	}
 	if *shareControlMode {
 		if *shareID == "" {
-			log.Fatal("-share-id is required")
+			return fmt.Errorf("-share-id is required")
 		}
 		response, err := client.GetShareControlMode(*shareID)
 		if err != nil {
-			log.Fatalf("query share control mode: %v", err)
+			return fmt.Errorf("query share control mode: %w", err)
 		}
 		log.Printf("share control mode query complete: code=%v", response["code"])
-		return
+		return nil
 	}
 
 	usesShareRoom := *shareJoin || *shareGuest || *shareConfirmation
 	if usesShareRoom && *shareID == "" {
-		log.Fatal("-share-id is required")
+		return fmt.Errorf("-share-id is required")
 	}
 	if (*shareJoin || *shareGuest) && *shareCode == "" {
-		log.Fatal("-share-code is required")
+		return fmt.Errorf("-share-code is required")
 	}
 	if *serveMode && *guestServe {
-		log.Fatal("-serve and -guest-serve cannot be combined")
+		return fmt.Errorf("-serve and -guest-serve cannot be combined")
 	}
 	if *serveMode && *unboundGuestServe {
-		log.Fatal("-serve and -unbound-guest-serve cannot be combined")
+		return fmt.Errorf("-serve and -unbound-guest-serve cannot be combined")
 	}
 	if *guestServe && *unboundGuestServe {
-		log.Fatal("-guest-serve and -unbound-guest-serve cannot be combined")
+		return fmt.Errorf("-guest-serve and -unbound-guest-serve cannot be combined")
 	}
 	if *unboundGuestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
-			log.Fatalf("configure mappings: %v", err)
+			return fmt.Errorf("configure mappings: %w", err)
 		}
-		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
+		return doUnboundGuestServe(client, cfg, rules, *roomFile, guestShareOptions{
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
 		}, secPolicy)
-		return
 	}
 	if *guestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
-			log.Fatalf("configure mappings: %v", err)
+			return fmt.Errorf("configure mappings: %w", err)
 		}
-		doGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
+		return doGuestServe(client, cfg, rules, *roomFile, guestShareOptions{
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
 		}, secPolicy)
-		return
 	}
 	if *serveMode {
 		if *deviceID != "" {
-			log.Fatal("-device cannot be combined with -serve; the server uses this config's device")
+			return fmt.Errorf("-device cannot be combined with -serve; the server uses this config's device")
 		}
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
-			log.Fatalf("configure mappings: %v", err)
+			return fmt.Errorf("configure mappings: %w", err)
 		}
-		doServe(client, cfg, rules, *roomFile, *forceRelay, secPolicy)
-		return
+		return doServe(client, cfg, rules, *roomFile, secPolicy)
 	}
 
-	targetDevID := *deviceID
+	if err := runController(client, cfg, secPolicy, controllerOptions{
+		deviceID:          *deviceID,
+		allowSelf:         *allowSelf,
+		controlDeviceID:   *controlDeviceID,
+		roomFile:          *roomFile,
+		shareJoin:         *shareJoin,
+		shareConfirmation: *shareConfirmation,
+		shareControlID:    *shareControlID,
+		shareGuest:        *shareGuest,
+		shareID:           *shareID,
+		shareCode:         *shareCode,
+		ruleID:            *ruleIDFlag,
+		mapping:           *mappingFlag,
+		localHost:         *localHost,
+		localPort:         *localPort,
+		remoteHost:        *remoteHost,
+		remotePort:        *remotePort,
+		capability:        *capFlag,
+		transportMode:     transportMode,
+		pckSweep:          *pckSweep,
+		mixKCP:            *mixkcpMode,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTransportForServer(mode peer.TransportMode, serverMode bool) error {
+	if serverMode && mode != peer.TransportAuto {
+		return fmt.Errorf("-transport relay is supported only by the controller, not server mode")
+	}
+	return nil
+}
+
+type controllerOptions struct {
+	deviceID          string
+	allowSelf         bool
+	controlDeviceID   string
+	roomFile          string
+	shareJoin         bool
+	shareConfirmation bool
+	shareControlID    string
+	shareGuest        bool
+	shareID           string
+	shareCode         string
+	ruleID            string
+	mapping           string
+	localHost         string
+	localPort         string
+	remoteHost        string
+	remotePort        string
+	capability        string
+	transportMode     peer.TransportMode
+	pckSweep          bool
+	mixKCP            bool
+}
+
+const relayTransportTimeout = 30 * time.Second
+
+// errSignalingClosed reports a signaling connection that ended without a local
+// shutdown request. It is a runtime failure, so the process must not exit 0
+// and let service managers mistake a dropped network path for a clean stop.
+var errSignalingClosed = errors.New("signaling connection closed unexpectedly")
+
+func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options controllerOptions) error {
+	usesShareRoom := options.shareJoin || options.shareGuest || options.shareConfirmation
+
+	targetDevID := options.deviceID
 	if targetDevID == "" {
 		targetDevID = cfg.DeviceID
 	}
 
-	if *roomFile == "" && !usesShareRoom && (targetDevID == "" || (targetDevID == cfg.DeviceID && !*allowSelf)) {
-		log.Fatal("target device must differ from this machine (use -device)")
+	if options.roomFile == "" && !usesShareRoom && (targetDevID == "" || (targetDevID == cfg.DeviceID && !options.allowSelf)) {
+		return fmt.Errorf("target device must differ from this machine (use -device)")
 	}
-	rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
+	rules, err := configuredRules(cfg, options.ruleID, options.mapping, options.localHost, options.localPort, options.remoteHost, options.remotePort)
 	if err != nil {
-		log.Fatalf("configure mappings: %v", err)
+		return fmt.Errorf("configure mappings: %w", err)
 	}
 
 	// Step 1: join the room created by the target device's server
 	var room *api.RoomConnectionInfo
 	controllerAppControlID := ""
-	if *shareJoin || *shareConfirmation {
+	if options.shareJoin || options.shareConfirmation {
 		logging.Infof("joining share room as controller")
 	}
 	switch {
-	case *shareConfirmation:
-		if *shareControlID == "" {
-			_, controlModeErr := client.GetShareControlMode(*shareID)
+	case options.shareConfirmation:
+		if options.shareControlID == "" {
+			_, controlModeErr := client.GetShareControlMode(options.shareID)
 			if controlModeErr != nil {
 				logging.Debugf("share control mode query failed: %v", controlModeErr)
 			}
 		}
-		controlID := *shareControlID
-		if *shareControlID != "" {
+		controlID := options.shareControlID
+		if options.shareControlID != "" {
 			logging.Debugf("using explicit share control_id=%s", controlID)
 		} else {
 			var err error
 			controlID, err = generateAppControlID()
 			if err != nil {
-				log.Fatalf("generate share control id: %v", err)
+				return fmt.Errorf("generate share control id: %w", err)
 			}
 			logging.Debugf("generated share control_id_length=%d", len(controlID))
 		}
 		controllerAppControlID = controlID
-		room, err = client.JoinRoomByConfirmation(*shareID, controlID)
+		room, err = client.JoinRoomByConfirmation(options.shareID, controlID)
 		if err != nil {
-			if responseErr, ok := err.(*api.ResponseError); ok {
+			var responseErr *api.ResponseError
+			if errors.As(err, &responseErr) {
 				data, _ := responseErr.Response["data"].(map[string]any)
 				logging.Debugf("join room by confirmation error data keys=%v", mapKeys(data))
 			}
-			log.Fatalf("join room by confirmation: %v", err)
+			return fmt.Errorf("join room by confirmation: %w", err)
 		}
-	case *shareJoin:
-		room, err = client.JoinRoomByShareCode(*shareID, *shareCode)
+	case options.shareJoin:
+		room, err = client.JoinRoomByShareCode(options.shareID, options.shareCode)
 		if err != nil {
-			if responseErr, ok := err.(*api.ResponseError); ok {
+			var responseErr *api.ResponseError
+			if errors.As(err, &responseErr) {
 				data, _ := responseErr.Response["data"].(map[string]any)
 				logging.Debugf("join room by share code error data keys=%v", mapKeys(data))
 			}
-			log.Fatalf("join share room: %v", err)
+			return fmt.Errorf("join share room: %w", err)
 		}
-	case *shareGuest:
+	case options.shareGuest:
 		guestSession, guestErr := client.CreateGuest()
 		if guestErr != nil {
-			log.Fatalf("create guest: %v", guestErr)
+			return fmt.Errorf("create guest: %w", guestErr)
 		}
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, *shareID, *shareCode)
+		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, options.shareID, options.shareCode)
 		if err != nil {
-			log.Fatalf("join guest share room: %v", err)
+			return fmt.Errorf("join guest share room: %w", err)
 		}
-	case *roomFile != "":
-		room, err = loadRoomFile(*roomFile)
+	case options.roomFile != "":
+		room, err = loadRoomFile(options.roomFile)
 		if err != nil {
-			log.Fatalf("load room file: %v", err)
+			return fmt.Errorf("load room file: %w", err)
 		}
-		logging.Debugf("loaded room from %s", *roomFile)
+		logging.Debugf("loaded room from %s", options.roomFile)
 		// The room-file controller reuses the guest's signaling token. The
 		// passive peer skips the controller-role events that the gateway
 		// rejects for this token, while Controlling=true prevents the gateway
@@ -274,7 +344,7 @@ func main() {
 		logging.Infof("joining remote device %s", targetDevID)
 		room, err = client.JoinRoomByDevice(targetDevID, false)
 		if err != nil {
-			log.Fatalf("join room: %v", err)
+			return fmt.Errorf("join room: %w", err)
 		}
 	}
 	logging.Debugf("signaling server=%s gateways=%d", room.SignalingServer, len(room.SignalingList))
@@ -292,7 +362,7 @@ func main() {
 		Controlling: true,
 	})
 	if err != nil {
-		log.Fatalf("signaling connect: %v", err)
+		return fmt.Errorf("signaling connect: %w", err)
 	}
 	defer sig.Close()
 
@@ -302,7 +372,7 @@ func main() {
 	case <-time.After(5 * time.Second):
 		logging.Warnf("signaling namespace connect timeout")
 	case <-sig.Done():
-		log.Fatal("signaling closed")
+		return fmt.Errorf("signaling closed before namespace connection")
 	}
 
 	// Log forward_setting events (server pushes these after answer)
@@ -312,11 +382,11 @@ func main() {
 		}
 	})
 
-	if *capFlag != "" {
-		if err := peer.CapOverride(*capFlag); err != nil {
-			log.Fatalf("cap override: %v", err)
+	if options.capability != "" {
+		if err := peer.CapOverride(options.capability); err != nil {
+			return fmt.Errorf("cap override: %w", err)
 		}
-		logging.Debugf("capability blob overridden: %s", *capFlag)
+		logging.Debugf("capability blob overridden: %s", options.capability)
 	}
 	var debugRule tunnel.Rule
 	var ruleID string
@@ -324,143 +394,77 @@ func main() {
 		debugRule = rules[0]
 		ruleID = debugRule.ID
 	}
-	if (*pckSweep || *mixkcpMode) && len(rules) == 0 {
-		log.Fatal("-pck-sweep and -mixkcp require at least one port mapping")
+	if (options.pckSweep || options.mixKCP) && len(rules) == 0 {
+		return fmt.Errorf("-pck-sweep and -mixkcp require at least one port mapping")
 	}
 
 	// Step 4: control handshake (gets client_id, ice_id, TURN servers)
 	var tun *tunnel.Tunnel
 	peerDeviceID := cfg.DeviceID
-	if *controlDeviceID != "" {
-		peerDeviceID = *controlDeviceID
+	if options.controlDeviceID != "" {
+		peerDeviceID = options.controlDeviceID
 		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
 	}
 	p, err := peer.NewController(&peer.Config{
-		Signal:       sig,
-		DeviceID:     peerDeviceID,
-		AppControlID: controllerAppControlID,
-		Passive:      room.IsRoomFileController,
-		ForceRelay:   *forceRelay,
+		Signal:        sig,
+		DeviceID:      peerDeviceID,
+		AppControlID:  controllerAppControlID,
+		Passive:       room.IsRoomFileController,
+		TransportMode: options.transportMode,
 		OnSignalData: func(data []byte) {
 			if tun != nil {
 				tun.HandleMessage(data)
 			}
 		}})
 	if err != nil {
-		log.Fatalf("control handshake: %v", err)
+		return fmt.Errorf("control handshake: %w", err)
 	}
 	defer p.Close()
 
 	// Step 5: create PeerConnection + data channels + send soac offer
 	if err := p.Connect(nil); err != nil {
-		log.Fatalf("peer connect: %v", err)
+		return fmt.Errorf("peer connect: %w", err)
 	}
 
 	// Step 6: start the local listener once the PM data channel is ready.
-	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p, sig: sig})
+	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p})
 	tun.SetSecurityPolicy(secPolicy)
+	runErr := make(chan error, 1)
+	tunnelReady := make(chan struct{})
+	var tunnelReadyOnce sync.Once
 	p.OnFileChannelOpen(func() {
+		if err := p.ValidateTransportMode(); err != nil {
+			select {
+			case runErr <- fmt.Errorf("validate transport: %w", err):
+			default:
+			}
+			return
+		}
 		if len(rules) > 0 {
 			if err := tun.Start(); err != nil {
-				log.Fatalf("start tunnel: %v", err)
+				select {
+				case runErr <- fmt.Errorf("start tunnel: %w", err):
+				default:
+				}
+				return
 			}
 			logActiveMappings("port forwarding active", rules)
 		} else {
 			logging.Infof("inbound port mapping active (no local listeners configured)")
 		}
 		logSecurityPolicy(secPolicy)
+		tunnelReadyOnce.Do(func() { close(tunnelReady) })
 	})
 	defer tun.Stop()
 
-	// PCK sweep mode: replicate the official channel setup then try CONNECT
-	// on each PCK logical channel to find where PM frames are accepted.
-	if *pckSweep {
-		readyCh := make(chan struct{})
-		var once sync.Once
-		p.OnBinaryChannelOpen(func() {
-			once.Do(func() { close(readyCh) })
-		})
-		go func() {
-			<-readyCh
-			time.Sleep(500 * time.Millisecond)
-			logging.Debugf("[pck] replicating channel setup")
-			// session setup kinds 1,2 then register chans 3,4 like the official client
-			if err := p.SendSignalPB(tunnel.BuildSessionSetup(1)); err != nil {
-				logging.Errorf("[pck] setup1 error: %v", err)
-			}
-			if err := p.SendSignalPB(tunnel.BuildSessionSetup(2)); err != nil {
-				logging.Errorf("[pck] setup2 error: %v", err)
-			}
-			time.Sleep(300 * time.Millisecond)
-			for _, ch := range []uint32{3, 4} {
-				if err := p.SendSignalPB(tunnel.BuildRegistration(ch)); err != nil {
-					logging.Errorf("[pck] reg %d error: %v", ch, err)
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-			// now sweep CONNECT across target channels
-			for targetChan := uint32(0); targetChan <= 20; targetChan++ {
-				frame, err := tunnel.BuildConnectPCK(targetChan, ruleID, "1", debugRule.TargetHost, debugRule.TargetPort)
-				if err != nil {
-					logging.Errorf("[pck] build CONNECT error: %v", err)
-					continue
-				}
-				if err := p.SendSignalPB(frame); err != nil {
-					logging.Errorf("[pck] target chan %d send error: %v", targetChan, err)
-					continue
-				}
-				logging.Debugf("[pck] CONNECT sent on target chan %d", targetChan)
-				time.Sleep(2 * time.Second)
-			}
-			logging.Debugf("[pck] sweep done")
-		}()
+	if options.pckSweep {
+		startPCKSweep(p, debugRule, ruleID)
 	}
 
 	logging.Infof("waiting for WebRTC connection")
 
-	if *mixkcpMode {
-		p.OnICEConnected(func() {
-			peerAddr := firstHostCandidate(p.RemoteCandidates())
-			if peerAddr == nil {
-				logging.Errorf("[mixkcp] no host candidate from remote, cannot send")
-				return
-			}
-			sender, err := mixsend.NewSender(peerAddr)
-			if err != nil {
-				logging.Errorf("[mixkcp] sender: %v", err)
-				return
-			}
-			defer sender.Close()
-			logging.Debugf("[mixkcp] sending CONNECT to %s (rule %s, target %s:%d)",
-				peerAddr, ruleID, debugRule.TargetHost, debugRule.TargetPort)
-
-			// CONNECT payload: the PM JSON message (wire format per findings 9.8;
-			// the official client's crypto layer is not reproduced — this sends the
-			// correctly structured frame with the JSON body in the payload region).
-			connectJSON := fmt.Sprintf(`{"seq":"6","timestamp":"%d","portMappingFrame":{"sessionId":"1","ruleId":"%s","streamId":"1","payload":"%s"}}`,
-				time.Now().Unix(), ruleID, base64.StdEncoding.EncodeToString(
-					[]byte(fmt.Sprintf(`{"version":1,"target_port":%d,"target_host":"%s"}`, debugRule.TargetPort, debugRule.TargetHost))))
-			if err := sender.SendPMFrame(0x43, []byte(connectJSON)); err != nil {
-				logging.Errorf("[mixkcp] send CONNECT: %v", err)
-				return
-			}
-			logging.Debugf("[mixkcp] CONNECT frame sent (%d bytes)", len(connectJSON))
-
-			// wait for a possible SYN_ACK (honest no-response state recorded)
-			senderDeadline := time.Now().Add(10 * time.Second)
-			for time.Now().Before(senderDeadline) {
-				sender.SetReadDeadline(senderDeadline)
-				f, err := sender.ReceivePMFrame()
-				if err != nil {
-					logging.Debugf("[mixkcp] no SYN_ACK received within deadline: %v", err)
-					return
-				}
-				logging.Debugf("[mixkcp] inbound frame cmd=%#x", f.Cmd)
-				if f.Cmd == 0x5d {
-					logging.Debugf("[mixkcp] SYN_ACK-like frame received")
-				}
-			}
-		})
+	if options.mixKCP {
+		startMixKCPProbe(p, debugRule, ruleID)
 	}
 
 	sig.On("bmsg_push", func(ev *signaling.Event) {
@@ -477,34 +481,54 @@ func main() {
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(interrupt)
+
+	if p.TransportMode() == peer.TransportRelay {
+		select {
+		case <-tunnelReady:
+			logging.Infof("transport relay ready")
+		case <-time.After(relayTransportTimeout):
+			return fmt.Errorf("transport relay required: connection not ready within %s", relayTransportTimeout)
+		case <-interrupt:
+			logging.Infof("interrupted, shutting down")
+			return nil
+		case <-sig.Done():
+			return errSignalingClosed
+		case err := <-runErr:
+			return err
+		}
+	}
 
 	select {
 	case <-interrupt:
 		logging.Infof("interrupted, shutting down")
 	case <-sig.Done():
-		logging.Infof("signaling connection closed, shutting down")
+		return errSignalingClosed
+	case err := <-runErr:
+		return err
 	}
+	return nil
 }
 
-func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, policy tunnel.SecurityPolicy) {
+func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, policy tunnel.SecurityPolicy) error {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
-		log.Fatalf("resolve hostname: %v", err)
+		return fmt.Errorf("resolve hostname: %w", err)
 	}
 	logging.Debugf("registering controlled device %q", hostname)
 	if _, err := client.InitMacDevice(hostname); err != nil {
-		log.Fatalf("register controlled device: %v", err)
+		return fmt.Errorf("register controlled device: %w", err)
 	}
 	if _, err := client.SetMacControllable(true); err != nil {
-		log.Fatalf("enable controlled device: %v", err)
+		return fmt.Errorf("enable controlled device: %w", err)
 	}
 
 	logging.Debugf("creating controlled room")
 	room, err := client.CreateRoom()
 	if err != nil {
-		log.Fatalf("create room: %v", err)
+		return fmt.Errorf("create room: %w", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, nil, forceRelay, guestShareOptions{}, policy)
+	return serveRoom(client, cfg, rules, room, roomFile, nil, guestShareOptions{}, policy)
 }
 
 type guestShareOptions struct {
@@ -513,26 +537,26 @@ type guestShareOptions struct {
 	CustomCode string
 }
 
-func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
+func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
 	session, err := client.CreateGuest()
 	if err != nil {
-		log.Fatalf("create guest: %v", err)
+		return fmt.Errorf("create guest: %w", err)
 	}
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
-		log.Fatalf("create guest room: %v", err)
+		return fmt.Errorf("create guest room: %w", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy)
+	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy)
 }
 
-func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
+func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
-		log.Fatalf("resolve hostname: %v", err)
+		return fmt.Errorf("resolve hostname: %w", err)
 	}
 	session, identity, err := client.CreateUnboundGuest(hostname)
 	if err != nil {
-		log.Fatalf("create unbound guest: %v", err)
+		return fmt.Errorf("create unbound guest: %w", err)
 	}
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
@@ -541,19 +565,19 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
-		log.Fatalf("create guest room: %v", err)
+		return fmt.Errorf("create guest room: %w", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy)
+	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy)
 }
 
-func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
+func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
 	if roomFile != "" {
 		roomInfoFile := roomFile
 		if guestSession != nil {
 			roomInfoFile = roomFile + ".room"
 		}
 		if err := saveRoomFile(roomInfoFile, room); err != nil {
-			log.Fatalf("save room file: %v", err)
+			return fmt.Errorf("save room file: %w", err)
 		}
 		logging.Debugf("saved room connection info to %s", roomInfoFile)
 	}
@@ -569,30 +593,30 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		Controlling: false,
 	})
 	if err != nil {
-		log.Fatalf("signaling connect: %v", err)
+		return fmt.Errorf("signaling connect: %w", err)
 	}
 	defer sig.Close()
 
 	select {
 	case <-sig.NamespaceConnected():
 	case <-time.After(5 * time.Second):
-		log.Fatal("signaling namespace connect timeout")
+		return fmt.Errorf("signaling namespace connect timeout")
 	case <-sig.Done():
-		log.Fatal("signaling closed")
+		return fmt.Errorf("signaling closed before namespace connection")
 	}
 
 	var share *api.GuestShareInfo
 	if guestSession != nil {
 		if _, err := client.GuestSetDeviceControllable(guestSession, true); err != nil {
-			log.Fatalf("set guest device controllable: %v", err)
+			return fmt.Errorf("set guest device controllable: %w", err)
 		}
 		share, err = waitForGuestConnectID(client, guestSession)
 		if err != nil {
-			log.Fatalf("get guest share info: %v", err)
+			return fmt.Errorf("get guest share info: %w", err)
 		}
 		share, err = ensureGuestShareCode(client, guestSession, share, shareOptions)
 		if err != nil {
-			log.Fatalf("prepare guest share code: %v", err)
+			return fmt.Errorf("prepare guest share code: %w", err)
 		}
 		controlModeID := shareOptions.ControlID
 		if controlModeID == "" {
@@ -600,7 +624,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		}
 		if _, err := client.GuestShareUploadControlMode(guestSession,
 			api.NewGuestShareUploadControlModeRequest(controlModeID, true, shareOptions.AuthMode)); err != nil {
-			log.Fatalf("upload guest control mode: %v", err)
+			return fmt.Errorf("upload guest control mode: %w", err)
 		}
 	}
 
@@ -683,7 +707,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 	if guestSession != nil {
 		if roomFile != "" {
 			if err := saveGuestShareFile(roomFile, share); err != nil {
-				log.Fatalf("save guest share file: %v", err)
+				return fmt.Errorf("save guest share file: %w", err)
 			}
 			logging.Debugf("saved guest share info to %s", roomFile)
 		}
@@ -700,7 +724,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		},
 	})
 	if err != nil {
-		log.Fatalf("create controlled peer: %v", err)
+		return fmt.Errorf("create controlled peer: %w", err)
 	}
 	defer p.Close()
 
@@ -713,12 +737,17 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		}
 	}
 
-	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p, sig: sig})
+	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p})
 	tun.SetSecurityPolicy(policy)
+	runErr := make(chan error, 1)
 	p.OnFileChannelOpen(func() {
 		if len(rules) > 0 {
 			if err := tun.Start(); err != nil {
-				log.Fatalf("start tunnel: %v", err)
+				select {
+				case runErr <- fmt.Errorf("start tunnel: %w", err):
+				default:
+				}
+				return
 			}
 			logActiveMappings("reverse port forwarding active", rules)
 		} else {
@@ -730,12 +759,16 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(interrupt)
 	select {
 	case <-interrupt:
 		logging.Infof("interrupted, shutting down")
 	case <-sig.Done():
-		logging.Infof("signaling connection closed, shutting down")
+		return errSignalingClosed
+	case err := <-runErr:
+		return err
 	}
+	return nil
 }
 
 func waitForGuestConnectID(client *api.Client, session *api.GuestSession) (*api.GuestShareInfo, error) {
@@ -1069,7 +1102,6 @@ func generateAppControlID() (string, error) {
 // the signaling pb channel events.
 type peerSender struct {
 	peer *peer.Peer
-	sig  *signaling.Client
 }
 
 func (s *peerSender) SendFrame(msg []byte) error {
@@ -1077,122 +1109,61 @@ func (s *peerSender) SendFrame(msg []byte) error {
 	return s.peer.SendSignalPB(msg)
 }
 
-func loadConfig(path string) (*auth.Config, error) {
-	return auth.LoadConfigFile(path)
-}
-
-func doListDevices(client *api.Client) {
-	resp, err := client.GetDeviceList()
+func doListDevices(client *api.Client) error {
+	devices, err := client.GetDeviceList()
 	if err != nil {
-		log.Fatalf("get device list: %v", err)
-	}
-
-	data, _ := resp["data"].(map[string]any)
-	if data == nil {
-		log.Fatalf("unexpected response format: %v", resp)
+		return fmt.Errorf("get device list: %w", err)
 	}
 
 	fmt.Printf("%-24s %-16s %-14s %-8s %-12s %s\n", "DEVICE_ID", "NAME", "STATUS", "PLAT", "CLIENT_ID", "VERSION")
 	fmt.Printf("%-24s %-16s %-14s %-8s %-12s %s\n", "--------", "----", "------", "----", "---------", "-------")
-
-	lists := []string{"current_device", "my_binded_devices", "others_shared_devices"}
-	for _, listName := range lists {
-		var items []any
-		if v, ok := data[listName].([]any); ok {
-			items = v
-		} else if v, ok := data[listName].(map[string]any); ok {
-			items = []any{v}
-		}
-		for _, item := range items {
-			dev, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			plat := ""
-			if v, ok := dev["platform"].(float64); ok {
-				plat = fmt.Sprintf("%.0f", v)
-			}
-			fmt.Printf("%-24s %-16s %-14s %-8s %-12s %s\n",
-				strval(dev, "device_id"), strval(dev, "alias"),
-				strval(dev, "status"), plat, strval(dev, "client_id"), strval(dev, "version_name"))
-		}
+	for _, device := range devices {
+		fmt.Printf("%-24s %-16s %-14s %-8d %-12s %s\n",
+			device.DeviceID, device.Alias, device.Status, device.Platform, device.ClientID, device.VersionName)
 	}
+	return nil
 }
 
-func doUserInfo(client *api.Client) {
-	resp, err := client.GetUserInfo()
+func doUserInfo(client *api.Client) error {
+	user, err := client.GetUserInfo()
 	if err != nil {
-		log.Fatalf("get user info: %v", err)
+		return fmt.Errorf("get user info: %w", err)
 	}
-	data, _ := resp["data"].(map[string]any)
-	if data == nil {
-		log.Fatalf("unexpected user info response: %v", resp)
-	}
-	code, _ := resp["code"].(float64)
-	message, _ := resp["msg"].(string)
-	nickname, _ := data["nickname"].(string)
-	userID, _ := data["user_id"].(string)
-	log.Printf("user info: code=%v msg=%q nickname=%q user_id_len=%d keys=%v",
-		code, message, nickname, len(userID), mapKeys(data))
+	log.Printf("user info: nickname=%q user_id_len=%d keys=%v",
+		user.Nickname, len(user.UserID), mapKeys(user.Raw))
+	return nil
 }
 
-type qrCodeLoginFileInfo struct {
-	GuestID           string `json:"guest_id"`
-	GuestToken        string `json:"guest_token"`
-	QRCodeJumpURL     string `json:"qrcode_jump_url"`
-	Token             string `json:"token"`
-	StatusQueryTicket string `json:"status_query_ticket"`
-}
-
-func saveQRCodeLoginInfo(path string, session *api.GuestSession, info *api.QRCodeLoginInfo) error {
-	data, err := json.Marshal(qrCodeLoginFileInfo{
-		GuestID:           session.GuestID,
-		GuestToken:        session.Token,
-		QRCodeJumpURL:     info.QRCodeJumpURL,
-		Token:             info.Token,
-		StatusQueryTicket: info.StatusQueryTicket,
-	})
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-func saveQRCodeLoginStatus(path string, status *api.QRCodeLoginStatusResult) error {
-	data, err := json.MarshalIndent(status.Raw, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-func doInteractiveLogin(client *api.Client, cfg *auth.Config, configPath string, qrTimeout time.Duration, defaultCountryCode string) {
+func doInteractiveLogin(client *api.Client, cfg *auth.Config, configPath string, qrTimeout time.Duration, defaultCountryCode string) error {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Select login method:")
 	fmt.Println("  1. QR code scan (Recommended)")
 	fmt.Println("  2. SMS verification code (Mobile)")
 	fmt.Print("Enter choice [1/2, default 1]: ")
-	choiceText, _ := reader.ReadString('\n')
+	choiceText, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read login method: %w", err)
+	}
 	choice := strings.TrimSpace(choiceText)
 	switch choice {
 	case "2", "mobile", "sms":
-		doMobileLogin(client, cfg, configPath, defaultCountryCode, "")
+		return doMobileLogin(client, cfg, configPath, defaultCountryCode, "")
 	default:
-		doLoginQRCode(client, cfg, configPath, qrTimeout)
+		return doLoginQRCode(client, cfg, configPath, qrTimeout)
 	}
 }
 
-func doMobileLogin(client *api.Client, cfg *auth.Config, configPath, countryCode, mobile string) {
+func doMobileLogin(client *api.Client, cfg *auth.Config, configPath, countryCode, mobile string) error {
 	reader := bufio.NewReader(os.Stdin)
 	if mobile == "" {
 		fmt.Print("Enter mobile phone number: ")
 		text, err := reader.ReadString('\n')
 		if err != nil {
-			log.Fatalf("read mobile number: %v", err)
+			return fmt.Errorf("read mobile number: %w", err)
 		}
 		mobile = strings.TrimSpace(text)
 		if mobile == "" {
-			log.Fatal("mobile phone number cannot be empty")
+			return fmt.Errorf("mobile phone number cannot be empty")
 		}
 	}
 	if countryCode == "" {
@@ -1202,151 +1173,133 @@ func doMobileLogin(client *api.Client, cfg *auth.Config, configPath, countryCode
 	log.Printf("requesting SMS verification code for %s %s...", countryCode, mobile)
 	resp, err := client.RequestMobileCode(countryCode, mobile)
 	if err != nil {
-		if respErr, ok := err.(*api.ResponseError); ok {
-			log.Fatalf("request SMS code failed: code=%d msg=%q (note: server may require captcha if triggered by security policy)",
-				respErr.Code, respErr.Message)
+		var responseErr *api.ResponseError
+		if errors.As(err, &responseErr) {
+			return fmt.Errorf("request SMS code failed: code=%d msg=%q (server may require captcha): %w",
+				responseErr.Code, responseErr.Message, err)
 		}
-		log.Fatalf("request SMS code: %v", err)
+		return fmt.Errorf("request SMS code: %w", err)
 	}
 	log.Printf("SMS code request sent (code=%v msg=%q)", resp["code"], resp["msg"])
 
 	fmt.Print("Enter SMS verification code: ")
 	codeText, err := reader.ReadString('\n')
 	if err != nil {
-		log.Fatalf("read SMS code: %v", err)
+		return fmt.Errorf("read SMS code: %w", err)
 	}
 	code := strings.TrimSpace(codeText)
 	if code == "" {
-		log.Fatal("verification code cannot be empty")
+		return fmt.Errorf("verification code cannot be empty")
 	}
 
 	login, err := client.LoginByMobile(countryCode, mobile, code)
 	if err != nil {
-		if respErr, ok := err.(*api.ResponseError); ok {
-			log.Fatalf("mobile login failed: code=%d msg=%q", respErr.Code, respErr.Message)
+		var responseErr *api.ResponseError
+		if errors.As(err, &responseErr) {
+			return fmt.Errorf("mobile login failed: code=%d msg=%q: %w", responseErr.Code, responseErr.Message, err)
 		}
-		log.Fatalf("mobile login: %v", err)
+		return fmt.Errorf("mobile login: %w", err)
 	}
 
-	data, _ := login["data"].(map[string]any)
-	token, _ := data["token"].(string)
-	if token == "" {
-		log.Fatalf("mobile login response has no token: %v", login)
-	}
-
-	userID, err := api.JWTSubject(token)
+	token := login.Token
+	refreshedState, err := persistLogin(client, cfg, configPath, token)
 	if err != nil {
-		log.Fatalf("decode login JWT: %v", err)
-	}
-	cfg.JWT = token
-	cfg.UserID = userID
-	cfg.GuestID = ""
-	if err := auth.SaveConfigFile(configPath, cfg); err != nil {
-		log.Fatalf("save refreshed config: %v", err)
-	}
-	refreshedState, err := client.GetLoginState()
-	if err != nil {
-		log.Fatalf("validate refreshed login state: %v", err)
-	}
-	if !refreshedState.Valid {
-		log.Fatalf("refreshed login state is invalid")
+		return err
 	}
 	log.Printf("mobile login confirmed; JWT length=%d user_id_len=%d config=%s",
 		len(token), len(refreshedState.UserID), configPath)
+	return nil
 }
 
-func doRefreshLogin(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) {
+func persistLogin(client *api.Client, cfg *auth.Config, configPath, token string) (*api.LoginState, error) {
+	userID, err := api.JWTSubject(token)
+	if err != nil {
+		return nil, fmt.Errorf("decode login JWT: %w", err)
+	}
+
+	previousJWT, previousUserID, previousGuestID := cfg.JWT, cfg.UserID, cfg.GuestID
+	cfg.JWT = token
+	cfg.UserID = userID
+	cfg.GuestID = ""
+	state, err := client.GetLoginState()
+	if err != nil || !state.Valid {
+		cfg.JWT, cfg.UserID, cfg.GuestID = previousJWT, previousUserID, previousGuestID
+		if err != nil {
+			return nil, fmt.Errorf("validate refreshed login state: %w", err)
+		}
+		return nil, fmt.Errorf("refreshed login state is invalid")
+	}
+	if err := auth.SaveConfigFile(configPath, cfg); err != nil {
+		cfg.JWT, cfg.UserID, cfg.GuestID = previousJWT, previousUserID, previousGuestID
+		return nil, fmt.Errorf("save refreshed config: %w", err)
+	}
+	return state, nil
+}
+
+func doRefreshLogin(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) error {
 	state, err := client.GetLoginState()
 	if err == nil && state.Valid {
 		log.Printf("login state valid; no refresh needed (user_id_len=%d nickname=%q)",
 			len(state.UserID), state.Nickname)
-		return
+		return nil
 	}
 	if err != nil {
 		var responseErr *api.ResponseError
 		if !errors.As(err, &responseErr) {
-			log.Fatalf("validate login state: %v", err)
+			return fmt.Errorf("validate login state: %w", err)
 		}
 		log.Printf("login state invalid: %v", responseErr)
 	} else {
 		log.Printf("login state invalid: user info response has no user_id")
 	}
-	doLoginQRCode(client, cfg, configPath, timeout)
+	return doLoginQRCode(client, cfg, configPath, timeout)
 }
 
-func doLoginQRCode(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) {
+func doLoginQRCode(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) error {
 	guest, err := client.CreateGuest()
 	if err != nil {
-		log.Fatalf("create guest: %v", err)
+		return fmt.Errorf("create guest: %w", err)
 	}
 	info, err := client.GenerateQRCodeLoginWithGuest(guest)
 	if err != nil {
-		log.Fatalf("generate QR code login: %v", err)
-	}
-	if err := saveQRCodeLoginInfo("workspace/login-qrcode.json", guest, info); err != nil {
-		log.Fatalf("save QR code login info: %v", err)
+		return fmt.Errorf("generate QR code login: %w", err)
 	}
 	log.Printf("QR-code login URL: %s", info.QRCodeJumpURL)
 	log.Printf("bootstrap credentials: token_len=%d status_query_ticket_len=%d",
 		len(info.Token), len(info.StatusQueryTicket))
-	log.Printf("saved QR code login info to workspace/login-qrcode.json")
 
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
-			log.Fatalf("QR code login timed out after %s", timeout)
+			return fmt.Errorf("QR code login timed out after %s", timeout)
 		}
 		status, err := client.QRCodeLoginStatusWithGuest(guest, info)
 		if err != nil {
 			var responseErr *api.ResponseError
 			if errors.As(err, &responseErr) {
-				log.Fatalf("QR code login status failed: %v", responseErr)
+				return fmt.Errorf("QR code login status failed: %w", responseErr)
 			}
 			log.Printf("query QR code login status: %v", err)
 			continue
-		}
-		if err := saveQRCodeLoginStatus("workspace/login-qrcode-status.json", status); err != nil {
-			log.Fatalf("save QR code login status: %v", err)
 		}
 		log.Printf("QR code login status: login_status=%d token_len=%d qrcode_jump_url_len=%d keys=%v",
 			status.LoginStatus, len(status.Token), len(status.QRCodeJumpURL), mapKeys(status.Raw))
 		if status.LoginStatus == 4 {
 			login, err := client.LoginByQRCodeWithGuest(guest, info)
 			if err != nil {
-				log.Fatalf("QR code login exchange failed: %v", err)
+				return fmt.Errorf("QR code login exchange failed: %w", err)
 			}
-			data, _ := login["data"].(map[string]any)
-			token, _ := data["token"].(string)
-			if token == "" {
-				log.Fatalf("QR code login exchange response has no token: %v", login)
-			}
-			if err := os.WriteFile("workspace/login-qrcode-jwt.json", []byte(token), 0600); err != nil {
-				log.Fatalf("save QR code login JWT: %v", err)
-			}
-			userID, err := api.JWTSubject(token)
+			token := login.Token
+			refreshedState, err := persistLogin(client, cfg, configPath, token)
 			if err != nil {
-				log.Fatalf("decode QR code login JWT: %v", err)
-			}
-			cfg.JWT = token
-			cfg.UserID = userID
-			cfg.GuestID = ""
-			if err := auth.SaveConfigFile(configPath, cfg); err != nil {
-				log.Fatalf("save refreshed config: %v", err)
-			}
-			refreshedState, err := client.GetLoginState()
-			if err != nil {
-				log.Fatalf("validate refreshed login state: %v", err)
-			}
-			if !refreshedState.Valid {
-				log.Fatalf("refreshed login state is invalid")
+				return err
 			}
 			log.Printf("QR code login confirmed; JWT length=%d user_id_len=%d config=%s",
 				len(token), len(refreshedState.UserID), configPath)
-			return
+			return nil
 		}
 		if status.Token != "" {
-			log.Printf("QR code login confirmed; raw response saved to workspace/login-qrcode-status.json")
-			return
+			log.Printf("QR code scanned; waiting for login exchange confirmation")
 		}
 		if status.LoginStatus != 0 {
 			log.Printf("QR code scanned; waiting for login token")
@@ -1354,17 +1307,17 @@ func doLoginQRCode(client *api.Client, cfg *auth.Config, configPath string, time
 	}
 }
 
-func doGuestTest(client *api.Client) {
+func doGuestTest(client *api.Client) error {
 	session, err := client.CreateGuest()
 	if err != nil {
-		log.Fatalf("create guest: %v", err)
+		return fmt.Errorf("create guest: %w", err)
 	}
 	log.Printf("guest session created: guest_id_len=%d token_len=%d user_id_len=%d device_id_len=%d",
 		len(session.GuestID), len(session.Token), len(session.UserID), len(session.DeviceID))
 
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
-		log.Fatalf("create guest room: %v", err)
+		return fmt.Errorf("create guest room: %w", err)
 	}
 	log.Printf("guest room created: signaling=%s gateways=%d token_len=%d",
 		room.SignalingServer, len(room.SignalingList), len(room.Token))
@@ -1376,7 +1329,7 @@ func doGuestTest(client *api.Client) {
 		Controlling: false,
 	})
 	if err != nil {
-		log.Fatalf("connect guest signaling: %v", err)
+		return fmt.Errorf("connect guest signaling: %w", err)
 	}
 	defer sig.Close()
 
@@ -1386,14 +1339,14 @@ func doGuestTest(client *api.Client) {
 	case <-time.After(5 * time.Second):
 		log.Printf("guest signaling namespace connect timeout")
 	case <-sig.Done():
-		log.Fatalf("guest signaling closed before namespace connect")
+		return fmt.Errorf("guest signaling closed before namespace connection")
 	}
 
 	time.Sleep(2 * time.Second)
 
 	share, err := client.GetGuestShareInfo(session)
 	if err != nil {
-		log.Fatalf("get guest share info: %v", err)
+		return fmt.Errorf("get guest share info: %w", err)
 	}
 	log.Printf("guest share info: alias=%q connect_id=%q connect_code_len=%d",
 		share.Alias, share.ConnectID, len(share.ConnectCode))
@@ -1403,7 +1356,7 @@ func doGuestTest(client *api.Client) {
 		log.Printf("connect_code is empty; uploading generated share pass code")
 		share, err = ensureGuestShareCode(client, session, share, guestShareOptions{AuthMode: api.ShareAuthTemporary})
 		if err != nil {
-			log.Fatalf("upload guest share sign: %v", err)
+			return fmt.Errorf("upload guest share sign: %w", err)
 		}
 		log.Printf("guest share info refreshed: alias=%q connect_id=%q connect_code_len=%d",
 			share.Alias, share.ConnectID, len(share.ConnectCode))
@@ -1411,7 +1364,7 @@ func doGuestTest(client *api.Client) {
 	}
 
 	if share.ConnectCode == "" {
-		log.Fatal("guest share code was not generated")
+		return fmt.Errorf("guest share code was not generated")
 	}
 
 	log.Printf("attempting join by share code as logged-in controller")
@@ -1426,11 +1379,11 @@ func doGuestTest(client *api.Client) {
 	log.Printf("attempting join by share code as guest controller")
 	guestJoined, err := client.JoinRoomByShareCodeWithGuest(session, share.ConnectID, share.ConnectCode)
 	if err != nil {
-		log.Printf("join by share code as guest controller failed: %v", err)
-		return
+		return fmt.Errorf("join by share code as guest controller: %w", err)
 	}
 	log.Printf("joined guest share room as guest controller: signaling=%s gateways=%d token_len=%d",
 		guestJoined.SignalingServer, len(guestJoined.SignalingList), len(guestJoined.Token))
+	return nil
 }
 
 func mapKeys(m map[string]any) []string {
@@ -1442,62 +1395,11 @@ func mapKeys(m map[string]any) []string {
 	return keys
 }
 
-func strval(m map[string]any, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
-}
-
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[:n] + "..."
-}
-
-func hexPreview(data []byte, n int) string {
-	if len(data) > n {
-		data = data[:n]
-	}
-	hex := make([]byte, 0, len(data)*2)
-	for _, b := range data {
-		hex = append(hex, "0123456789abcdef"[b>>4], "0123456789abcdef"[b&0xf])
-	}
-	return string(hex)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// firstHostCandidate extracts a UDP host candidate address from the remote
-// ICE candidates (preferring LAN addresses like the official client's fd85
-// path to 10.10.10.13).
-func firstHostCandidate(cands []string) *net.UDPAddr {
-	for _, c := range cands {
-		if !strings.Contains(c, " typ host") {
-			continue
-		}
-		if strings.Contains(c, " tcp ") {
-			continue // mix-kcp rides the UDP path
-		}
-		// candidate:<foundation> <component> <transport> <priority> <ip> <port> typ host ...
-		parts := strings.Fields(c)
-		if len(parts) < 6 {
-			continue
-		}
-		ip := parts[4]
-		port := parts[5]
-		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip, port))
-		if err == nil {
-			return addr
-		}
-	}
-	return nil
 }
 
 func buildSecurityPolicy(cfg *auth.Config, allowLAN bool, allowedPortsFlag string) (tunnel.SecurityPolicy, error) {

@@ -20,8 +20,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+
+      - name: Module tidy
+        run: go mod tidy -diff
+
       - name: Vet
         run: go vet ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
 
       - name: Test
         run: go test -count=1 ./...
@@ -66,7 +75,7 @@ jobs:
         run: |
           NAME="uulink-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "$NAME"
-          mv uulink* "$NAME/"
+          mv "uulink${{ matrix.goos == 'windows' && '.exe' || '' }}" "$NAME/"
           cp config.example.json README.md "$NAME/"
           if [ "${{ matrix.goos }}" = "windows" ]; then
             (cd . && zip -r "$NAME.zip" "$NAME")

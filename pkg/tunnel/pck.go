@@ -108,7 +108,7 @@ func BuildPMFramePCK(targetChan uint32, msg []byte) []byte {
 // protobuf helpers (local copies to avoid importing appdata)
 
 func appendPBVarintField(buf []byte, fieldNum, value uint64) []byte {
-	buf = appendPBVarint(buf, (fieldNum<<3)|0)
+	buf = appendPBVarint(buf, fieldNum<<3)
 	return appendPBVarint(buf, value)
 }
 

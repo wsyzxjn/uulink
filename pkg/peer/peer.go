@@ -17,7 +17,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -45,8 +44,6 @@ const connectOptionsHex = "080110ffffffffffffffffff011a190802100620012a060880281
 
 // ConnectOptionsHex exposes the captured protobuf for external use.
 const ConnectOptionsHex = connectOptionsHex
-
-var controlCapBlob = mustHex("08061002180120023002380240024801")
 
 // Controlled peers do not receive the controller's control-ack ICE list.
 // These are the public STUN servers observed in that ack.
@@ -84,11 +81,11 @@ func (a *ControlAckData) WebRTCICEServers() []webrtc.ICEServer {
 
 // Config for creating a controller Peer.
 type Config struct {
-	Signal       *signaling.Client
-	DeviceID     string // our device id (for streamer_data)
-	AppControlID string
-	Passive      bool // skip signaling control handshake (room-file controller)
-	ForceRelay   bool // only gather TURN relay candidates
+	Signal        *signaling.Client
+	DeviceID      string // our device id (for streamer_data)
+	AppControlID  string
+	Passive       bool          // skip signaling control handshake (room-file controller)
+	TransportMode TransportMode // controller transport policy: auto or relay
 	// SDPOfferFile, when non-empty, makes the controller write its WebRTC
 	// offer to this file and wait for SDPAnswerFile instead of using soac.
 	SDPOfferFile  string
@@ -100,37 +97,38 @@ type Config struct {
 
 // Peer manages the UU Remote WebRTC session as controller.
 type Peer struct {
-	sig               *signaling.Client
-	appControlID      string
-	iceID             string
-	clientID          string
-	routingClientID   string
-	ack               *ControlAckData
-	sdpOfferFile      string
-	sdpAnswerFile     string
-	forceRelay        bool
-	pc                *webrtc.PeerConnection
-	binaryDC          *webrtc.DataChannel
-	controlDC         *webrtc.DataChannel
-	textDC            *webrtc.DataChannel
-	fileDC            *webrtc.DataChannel
-	mu                sync.Mutex
-	onBinaryData      func([]byte)
-	onSignalData      func([]byte)
-	onBinaryOpen      func()
-	onFileOpen        func()
-	onICEConnected    func()
-	controlEchoOnce   sync.Once
-	remoteCandidates  []string
-	ackCh             chan *ControlAckData
-	soacMu            sync.Mutex
-	controlledReady   chan struct{}
-	pendingSOAC       []*signaling.Event
-	remoteDescSet     bool
-	pendingCandidates []webrtc.ICECandidateInit
-	selectedPair      *webrtc.ICECandidatePair
-	statsDone         chan struct{}
-	statsRunning      bool
+	sig                    *signaling.Client
+	appControlID           string
+	iceID                  string
+	clientID               string
+	routingClientID        string
+	ack                    *ControlAckData
+	sdpOfferFile           string
+	sdpAnswerFile          string
+	transportMode          TransportMode
+	effectiveTransportMode TransportMode
+	pc                     *webrtc.PeerConnection
+	binaryDC               *webrtc.DataChannel
+	controlDC              *webrtc.DataChannel
+	textDC                 *webrtc.DataChannel
+	fileDC                 *webrtc.DataChannel
+	mu                     sync.Mutex
+	onBinaryData           func([]byte)
+	onSignalData           func([]byte)
+	onBinaryOpen           func()
+	onFileOpen             func()
+	onICEConnected         func()
+	controlEchoOnce        sync.Once
+	remoteCandidates       []string
+	ackCh                  chan *ControlAckData
+	soacMu                 sync.Mutex
+	controlledReady        chan struct{}
+	pendingSOAC            []*signaling.Event
+	remoteDescSet          bool
+	pendingCandidates      []webrtc.ICECandidateInit
+	selectedPair           *webrtc.ICECandidatePair
+	statsDone              chan struct{}
+	statsRunning           bool
 }
 
 type soacEvent struct {
@@ -165,7 +163,7 @@ func NewController(cfg *Config) (*Peer, error) {
 		appControlID:  appControlID,
 		sdpOfferFile:  cfg.SDPOfferFile,
 		sdpAnswerFile: cfg.SDPAnswerFile,
-		forceRelay:    cfg.ForceRelay,
+		transportMode: cfg.TransportMode,
 		onBinaryData:  cfg.OnBinaryData,
 		onSignalData:  cfg.OnSignalData,
 		ackCh:         make(chan *ControlAckData, 1),
@@ -428,11 +426,24 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 		iceServers = p.ack.WebRTCICEServers()
 		logging.Debugf("[peer] using %d ICE servers from control ack", len(iceServers))
 	}
-	rtcCfg := webrtc.Configuration{ICEServers: iceServers}
-	if p.forceRelay || (p.ack != nil && p.ack.ForceRelay) {
-		rtcCfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
-		logging.Infof("[peer] ICE transport policy forced to relay")
+	serverRequiresRelay := p.ack != nil && p.ack.ForceRelay
+	mode := resolveTransportMode(p.transportMode, serverRequiresRelay)
+	if mode != TransportAuto && mode != TransportRelay {
+		return fmt.Errorf("invalid transport mode %q", mode)
 	}
+	if mode == TransportRelay && !hasTURNServer(iceServers) {
+		return fmt.Errorf("transport relay requires a TURN server but none was supplied")
+	}
+
+	p.mu.Lock()
+	p.effectiveTransportMode = mode
+	p.mu.Unlock()
+
+	rtcCfg := webrtc.Configuration{
+		ICEServers:         iceServers,
+		ICETransportPolicy: transportICEPolicy(mode),
+	}
+	logging.Infof("[peer] transport mode=%s server_requires_relay=%v", mode.String(), serverRequiresRelay)
 
 	pc, err := webrtc.NewPeerConnection(rtcCfg)
 	if err != nil {
@@ -705,80 +716,11 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 			logging.Debugf("[peer] controlled peer already has an offer; ignoring duplicate")
 			return
 		}
-		p.appControlID = msg.Data.AppControlID
-		p.iceID = msg.Data.IceID
-		// soac frames are routed by the controller's client_id. A controlled
-		// peer echoes that ID rather than using its own room_info client_id.
-		p.routingClientID = msg.ClientID
-
-		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-			ICEServers: controlledSTUNServers,
-		})
-		if err != nil {
-			logging.Errorf("[peer] controlled new peer connection error: %v", err)
-			return
-		}
-		p.pc = pc
-		pc.OnICECandidate(p.onICECandidate)
-		pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-			logging.Infof("[peer] connection state: %s", state.String())
-			p.logConnectionStats(pc, "controlled")
-		})
-		pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-			logging.Debugf("[peer] ICE state: %s", state.String())
-			if state == webrtc.ICEConnectionStateConnected && p.onICEConnected != nil {
-				go p.onICEConnected()
-			}
-		})
-		pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
-			p.setSelectedCandidatePair(pc, "controlled", pair)
-		})
-		pc.OnDataChannel(p.setupControlledDataChannel)
-
-		offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.Data.SDP}
-		if offer.SDP == "" && msg.Data.GzipSDP != "" && !strings.HasPrefix(msg.Data.GzipSDP, "{") {
-			offer.SDP = msg.Data.GzipSDP
-		}
-		if offer.SDP == "" {
-			logging.Errorf("[peer] controlled offer with empty SDP")
-			return
-		}
-		if err := pc.SetRemoteDescription(offer); err != nil {
-			logging.Errorf("[peer] controlled set remote offer error: %v", err)
-			return
-		}
-		p.drainPendingCandidates()
-
-		answer, err := pc.CreateAnswer(nil)
-		if err != nil {
-			logging.Errorf("[peer] controlled create answer error: %v", err)
-			return
-		}
-		if err := pc.SetLocalDescription(answer); err != nil {
-			logging.Errorf("[peer] controlled set local answer error: %v", err)
-			return
-		}
-
-		gz, err := gzipCompress([]byte(answer.SDP))
-		if err != nil {
-			logging.Errorf("[peer] controlled gzip answer error: %v", err)
-			return
-		}
-		payload := map[string]any{
-			"client_id": p.routingClientID,
-			"data": map[string]any{
-				"app_control_id":   p.appControlID,
-				"gzip_sdp":         map[string]any{"_placeholder": true, "num": 0},
-				"ice_id":           p.iceID,
-				"ice_network_type": 3,
-				"sdp":              "",
-				"type":             "answer",
-			},
-		}
-		logging.Debugf("[peer] sending controlled soac answer (sdp %d bytes, gzip %d)",
-			len(answer.SDP), len(gz))
-		if err := p.sig.EmitBinary("soac", payload, gz); err != nil {
-			logging.Errorf("[peer] send controlled answer error: %v", err)
+		if err := p.answerControlledOffer(msg); err != nil {
+			// Drop the half-built connection so the controller's next offer is
+			// answered instead of being rejected as a duplicate.
+			p.resetControlledConnection()
+			logging.Errorf("[peer] controlled offer failed: %v", err)
 		}
 
 	case "candidate":
@@ -794,6 +736,98 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 
 	default:
 		logging.Debugf("[peer] controlled soac type=%s ignored", msg.Data.Type)
+	}
+}
+
+// answerControlledOffer builds the controlled-side PeerConnection for one soac
+// offer and sends the answer. It must run with soacMu held.
+func (p *Peer) answerControlledOffer(msg soacEvent) error {
+	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.Data.SDP}
+	if offer.SDP == "" && msg.Data.GzipSDP != "" && !strings.HasPrefix(msg.Data.GzipSDP, "{") {
+		offer.SDP = msg.Data.GzipSDP
+	}
+	if offer.SDP == "" {
+		return fmt.Errorf("offer has empty SDP")
+	}
+
+	p.appControlID = msg.Data.AppControlID
+	p.iceID = msg.Data.IceID
+	// soac frames are routed by the controller's client_id. A controlled
+	// peer echoes that ID rather than using its own room_info client_id.
+	p.routingClientID = msg.ClientID
+
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: controlledSTUNServers,
+	})
+	if err != nil {
+		return fmt.Errorf("new peer connection: %w", err)
+	}
+	p.mu.Lock()
+	p.pc = pc
+	p.mu.Unlock()
+	pc.OnICECandidate(p.onICECandidate)
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		logging.Infof("[peer] connection state: %s", state.String())
+		p.logConnectionStats(pc, "controlled")
+	})
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		logging.Debugf("[peer] ICE state: %s", state.String())
+		if state == webrtc.ICEConnectionStateConnected && p.onICEConnected != nil {
+			go p.onICEConnected()
+		}
+	})
+	pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
+		p.setSelectedCandidatePair(pc, "controlled", pair)
+	})
+	pc.OnDataChannel(p.setupControlledDataChannel)
+
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		return fmt.Errorf("set remote offer: %w", err)
+	}
+	p.drainPendingCandidates()
+
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		return fmt.Errorf("create answer: %w", err)
+	}
+	if err := pc.SetLocalDescription(answer); err != nil {
+		return fmt.Errorf("set local answer: %w", err)
+	}
+
+	gz, err := gzipCompress([]byte(answer.SDP))
+	if err != nil {
+		return fmt.Errorf("gzip answer: %w", err)
+	}
+	payload := map[string]any{
+		"client_id": p.routingClientID,
+		"data": map[string]any{
+			"app_control_id":   p.appControlID,
+			"gzip_sdp":         map[string]any{"_placeholder": true, "num": 0},
+			"ice_id":           p.iceID,
+			"ice_network_type": 3,
+			"sdp":              "",
+			"type":             "answer",
+		},
+	}
+	logging.Debugf("[peer] sending controlled soac answer (sdp %d bytes, gzip %d)",
+		len(answer.SDP), len(gz))
+	if err := p.sig.EmitBinary("soac", payload, gz); err != nil {
+		return fmt.Errorf("send answer: %w", err)
+	}
+	return nil
+}
+
+// resetControlledConnection discards a failed controlled PeerConnection so the
+// next offer can be answered. It must run with soacMu held.
+func (p *Peer) resetControlledConnection() {
+	p.mu.Lock()
+	pc := p.pc
+	p.pc = nil
+	p.remoteDescSet = false
+	p.pendingCandidates = nil
+	p.mu.Unlock()
+	if pc != nil {
+		_ = pc.Close()
 	}
 }
 
@@ -1033,7 +1067,7 @@ func pbBytes(data []byte, want uint64) ([]byte, bool) {
 }
 
 func appendPBVarintField(buf []byte, fieldNum, value uint64) []byte {
-	buf = appendPBVarint(buf, (fieldNum<<3)|0)
+	buf = appendPBVarint(buf, fieldNum<<3)
 	return appendPBVarint(buf, value)
 }
 
@@ -1122,6 +1156,40 @@ func (p *Peer) OnICEConnected(fn func()) {
 	p.mu.Lock()
 	p.onICEConnected = fn
 	p.mu.Unlock()
+}
+
+// TransportMode returns the effective mode resolved before peer creation.
+func (p *Peer) TransportMode() TransportMode {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.effectiveTransportMode == "" {
+		return TransportAuto
+	}
+	return p.effectiveTransportMode
+}
+
+// SelectedPairMode reports the candidate type of the selected ICE pair.
+func (p *Peer) SelectedPairMode() string {
+	p.mu.Lock()
+	pair := p.selectedPair
+	p.mu.Unlock()
+	if pair == nil {
+		return "unavailable"
+	}
+	return candidatePairMode(pair)
+}
+
+// ValidateTransportMode refuses to start the data plane when relay was
+// required but the selected ICE pair is not relayed.
+func (p *Peer) ValidateTransportMode() error {
+	if p.TransportMode() != TransportRelay {
+		return nil
+	}
+	mode := p.SelectedPairMode()
+	if mode != "relay" {
+		return fmt.Errorf("transport relay required but selected candidate pair mode=%s", mode)
+	}
+	return nil
 }
 
 // RemoteCandidates returns the remote ICE candidate strings received via soac
@@ -1267,13 +1335,4 @@ func randomUUID() (string, error) {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
-}
-
-func gzipDecompress(data []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
 }

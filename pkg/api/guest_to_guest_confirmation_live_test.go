@@ -91,8 +91,8 @@ func TestLiveGuestToGuestConfirmationJoin(t *testing.T) {
 	room, err := controllerClient.JoinRoomByConfirmationWithGuest(
 		controllerGuest, share.ConnectID, share.ConnectCode)
 	if err != nil {
-		responseErr, ok := err.(*ResponseError)
-		if !ok {
+		var responseErr *ResponseError
+		if !errors.As(err, &responseErr) {
 			t.Fatalf("guest join by confirmation: %v", err)
 		}
 		data, _ := responseErr.Response["data"].(map[string]any)

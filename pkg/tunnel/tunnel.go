@@ -147,8 +147,9 @@ func ParsePortRange(s string) (start, end int, err error) {
 // ExpandPortRange takes local and remote port specifications (single ports or ranges)
 // and expands them into matching 1-to-1 port pairs.
 // Examples:
-//   "8080", "8080" -> [{8080, 8080}]
-//   "9000-9005", "8000-8005" -> [{9000, 8000}, {9001, 8001}, ...]
+//
+//	"8080", "8080" -> [{8080, 8080}]
+//	"9000-9005", "8000-8005" -> [{9000, 8000}, {9001, 8001}, ...]
 func ExpandPortRange(localSpec, remoteSpec string) ([]PortPair, error) {
 	localStart, localEnd, err := ParsePortRange(localSpec)
 	if err != nil {
@@ -178,8 +179,9 @@ func ExpandPortRange(localSpec, remoteSpec string) ([]PortPair, error) {
 
 // ParsePortMappingSpec parses a "LOCAL_SPEC:REMOTE_SPEC" mapping string into port pairs.
 // Examples:
-//   "8080:8080"
-//   "9000-9005:8000-8005"
+//
+//	"8080:8080"
+//	"9000-9005:8000-8005"
 func ParsePortMappingSpec(spec string) ([]PortPair, error) {
 	spec = strings.TrimSpace(spec)
 	parts := strings.Split(spec, ":")

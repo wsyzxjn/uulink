@@ -117,6 +117,9 @@ func DecodeMessage(data []byte) (*Message, error) {
 			}
 		case 27:
 			b, n, err := decodeBytesField(data[pos:], wireType)
+			if err != nil {
+				return nil, fmt.Errorf("decode message frame: %w", err)
+			}
 			pos += n
 			frame, err := decodeFrame(b)
 			if err != nil {
@@ -272,14 +275,8 @@ func NewSynAck() []byte {
 
 // protobuf helpers
 
-func appendFieldString(buf []byte, fieldNum uint64, s string) []byte {
-	buf = appendVarint(buf, (fieldNum<<3)|2)
-	buf = appendVarint(buf, uint64(len(s)))
-	return append(buf, s...)
-}
-
 func appendFieldVarint(buf []byte, fieldNum, value uint64) []byte {
-	buf = appendVarint(buf, (fieldNum<<3)|0)
+	buf = appendVarint(buf, fieldNum<<3)
 	return appendVarint(buf, value)
 }
 
@@ -307,14 +304,6 @@ func decodeVarint(data []byte) (uint64, int) {
 		}
 	}
 	return 0, 0
-}
-
-func decodeStringField(data []byte, wireType uint64) (string, int, error) {
-	if wireType != 2 {
-		return "", 0, fmt.Errorf("string field: expected wire type 2, got %d", wireType)
-	}
-	b, n, err := decodeBytesField(data, 2)
-	return string(b), n, err
 }
 
 func decodeBytesField(data []byte, wireType uint64) ([]byte, int, error) {

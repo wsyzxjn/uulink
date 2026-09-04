@@ -15,22 +15,13 @@ type LoginState struct {
 // with code 0 but no user_id is treated as an invalid login state, matching the
 // server's observed behavior for expired tokens.
 func (c *Client) GetLoginState() (*LoginState, error) {
-	resp, err := c.GetUserInfo()
+	user, err := c.GetUserInfo()
 	if err != nil {
 		return nil, err
 	}
-	if code, ok := resp["code"].(float64); ok && code != 0 {
-		message, _ := resp["msg"].(string)
-		return nil, &ResponseError{Code: int(code), Message: message, Response: resp}
-	}
-
-	state := &LoginState{Raw: resp}
-	data, ok := resp["data"].(map[string]any)
-	if !ok {
-		return state, nil
-	}
-	state.UserID, _ = data["user_id"].(string)
-	state.Nickname, _ = data["nickname"].(string)
+	state := &LoginState{Raw: user.Raw}
+	state.UserID = user.UserID
+	state.Nickname = user.Nickname
 	state.Valid = state.UserID != ""
 	return state, nil
 }

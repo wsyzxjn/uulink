@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -49,8 +50,8 @@ func TestLiveGuestConfirmationJoin(t *testing.T) {
 
 	room, err := client.JoinRoomByConfirmation(share.ConnectID, cfg.DeviceID)
 	if err != nil {
-		responseErr, ok := err.(*ResponseError)
-		if !ok {
+		var responseErr *ResponseError
+		if !errors.As(err, &responseErr) {
 			t.Fatalf("join by confirmation: %v", err)
 		}
 		data, _ := responseErr.Response["data"].(map[string]any)

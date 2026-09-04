@@ -3,8 +3,47 @@ package peer
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
+
+	"github.com/user/uulink/pkg/signaling"
 )
+
+func TestControlledOfferFailureLeavesPeerReadyForNextOffer(t *testing.T) {
+	p := &Peer{controlledReady: make(chan struct{}), statsDone: make(chan struct{})}
+	close(p.controlledReady)
+
+	emptyOffer, err := json.Marshal(map[string]any{
+		"client_id": "controller-1",
+		"data":      map[string]any{"type": "offer", "sdp": "", "app_control_id": "ac-1", "ice_id": "ice-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.handleControlledSOAC(&signaling.Event{Name: "soac", Args: []json.RawMessage{emptyOffer}})
+
+	p.mu.Lock()
+	pc := p.pc
+	p.mu.Unlock()
+	if pc != nil {
+		t.Fatal("failed offer left a PeerConnection behind; later offers would be dropped as duplicates")
+	}
+
+	// A failed offer must not poison the connection with a stale, never-applied
+	// remote description or with candidates that belonged to it.
+	p.mu.Lock()
+	remoteDescSet, pendingCandidates := p.remoteDescSet, len(p.pendingCandidates)
+	p.mu.Unlock()
+	if remoteDescSet || pendingCandidates != 0 {
+		t.Fatalf("stale state after failed offer: remoteDescSet=%v pending=%d", remoteDescSet, pendingCandidates)
+	}
+
+	// An offer that is rejected before validation must not adopt the sender's
+	// routing identity; that only happens once a valid offer is answered.
+	if p.routingClientID != "" || p.appControlID != "" {
+		t.Fatalf("invalid offer changed identity: routing=%q app_control=%q", p.routingClientID, p.appControlID)
+	}
+}
 
 func TestReplacePBBytesFieldUpdatesControlDeviceAndCapability(t *testing.T) {
 	pb, err := hex.DecodeString(ConnectOptionsHex)

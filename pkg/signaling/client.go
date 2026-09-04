@@ -73,6 +73,7 @@ type Client struct {
 	ackHandlers  map[int]func([]json.RawMessage)
 	ackCounter   int
 	amu          sync.Mutex
+	closeOnce    sync.Once
 
 	// Pending binary events waiting for attachments
 	pendingBinaryEvent *pendingBinaryEvent
@@ -409,12 +410,12 @@ func (c *Client) NamespaceConnected() <-chan struct{} {
 
 // Close shuts down the connection.
 func (c *Client) Close() error {
-	select {
-	case <-c.done:
-	default:
+	var err error
+	c.closeOnce.Do(func() {
 		close(c.done)
-	}
-	return c.conn.Close()
+		err = c.conn.Close()
+	})
+	return err
 }
 
 // Done returns a channel that's closed when the connection ends.
@@ -429,13 +430,7 @@ func (c *Client) send(msg string) error {
 }
 
 func (c *Client) readLoop() {
-	defer func() {
-		select {
-		case <-c.done:
-		default:
-			close(c.done)
-		}
-	}()
+	defer c.Close()
 
 	for {
 		msgType, msg, err := c.conn.ReadMessage()
@@ -727,11 +722,4 @@ func (c *Client) pingLoop() {
 			}
 		}
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

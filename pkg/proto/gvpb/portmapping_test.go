@@ -154,3 +154,11 @@ func TestOfficialDataAndFinFramesDecode(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeMessageRejectsWrongFrameWireType(t *testing.T) {
+	// Field 27 must be length-delimited; this encodes it as a varint.
+	_, err := DecodeMessage([]byte{0xd8, 0x01, 0x00})
+	if err == nil {
+		t.Fatal("DecodeMessage() accepted a frame with the wrong wire type")
+	}
+}

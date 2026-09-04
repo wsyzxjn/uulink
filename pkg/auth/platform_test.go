@@ -4,11 +4,11 @@ import "testing"
 
 func TestPlatformParams(t *testing.T) {
 	tests := []struct {
-		goos         string
-		cfgPlatform  int
-		platform     string
-		versionName  string
-		versionCode  string
+		goos        string
+		cfgPlatform int
+		platform    string
+		versionName string
+		versionCode string
 	}{
 		{"darwin", 0, "4", "4.38.0", "616"},
 		{"windows", 0, "1", "4.38.3", "9325"},

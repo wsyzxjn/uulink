@@ -1,10 +1,114 @@
 package main
 
 import (
+	"encoding/base64"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
+	"github.com/user/uulink/pkg/peer"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func loginTestClient(cfg *auth.Config, response string) *api.Client {
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(response)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	return api.NewClientWithOptions(cfg, api.ClientOptions{
+		BaseURL:    "https://api.example",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+}
+
+func unsignedTestJWT(subject string) string {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"` + subject + `"}`))
+	return "header." + payload + ".signature"
+}
+
+func TestValidateTransportForServer(t *testing.T) {
+	if err := validateTransportForServer(peer.TransportAuto, true); err != nil {
+		t.Fatalf("server mode rejected auto transport: %v", err)
+	}
+	if err := validateTransportForServer(peer.TransportRelay, false); err != nil {
+		t.Fatalf("controller mode rejected relay transport: %v", err)
+	}
+	if err := validateTransportForServer(peer.TransportRelay, true); err == nil {
+		t.Fatal("server mode accepted relay transport")
+	}
+}
+
+func TestPersistLogin(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		cfg := &auth.Config{JWT: "old-token", UserID: "old-user", GuestID: "old-guest"}
+		client := loginTestClient(cfg, `{"code":0,"data":{"user_id":"new-user","nickname":"tester"}}`)
+		configPath := filepath.Join(t.TempDir(), "config.json")
+
+		state, err := persistLogin(client, cfg, configPath, unsignedTestJWT("new-user"))
+		if err != nil {
+			t.Fatalf("persistLogin(): %v", err)
+		}
+		if !state.Valid || cfg.UserID != "new-user" || cfg.GuestID != "" {
+			t.Fatalf("persisted state=%+v config=%+v", state, cfg)
+		}
+		saved, err := auth.LoadConfigFile(configPath)
+		if err != nil {
+			t.Fatalf("LoadConfigFile(): %v", err)
+		}
+		if saved.JWT != cfg.JWT || saved.UserID != "new-user" || saved.GuestID != "" {
+			t.Fatalf("saved config=%+v", saved)
+		}
+		info, err := os.Stat(configPath)
+		if err != nil {
+			t.Fatalf("Stat(): %v", err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("config permissions=%o, want 600", info.Mode().Perm())
+		}
+	})
+
+	t.Run("invalid login rolls back", func(t *testing.T) {
+		cfg := &auth.Config{JWT: "old-token", UserID: "old-user", GuestID: "old-guest"}
+		client := loginTestClient(cfg, `{"code":0,"data":{}}`)
+		configPath := filepath.Join(t.TempDir(), "config.json")
+
+		if _, err := persistLogin(client, cfg, configPath, unsignedTestJWT("new-user")); err == nil {
+			t.Fatal("persistLogin() accepted an invalid login state")
+		}
+		if cfg.JWT != "old-token" || cfg.UserID != "old-user" || cfg.GuestID != "old-guest" {
+			t.Fatalf("config was not rolled back: %+v", cfg)
+		}
+		if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+			t.Fatalf("invalid login wrote config: %v", err)
+		}
+	})
+
+	t.Run("save failure rolls back", func(t *testing.T) {
+		cfg := &auth.Config{JWT: "old-token", UserID: "old-user", GuestID: "old-guest"}
+		client := loginTestClient(cfg, `{"code":0,"data":{"user_id":"new-user"}}`)
+		configPath := filepath.Join(t.TempDir(), "missing", "config.json")
+
+		if _, err := persistLogin(client, cfg, configPath, unsignedTestJWT("new-user")); err == nil {
+			t.Fatal("persistLogin() succeeded with a missing config directory")
+		}
+		if cfg.JWT != "old-token" || cfg.UserID != "old-user" || cfg.GuestID != "old-guest" {
+			t.Fatalf("config was not rolled back: %+v", cfg)
+		}
+	})
+}
 
 func TestConfiguredRulesAllowsInboundOnly(t *testing.T) {
 	rules, err := configuredRules(&auth.Config{}, "", "", "127.0.0.1", "", "127.0.0.1", "")
