@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/user/uulink/pkg/api"
@@ -205,5 +206,42 @@ func TestCustomCodeResolutionPriority(t *testing.T) {
 	}
 	if got := resolve("", "", cfg.CustomCode); got != "ConfigPass1" {
 		t.Errorf("cfgCode priority = %q, want ConfigPass1", got)
+	}
+}
+
+func TestConfigInitializationAndDeterministicReuse(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+
+	// 1. First run: config does not exist, LoadOrInitConfigFile creates it with random fixed client_id
+	cfg, err := auth.LoadOrInitConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("first LoadOrInitConfigFile: %v", err)
+	}
+	if cfg.ClientID == "" {
+		t.Fatal("expected ClientID to be generated on initialization")
+	}
+	initialClientID := cfg.ClientID
+
+	// Simulate registering with server and saving device_id and custom_code
+	cfg.DeviceID = "dev_12345678"
+	cfg.CustomCode = "MyPass123"
+	if err := auth.SaveConfigFile(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	// 2. Second run: reloads config, must have exact same ClientID, DeviceID, and CustomCode
+	reloaded, err := auth.LoadOrInitConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("second LoadOrInitConfigFile: %v", err)
+	}
+	if reloaded.ClientID != initialClientID {
+		t.Errorf("ClientID changed: got %s, want %s", reloaded.ClientID, initialClientID)
+	}
+	if reloaded.DeviceID != "dev_12345678" {
+		t.Errorf("DeviceID changed: got %s, want dev_12345678", reloaded.DeviceID)
+	}
+	if reloaded.CustomCode != "MyPass123" {
+		t.Errorf("CustomCode changed: got %s, want MyPass123", reloaded.CustomCode)
 	}
 }

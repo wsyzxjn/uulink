@@ -3,8 +3,13 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 // EffectiveHostname returns the configured hostname, or the current system
@@ -54,4 +59,48 @@ func SaveConfigFile(path string, cfg *Config) error {
 		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
+}
+
+// EnsureClientID ensures the config has a valid ClientID, generating a random
+// UUID if none is set. Returns whether the config was modified.
+func (c *Config) EnsureClientID() bool {
+	if c.ClientID != "" {
+		return false
+	}
+	id, err := uuid.NewRandom()
+	if err != nil {
+		c.ClientID = fmt.Sprintf("%016X", time.Now().UnixNano())
+		return true
+	}
+	c.ClientID = strings.ToUpper(id.String())
+	return true
+}
+
+// NewDefaultConfig initializes a new Config with a randomly generated,
+// fixed ClientID.
+func NewDefaultConfig() *Config {
+	cfg := &Config{}
+	cfg.EnsureClientID()
+	return cfg
+}
+
+// LoadOrInitConfigFile loads config from path, or generates a default config
+// with a persistent random client_id if the file does not exist.
+func LoadOrInitConfigFile(path string) (*Config, error) {
+	cfg, err := LoadConfigFile(path)
+	if err == nil {
+		if cfg.EnsureClientID() {
+			_ = SaveConfigFile(path, cfg)
+		}
+		return cfg, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		cfg = NewDefaultConfig()
+		if err := SaveConfigFile(path, cfg); err != nil {
+			// If saving fails (e.g. read-only dir), still return the generated in-memory config
+			return cfg, nil
+		}
+		return cfg, nil
+	}
+	return nil, err
 }

@@ -83,12 +83,12 @@ func main() {
 	}
 	logging.SetLevel(parsedLogLevel)
 
-	cfg, err := auth.LoadConfigFile(*configPath)
+	cfg, err := auth.LoadOrInitConfigFile(*configPath)
 	if err != nil {
 		if os.IsNotExist(err) && (*customServe || *unboundGuestServe || *customConnect != "") {
-			cfg = &auth.Config{}
+			cfg = auth.NewDefaultConfig()
 		} else {
-			log.Fatalf("load config: %v", err)
+			log.Fatalf("load/init config: %v", err)
 		}
 	}
 
@@ -207,6 +207,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   api.ShareAuthCustom,
 			CustomCode: effectiveCustomCode,
+			ConfigPath: *configPath,
 		}, secPolicy)
 		return
 	}
@@ -219,6 +220,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: effectiveCustomCode,
+			ConfigPath: *configPath,
 		}, secPolicy)
 		return
 	}
@@ -231,6 +233,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: effectiveCustomCode,
+			ConfigPath: *configPath,
 		}, secPolicy)
 		return
 	}
@@ -580,6 +583,7 @@ type guestShareOptions struct {
 	ControlID  string
 	AuthMode   api.ShareAuthMode
 	CustomCode string
+	ConfigPath string
 }
 
 func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
@@ -606,7 +610,10 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
 	cfg.Platform = 1
-	logging.Debugf("unbound guest identity created")
+	if shareOptions.ConfigPath != "" {
+		_ = auth.SaveConfigFile(shareOptions.ConfigPath, cfg)
+	}
+	logging.Debugf("unbound guest identity ready: client_id=%s device_id=%s", cfg.ClientID, cfg.DeviceID)
 
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
@@ -761,6 +768,20 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			logging.Infof("client connect command: ./uulink -custom-connect %s -custom-code %s", share.ConnectID, share.ConnectCode)
 		} else {
 			logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
+		}
+		if shareOptions.ConfigPath != "" {
+			changed := false
+			if cfg.ShareID != share.ConnectID {
+				cfg.ShareID = share.ConnectID
+				changed = true
+			}
+			if shareOptions.CustomCode != "" && cfg.CustomCode != shareOptions.CustomCode {
+				cfg.CustomCode = shareOptions.CustomCode
+				changed = true
+			}
+			if changed {
+				_ = auth.SaveConfigFile(shareOptions.ConfigPath, cfg)
+			}
 		}
 	}
 
