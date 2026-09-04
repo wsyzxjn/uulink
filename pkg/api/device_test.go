@@ -47,7 +47,7 @@ func TestInitWindowsDeviceWithoutAuthReusesClientID(t *testing.T) {
 	})
 
 	cfg := &auth.Config{
-		ClientID: configuredID,
+		UnboundClientID: configuredID,
 	}
 	client := NewClient(cfg)
 	client.http.Transport = mockTransport
@@ -75,7 +75,7 @@ func TestInitWindowsDeviceWithoutAuthReusesClientID(t *testing.T) {
 	}
 
 	// Verify that client.cfg.DeviceID was populated
-	if cfg.DeviceID != "test_dev_12345678" {
+	if cfg.UnboundDeviceID != "test_dev_12345678" {
 		t.Errorf("cfg.DeviceID was not populated: %q", cfg.DeviceID)
 	}
 }
@@ -105,7 +105,7 @@ func TestInitWindowsDeviceWithoutAuthGeneratesWhenEmpty(t *testing.T) {
 		t.Fatalf("InitWindowsDeviceWithoutAuth: %v", err)
 	}
 
-	if cfg.ClientID == "" {
+	if cfg.UnboundClientID == "" {
 		t.Fatal("cfg.ClientID was not generated and set")
 	}
 	if identity.DeviceID != "gen_dev_87654321" {

@@ -215,14 +215,16 @@ func main() {
 			log.Fatalf("configure mappings: %v", err)
 		}
 		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
-			ControlID:  *guestControlID,
-			AuthMode:   api.ShareAuthCustom,
-			CustomCode: effectiveCustomCode,
-			ConfigPath: *configPath,
+			ControlID:     *guestControlID,
+			AuthMode:      api.ShareAuthCustom,
+			CustomCode:    effectiveCustomCode,
+			ConfigPath:    *configPath,
+			PublishURL:    *publishURL,
+			PublishSecret: *publishSecret,
 		}, secPolicy)
 		return
 	}
-	if *configURL != "" && (*serveMode || *guestServe || *unboundGuestServe) {
+	if *configURL != "" && (*serveMode || *guestServe || *unboundGuestServe || *customServe) {
 		log.Fatal("-config-url cannot be combined with server modes (-serve, -guest-serve, -unbound-guest-serve)")
 	}
 	if *unboundGuestServe {
@@ -313,11 +315,15 @@ func main() {
 		shareID := remoteCfg.EffectiveShareID()
 		shareCode := remoteCfg.EffectiveShareCode()
 		logging.Infof("joining share room %s via remote config", shareID)
-		guestSession, guestErr := client.CreateGuest()
-		if guestErr != nil {
-			log.Fatalf("create guest session: %v", guestErr)
+		if cfg.JWT != "" {
+			room, err = client.JoinRoomByShareCode(shareID, shareCode)
+		} else {
+			guestSession, guestErr := client.CreateGuest()
+			if guestErr != nil {
+				log.Fatalf("create guest session: %v", guestErr)
+			}
+			room, err = client.JoinRoomByShareCodeWithGuest(guestSession, shareID, shareCode)
 		}
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, shareID, shareCode)
 		if err != nil {
 			if responseErr, ok := err.(*api.ResponseError); ok {
 				data, _ := responseErr.Response["data"].(map[string]any)
@@ -357,11 +363,15 @@ func main() {
 			log.Fatalf("validate custom code: %v", err)
 		}
 		logging.Infof("joining share room %s with custom verification code", targetShareID)
-		guestSession, guestErr := client.CreateGuest()
-		if guestErr != nil {
-			log.Fatalf("create guest session: %v", guestErr)
+		if cfg.JWT != "" {
+			room, err = client.JoinRoomByShareCode(targetShareID, targetShareCode)
+		} else {
+			guestSession, guestErr := client.CreateGuest()
+			if guestErr != nil {
+				log.Fatalf("create guest session: %v", guestErr)
+			}
+			room, err = client.JoinRoomByShareCodeWithGuest(guestSession, targetShareID, targetShareCode)
 		}
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, targetShareID, targetShareCode)
 		if err != nil {
 			if responseErr, ok := err.(*api.ResponseError); ok {
 				data, _ := responseErr.Response["data"].(map[string]any)

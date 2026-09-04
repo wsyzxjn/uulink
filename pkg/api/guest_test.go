@@ -116,7 +116,7 @@ func TestShareAuthModeOfficialControlMode(t *testing.T) {
 		want string
 	}{
 		{ShareAuthTemporary, "by_password"},
-		{ShareAuthCustom, "by_confirmation"},
+		{ShareAuthCustom, "by_password"},
 		{ShareAuthBoth, "password_confirmation"},
 	}
 	for _, test := range tests {
@@ -164,7 +164,7 @@ func TestNewGuestShareUploadSignRequestModes(t *testing.T) {
 		},
 		{
 			ShareAuthCustom,
-			`{"can_remote_control":true,"control_id":"12345678","sign":"","backup_sign":"` + customSign + `","control_mode":"by_confirmation","need_confirmation":true}`,
+			`{"can_remote_control":true,"control_id":"12345678","sign":"` + customSign + `","backup_sign":"` + customSign + `","control_mode":"by_password","need_confirmation":false}`,
 		},
 		{
 			ShareAuthBoth,

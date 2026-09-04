@@ -60,8 +60,8 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 // account, which makes it usable as an anonymous guest-controlled endpoint.
 func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdentity, error) {
 	guid := ""
-	if c.cfg != nil && c.cfg.ClientID != "" {
-		guid = strings.ToLower(strings.TrimPrefix(c.cfg.ClientID, "MG-"))
+	if c.cfg != nil && c.cfg.UnboundClientID != "" {
+		guid = strings.ToLower(strings.TrimPrefix(c.cfg.UnboundClientID, "MG-"))
 	}
 	if guid == "" {
 		id, err := uuid.NewRandom()
@@ -70,7 +70,7 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 		}
 		guid = id.String()
 		if c.cfg != nil {
-			c.cfg.ClientID = strings.ToUpper(guid)
+			c.cfg.UnboundClientID = "MG-" + guid
 		}
 	}
 	clientID := "MG-" + guid
@@ -118,8 +118,8 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 	if deviceID == "" {
 		return nil, fmt.Errorf("init windows device response missing device_id")
 	}
-	if c.cfg != nil && c.cfg.DeviceID == "" {
-		c.cfg.DeviceID = deviceID
+	if c.cfg != nil {
+		c.cfg.UnboundDeviceID = deviceID
 	}
 
 	return &UnboundDeviceIdentity{ClientID: clientID, DeviceID: deviceID}, nil
