@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,18 +59,28 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 // server without a user JWT. The returned device is not bound to any user
 // account, which makes it usable as an anonymous guest-controlled endpoint.
 func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdentity, error) {
-	id, err := uuid.NewRandom()
-	if err != nil {
-		return nil, fmt.Errorf("generate device uuid: %w", err)
+	guid := ""
+	if c.cfg != nil && c.cfg.ClientID != "" {
+		guid = strings.ToLower(strings.TrimPrefix(c.cfg.ClientID, "MG-"))
 	}
-	clientID := "MG-" + id.String()
+	if guid == "" {
+		id, err := uuid.NewRandom()
+		if err != nil {
+			return nil, fmt.Errorf("generate device uuid: %w", err)
+		}
+		guid = id.String()
+		if c.cfg != nil {
+			c.cfg.ClientID = strings.ToUpper(guid)
+		}
+	}
+	clientID := "MG-" + guid
 
 	body := map[string]any{
 		"name":         name,
 		"client_id":    clientID,
 		"system_id":    clientID,
-		"machine_guid": id.String(),
-		"guid":         id.String(),
+		"machine_guid": guid,
+		"guid":         guid,
 		"os":           "Microsoft Windows NT 10.0.26200.0",
 		"base_board":   "Virtual",
 		"cpu":          "Virtual CPU",
@@ -88,7 +99,9 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 	cfg.ClientID = clientID
 	cfg.DeviceID = ""
 	cfg.Platform = 1
-	resp, err := NewClient(&cfg).Do("POST", "/api/v1/device/windows/init", body)
+	subClient := NewClient(&cfg)
+	subClient.http.Transport = c.http.Transport
+	resp, err := subClient.Do("POST", "/api/v1/device/windows/init", body)
 	if err != nil {
 		return nil, fmt.Errorf("init windows device without auth: %w", err)
 	}
@@ -104,6 +117,9 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 	deviceID, _ := data["device_id"].(string)
 	if deviceID == "" {
 		return nil, fmt.Errorf("init windows device response missing device_id")
+	}
+	if c.cfg != nil && c.cfg.DeviceID == "" {
+		c.cfg.DeviceID = deviceID
 	}
 
 	return &UnboundDeviceIdentity{ClientID: clientID, DeviceID: deviceID}, nil

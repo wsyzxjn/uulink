@@ -83,6 +83,9 @@ func main() {
 	publishSecret := flag.String("publish-secret", "", "optional bearer token for publish webhook")
 	lanDiscovery := flag.Bool("lan-discovery", false, "enable Minecraft LAN discovery broadcast for forwarded ports")
 	lanMotd := flag.String("lan-motd", "", "override MOTD text for LAN discovery broadcast")
+	customServe := flag.Bool("custom-serve", false, "run assistance server using custom verification code mode (unbound/no-login)")
+	customConnect := flag.String("custom-connect", "", "connect ID of the remote assistance server to connect to using custom code")
+	customCodeFlag := flag.String("custom-code", "", "custom verification code (8-16 alphanumeric characters) for server or client mode")
 	flag.Parse()
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
@@ -91,22 +94,32 @@ func main() {
 	}
 	logging.SetLevel(parsedLogLevel)
 
+	cfg, err := auth.LoadOrInitConfigFile(*configPath)
+	if err != nil {
+		if os.IsNotExist(err) && (*configURL != "" || *customServe || *unboundGuestServe || *customConnect != "") {
+			cfg = auth.NewDefaultConfig()
+		} else {
+			log.Fatalf("load/init config: %v", err)
+		}
+	}
+
 	authMode, err := api.ParseShareAuthMode(*shareAuthMode)
 	if err != nil {
 		log.Fatalf("parse share auth mode: %v", err)
 	}
-	if *guestCustomCode != "" && authMode != api.ShareAuthTemporary {
-		if err := api.ValidateCustomShareCode(*guestCustomCode); err != nil {
-			log.Fatalf("validate guest custom code: %v", err)
-		}
+	effectiveCustomCode := *customCodeFlag
+	if effectiveCustomCode == "" {
+		effectiveCustomCode = *guestCustomCode
 	}
-
-	cfg, err := auth.LoadConfigFile(*configPath)
-	if err != nil {
-		if os.IsNotExist(err) && *configURL != "" {
-			cfg = &auth.Config{}
-		} else {
-			log.Fatalf("load config: %v", err)
+	if effectiveCustomCode == "" {
+		effectiveCustomCode = cfg.CustomCode
+	}
+	if (effectiveCustomCode != "" || *customServe) && authMode == api.ShareAuthTemporary {
+		authMode = api.ShareAuthCustom
+	}
+	if effectiveCustomCode != "" && authMode != api.ShareAuthTemporary {
+		if err := api.ValidateCustomShareCode(effectiveCustomCode); err != nil {
+			log.Fatalf("validate custom code: %v", err)
 		}
 	}
 
@@ -157,21 +170,57 @@ func main() {
 		return
 	}
 
-	usesShareRoom := *shareJoin || *shareGuest || *shareConfirmation
-	if usesShareRoom && *shareID == "" {
-		log.Fatal("-share-id is required")
+	isCustomConnect := *customConnect != "" || (*shareJoin && effectiveCustomCode != "")
+	targetShareID := *shareID
+	if *customConnect != "" {
+		targetShareID = *customConnect
 	}
-	if (*shareJoin || *shareGuest) && *shareCode == "" {
-		log.Fatal("-share-code is required")
+	if targetShareID == "" {
+		targetShareID = cfg.ShareID
 	}
-	if *serveMode && *guestServe {
-		log.Fatal("-serve and -guest-serve cannot be combined")
+	targetShareCode := *shareCode
+	if targetShareCode == "" {
+		targetShareCode = effectiveCustomCode
 	}
-	if *serveMode && *unboundGuestServe {
-		log.Fatal("-serve and -unbound-guest-serve cannot be combined")
+	if targetShareCode == "" {
+		targetShareCode = cfg.ShareCode
 	}
-	if *guestServe && *unboundGuestServe {
-		log.Fatal("-guest-serve and -unbound-guest-serve cannot be combined")
+
+	usesShareRoom := *shareJoin || *shareGuest || *shareConfirmation || isCustomConnect
+	if usesShareRoom && targetShareID == "" {
+		log.Fatal("share ID is required (use -custom-connect or -share-id)")
+	}
+	if usesShareRoom && !*shareConfirmation && targetShareCode == "" {
+		log.Fatal("verification code is required (use -custom-code or -share-code)")
+	}
+	serverModesCount := 0
+	if *serveMode { serverModesCount++ }
+	if *guestServe { serverModesCount++ }
+	if *unboundGuestServe { serverModesCount++ }
+	if *customServe { serverModesCount++ }
+	if serverModesCount > 1 {
+		log.Fatal("only one server mode flag (-serve, -guest-serve, -unbound-guest-serve, -custom-serve) can be specified")
+	}
+	if *customServe {
+		if effectiveCustomCode == "" {
+			var err error
+			effectiveCustomCode, err = api.GenerateCustomShareCode()
+			if err != nil {
+				log.Fatalf("generate custom code: %v", err)
+			}
+			logging.Infof("generated custom verification code: %s", effectiveCustomCode)
+		}
+		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		if err != nil {
+			log.Fatalf("configure mappings: %v", err)
+		}
+		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
+			ControlID:  *guestControlID,
+			AuthMode:   api.ShareAuthCustom,
+			CustomCode: effectiveCustomCode,
+			ConfigPath: *configPath,
+		}, secPolicy)
+		return
 	}
 	if *configURL != "" && (*serveMode || *guestServe || *unboundGuestServe) {
 		log.Fatal("-config-url cannot be combined with server modes (-serve, -guest-serve, -unbound-guest-serve)")
@@ -184,7 +233,8 @@ func main() {
 		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
 			ControlID:     *guestControlID,
 			AuthMode:      authMode,
-			CustomCode:    *guestCustomCode,
+			CustomCode:    effectiveCustomCode,
+			ConfigPath:    *configPath,
 			PublishURL:    *publishURL,
 			PublishSecret: *publishSecret,
 		}, secPolicy)
@@ -198,7 +248,8 @@ func main() {
 		doGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
 			ControlID:     *guestControlID,
 			AuthMode:      authMode,
-			CustomCode:    *guestCustomCode,
+			CustomCode:    effectiveCustomCode,
+			ConfigPath:    *configPath,
 			PublishURL:    *publishURL,
 			PublishSecret: *publishSecret,
 		}, secPolicy)
@@ -277,7 +328,7 @@ func main() {
 			logging.Debugf("generated share control_id_length=%d", len(controlID))
 		}
 		controllerAppControlID = controlID
-		room, err = client.JoinRoomByConfirmation(*shareID, controlID)
+		room, err = client.JoinRoomByConfirmation(targetShareID, controlID)
 		if err != nil {
 			if responseErr, ok := err.(*api.ResponseError); ok {
 				data, _ := responseErr.Response["data"].(map[string]any)
@@ -285,8 +336,25 @@ func main() {
 			}
 			log.Fatalf("join room by confirmation: %v", err)
 		}
+	case isCustomConnect:
+		if err := api.ValidateCustomShareCode(targetShareCode); err != nil {
+			log.Fatalf("validate custom code: %v", err)
+		}
+		logging.Infof("joining share room %s with custom verification code", targetShareID)
+		guestSession, guestErr := client.CreateGuest()
+		if guestErr != nil {
+			log.Fatalf("create guest session: %v", guestErr)
+		}
+		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, targetShareID, targetShareCode)
+		if err != nil {
+			if responseErr, ok := err.(*api.ResponseError); ok {
+				data, _ := responseErr.Response["data"].(map[string]any)
+				logging.Debugf("join room by custom code error data keys=%v", mapKeys(data))
+			}
+			log.Fatalf("join custom share room: %v", err)
+		}
 	case *shareJoin:
-		room, err = client.JoinRoomByShareCode(*shareID, *shareCode)
+		room, err = client.JoinRoomByShareCode(targetShareID, targetShareCode)
 		if err != nil {
 			if responseErr, ok := err.(*api.ResponseError); ok {
 				data, _ := responseErr.Response["data"].(map[string]any)
@@ -308,7 +376,7 @@ func main() {
 		if guestErr != nil {
 			log.Fatalf("create guest: %v", guestErr)
 		}
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, *shareID, *shareCode)
+		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, targetShareID, targetShareCode)
 		if err != nil {
 			log.Fatalf("join guest share room: %v", err)
 		}
@@ -585,6 +653,7 @@ type guestShareOptions struct {
 	ControlID     string
 	AuthMode      api.ShareAuthMode
 	CustomCode    string
+	ConfigPath    string
 	PublishURL    string
 	PublishSecret string
 }
@@ -613,7 +682,10 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
 	cfg.Platform = 1
-	logging.Debugf("unbound guest identity created")
+	if shareOptions.ConfigPath != "" {
+		_ = auth.SaveConfigFile(shareOptions.ConfigPath, cfg)
+	}
+	logging.Debugf("unbound guest identity ready: client_id=%s device_id=%s", cfg.ClientID, cfg.DeviceID)
 
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
@@ -763,7 +835,26 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			}
 			logging.Debugf("saved guest share info to %s", roomFile)
 		}
-		logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
+		if shareOptions.AuthMode == api.ShareAuthCustom {
+			logging.Infof("custom assistance ready: connect_id=%s custom_code=%s", share.ConnectID, share.ConnectCode)
+			logging.Infof("client connect command: ./uulink -custom-connect %s -custom-code %s", share.ConnectID, share.ConnectCode)
+		} else {
+			logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
+		}
+		if shareOptions.ConfigPath != "" {
+			changed := false
+			if cfg.ShareID != share.ConnectID {
+				cfg.ShareID = share.ConnectID
+				changed = true
+			}
+			if shareOptions.CustomCode != "" && cfg.CustomCode != shareOptions.CustomCode {
+				cfg.CustomCode = shareOptions.CustomCode
+				changed = true
+			}
+			if changed {
+				_ = auth.SaveConfigFile(shareOptions.ConfigPath, cfg)
+			}
+		}
 		if shareOptions.PublishURL != "" {
 			publishShareInfo(shareOptions.PublishURL, shareOptions.PublishSecret, share, rules)
 		}

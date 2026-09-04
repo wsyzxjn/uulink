@@ -169,7 +169,44 @@ INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
 
 Once connected, bidirectional port forwarding between the two endpoints is active immediately.
 
-### Method 4: Remote Configuration Distribution (tslink-Compatible Zero-Config Mode)
+### Method 4: Fixed Custom Verification Code Mode
+
+Use this method when you want to establish access using a static, memorable password rather than temporary random codes. Neither endpoint requires a logged-in NetEase account or local `config.json`.
+
+1. Start the server with a custom code (8-16 alphanumeric characters containing both letters and digits):
+
+```bash
+./uulink -custom-serve -custom-code MyPass123 -local 19081 -remote-port 18090
+```
+
+The terminal will display the assistance connect ID:
+
+```text
+INFO custom assistance ready: connect_id=266444253 custom_code=MyPass123
+INFO client connect command: ./uulink -custom-connect 266444253 -custom-code MyPass123
+```
+
+If `-custom-code` is omitted, `uulink` automatically generates a compliant custom code.
+
+2. Connect from the client using the connect ID and custom code:
+
+```bash
+./uulink -custom-connect 266444253 -custom-code MyPass123 -local 19090 -remote-port 18091
+```
+
+You can also specify `share_id` and `custom_code` in `config.json` for one-command startup:
+
+```json
+{
+  "share_id": "266444253",
+  "custom_code": "MyPass123",
+  "mappings": [
+    { "local_port": 19090, "remote_port": 18091 }
+  ]
+}
+```
+
+### Method 5: Remote Configuration Distribution (tslink-Compatible Zero-Config Mode)
 
 Use this method for zero-friction distribution to friends or community players. The client fetches share credentials and mapping rules automatically from an HTTP(S) URL without requiring local configuration files or user logins.
 
@@ -179,6 +216,7 @@ Use this method for zero-friction distribution to friends or community players. 
 {
   "share_id": "266444253",
   "share_code": "6W44YBPL",
+  "custom_code": "MyPass123",
   "mappings": [
     { "local_port": 25565, "remote_port": 25565 }
   ],
@@ -277,6 +315,9 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-share` | Connect to an assistance server by share ID and code | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
+| `-custom-serve` | Run assistance server with custom verification code mode | - |
+| `-custom-code <code>` | Custom verification code (8-16 alphanumeric characters) | - |
+| `-custom-connect <id>` | Connect ID of the assistance server to connect to | - |
 | `-config-url <url>` | Fetch remote share configuration and run in client mode | - |
 | `-publish-url <url>` | Webhook URL to publish share info on room start | - |
 | `-publish-secret <token>` | Optional bearer token for publish webhook | - |

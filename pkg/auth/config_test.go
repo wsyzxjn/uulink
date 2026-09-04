@@ -108,3 +108,44 @@ func TestUnmarshalPortMappingFormats(t *testing.T) {
 		t.Errorf("mapping[2] = %+v", mappings[2])
 	}
 }
+
+func TestEnsureClientID(t *testing.T) {
+	cfg := &Config{}
+	if !cfg.EnsureClientID() {
+		t.Fatal("EnsureClientID should return true when ClientID was empty")
+	}
+	if cfg.ClientID == "" {
+		t.Fatal("ClientID is still empty after EnsureClientID")
+	}
+	original := cfg.ClientID
+	if cfg.EnsureClientID() {
+		t.Fatal("EnsureClientID should return false when ClientID was already set")
+	}
+	if cfg.ClientID != original {
+		t.Fatalf("ClientID changed from %s to %s", original, cfg.ClientID)
+	}
+}
+
+func TestLoadOrInitConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "new-config.json")
+
+	// 1. File does not exist: creates default config with persistent ClientID
+	cfg, err := LoadOrInitConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadOrInitConfigFile: %v", err)
+	}
+	if cfg.ClientID == "" {
+		t.Fatal("generated config has empty ClientID")
+	}
+	origID := cfg.ClientID
+
+	// 2. File now exists: reloading gives the exact same ClientID
+	reloaded, err := LoadOrInitConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload LoadOrInitConfigFile: %v", err)
+	}
+	if reloaded.ClientID != origID {
+		t.Fatalf("reloaded ClientID = %s, want %s", reloaded.ClientID, origID)
+	}
+}
