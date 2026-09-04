@@ -8,6 +8,7 @@
 
 # Config with credentials
 config.json
+config.test.local.json
 
 # Reverse-engineering workspace (debug scripts, captures, findings)
 /workspace/

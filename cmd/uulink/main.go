@@ -211,6 +211,7 @@ func main() {
 	// Step 1: join the room created by the target device's server
 	var room *api.RoomConnectionInfo
 	controllerAppControlID := ""
+	controllerGuestDeviceID := ""
 	if *shareJoin || *shareConfirmation {
 		logging.Infof("joining share room as controller")
 	}
@@ -256,6 +257,7 @@ func main() {
 		if guestErr != nil {
 			log.Fatalf("create guest: %v", guestErr)
 		}
+		controllerGuestDeviceID = guestSession.DeviceID
 		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, *shareID, *shareCode)
 		if err != nil {
 			log.Fatalf("join guest share room: %v", err)
@@ -334,6 +336,10 @@ func main() {
 	peerDeviceID := cfg.DeviceID
 	if *controlDeviceID != "" {
 		peerDeviceID = *controlDeviceID
+	} else if controllerGuestDeviceID != "" {
+		// A guest controller has its own ephemeral device identity. Keep it
+		// separate from the logged-in config device used for API headers.
+		peerDeviceID = controllerGuestDeviceID
 		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
 	}
 	p, err := peer.NewController(&peer.Config{
