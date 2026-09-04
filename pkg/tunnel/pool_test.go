@@ -1,11 +1,12 @@
 package tunnel
 
 import (
-	"context"
-	"time"
 	"bytes"
-		"sync"
+	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type mockSession struct {
@@ -233,8 +234,6 @@ func TestPoolTunnelRouting(t *testing.T) {
 	}
 }
 
-
-
 func TestAdaptiveSessionPoolDirectMode(t *testing.T) {
 	expanded := false
 	expandFn := func(ctx context.Context, target int) error {
@@ -303,5 +302,19 @@ func TestAdaptiveSessionPoolUserDisabled(t *testing.T) {
 	ap.OnModeDetected("relay")
 	if expanded {
 		t.Errorf("expandFn should not be called when targetSessions == 1")
+	}
+}
+
+func TestAdaptiveSessionPoolWithoutExpansionCallbackStaysSingleSession(t *testing.T) {
+	ap := NewAdaptiveSessionPool(4, PolicyStreamRoundRobin, nil)
+	ap.Pool().AddSession(newMockSession("s0"))
+
+	ap.OnModeDetected("relay")
+
+	if got := ap.Pool().SessionCount(); got != 1 {
+		t.Fatalf("session count = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&ap.isExpanding); got != 0 {
+		t.Fatalf("isExpanding = %d, want 0", got)
 	}
 }

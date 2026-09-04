@@ -1,8 +1,8 @@
 package tunnel
 
 import (
-	"context"
 	"container/heap"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -368,7 +368,6 @@ func (a *poolSenderAdapter) SendFrame(msg []byte) error {
 	return err
 }
 
-
 // AdaptiveSessionPool wraps a SessionPool to implement the adaptive pooling strategy:
 // - Direct P2P mode (mode == "direct"): single session is maintained (unthrottled, zero overhead).
 // - Relay mode (mode == "relay"): automatically activates multi-session pooling up to TargetSessions (default: 4, ~48 Mbps).
@@ -427,6 +426,11 @@ func (a *AdaptiveSessionPool) OnModeDetected(mode string) {
 			logging.Infof("[adaptive-pool] relay mode active; single session configured (sessions=%d)", a.targetSessions)
 			return
 		}
+		if a.expandFn == nil {
+			logging.Warnf("[adaptive-pool] relay mode active, but session expansion is unavailable; continuing with %d session(s)",
+				a.pool.SessionCount())
+			return
+		}
 
 		if !atomic.CompareAndSwapInt32(&a.isExpanding, 0, 1) {
 			return
@@ -435,15 +439,13 @@ func (a *AdaptiveSessionPool) OnModeDetected(mode string) {
 		logging.Infof("[adaptive-pool] relay mode detected; activating multi-session pool (target: %d sessions, ~%d Mbps bandwidth pool)",
 			a.targetSessions, a.targetSessions*12)
 
-		if a.expandFn != nil {
-			ctx, cancel := context.WithCancel(context.Background())
-			a.cancel = cancel
-			go func() {
-				if err := a.expandFn(ctx, a.targetSessions); err != nil {
-					logging.Errorf("[adaptive-pool] expansion error: %v", err)
-				}
-			}()
-		}
+		ctx, cancel := context.WithCancel(context.Background())
+		a.cancel = cancel
+		go func() {
+			if err := a.expandFn(ctx, a.targetSessions); err != nil {
+				logging.Errorf("[adaptive-pool] expansion error: %v", err)
+			}
+		}()
 	}
 }
 
