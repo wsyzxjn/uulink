@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,19 +56,25 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 // InitWindowsDeviceWithoutAuth registers a Windows-shaped device on the
 // server without a user JWT. The returned device is not bound to any user
 // account, which makes it usable as an anonymous guest-controlled endpoint.
+// The generated client identity is stored in cfg.UnboundClientID so a later
+// run re-registers the same device instead of minting a new one.
 func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdentity, error) {
-	id, err := uuid.NewRandom()
-	if err != nil {
-		return nil, fmt.Errorf("generate device uuid: %w", err)
+	guid := strings.ToLower(strings.TrimPrefix(c.cfg.UnboundClientID, "MG-"))
+	if guid == "" {
+		id, err := uuid.NewRandom()
+		if err != nil {
+			return nil, fmt.Errorf("generate device uuid: %w", err)
+		}
+		guid = id.String()
 	}
-	clientID := "MG-" + id.String()
+	clientID := "MG-" + guid
 
 	body := map[string]any{
 		"name":         name,
 		"client_id":    clientID,
 		"system_id":    clientID,
-		"machine_guid": id.String(),
-		"guid":         id.String(),
+		"machine_guid": guid,
+		"guid":         guid,
 		"os":           "Microsoft Windows NT 10.0.26200.0",
 		"base_board":   "Virtual",
 		"cpu":          "Virtual CPU",
@@ -99,6 +106,8 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 		return nil, fmt.Errorf("init windows device response missing device_id")
 	}
 
+	c.cfg.UnboundClientID = clientID
+	c.cfg.UnboundDeviceID = deviceID
 	return &UnboundDeviceIdentity{ClientID: clientID, DeviceID: deviceID}, nil
 }
 

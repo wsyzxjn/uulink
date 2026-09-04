@@ -2,8 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/user/uulink/pkg/auth"
 )
 
 func TestGenerateSharePassCode(t *testing.T) {
@@ -116,7 +123,7 @@ func TestShareAuthModeOfficialControlMode(t *testing.T) {
 		want string
 	}{
 		{ShareAuthTemporary, "by_password"},
-		{ShareAuthCustom, "by_confirmation"},
+		{ShareAuthCustom, "by_password"},
 		{ShareAuthBoth, "password_confirmation"},
 	}
 	for _, test := range tests {
@@ -164,7 +171,7 @@ func TestNewGuestShareUploadSignRequestModes(t *testing.T) {
 		},
 		{
 			ShareAuthCustom,
-			`{"can_remote_control":true,"control_id":"12345678","sign":"","backup_sign":"` + customSign + `","control_mode":"by_confirmation","need_confirmation":true}`,
+			`{"can_remote_control":true,"control_id":"12345678","sign":"` + customSign + `","backup_sign":"` + customSign + `","control_mode":"by_password","need_confirmation":false}`,
 		},
 		{
 			ShareAuthBoth,
@@ -221,5 +228,62 @@ func TestGenerateAndValidateCustomShareCode(t *testing.T) {
 		if err := ValidateCustomShareCode(code); err == nil {
 			t.Fatalf("ValidateCustomShareCode(%q) accepted invalid code", code)
 		}
+	}
+}
+
+func TestJoinRoomByShareCodeWaitsForConfirmation(t *testing.T) {
+	previous := joinConfirmationInterval
+	joinConfirmationInterval = time.Millisecond
+	defer func() { joinConfirmationInterval = previous }()
+
+	var calls int32
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/api/v2/room/join/share/by_code" {
+			t.Fatalf("unexpected path %q", request.URL.Path)
+		}
+		body := `{"code":1136,"msg":"waiting for confirmation"}`
+		if atomic.AddInt32(&calls, 1) >= 3 {
+			body = `{"code":0,"data":{"signaling_server":"wss://sig.example","token":"nrd-token"}}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+	client := NewClientWithOptions(&auth.Config{}, ClientOptions{
+		BaseURL:    "https://api.example",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+
+	room, err := client.JoinRoomByShareCode("266444253", "MyPass123")
+	if err != nil {
+		t.Fatalf("JoinRoomByShareCode(): %v", err)
+	}
+	if room.SignalingServer != "wss://sig.example" || room.Token != "nrd-token" {
+		t.Fatalf("room = %+v", room)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("join attempts = %d, want 3", got)
+	}
+}
+
+func TestJoinRoomByShareCodeReturnsOtherBusinessErrors(t *testing.T) {
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":1131,"msg":"code mismatch"}`)),
+		}, nil
+	})
+	client := NewClientWithOptions(&auth.Config{}, ClientOptions{
+		BaseURL:    "https://api.example",
+		HTTPClient: &http.Client{Transport: transport},
+	})
+
+	_, err := client.JoinRoomByShareCodeWithGuest(&GuestSession{GuestID: "g", Token: "t"}, "266444253", "ABCD1234")
+	var responseErr *ResponseError
+	if !errors.As(err, &responseErr) || responseErr.Code != 1131 {
+		t.Fatalf("error = %v, want ResponseError 1131", err)
 	}
 }

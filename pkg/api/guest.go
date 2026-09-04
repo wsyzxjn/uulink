@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 const sharePassCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -260,13 +261,13 @@ func ParseShareAuthMode(value string) (ShareAuthMode, error) {
 	}
 }
 
-// OfficialControlMode returns the control_mode string used by the official API.
+// OfficialControlMode returns the control_mode string used by the official
+// API. Temporary and custom codes are both password modes; a custom code only
+// changes which code is signed, not whether the controller must be confirmed.
 func (mode ShareAuthMode) OfficialControlMode() string {
 	switch mode {
-	case ShareAuthTemporary:
+	case ShareAuthTemporary, ShareAuthCustom:
 		return "by_password"
-	case ShareAuthCustom:
-		return "by_confirmation"
 	case ShareAuthBoth:
 		return "password_confirmation"
 	default:
@@ -276,7 +277,7 @@ func (mode ShareAuthMode) OfficialControlMode() string {
 
 // NeedsConfirmation returns the need_confirmation value used with the mode.
 func (mode ShareAuthMode) NeedsConfirmation() bool {
-	return mode == ShareAuthCustom || mode == ShareAuthBoth
+	return mode == ShareAuthBoth
 }
 
 // ShareJoinCode returns the verification string submitted by the controller.
@@ -322,10 +323,14 @@ func NewGuestShareUploadSignRequestWithSalt(controlID, salt, temporaryCode, cust
 		ControlMode:      mode.OfficialControlMode(),
 		NeedConfirmation: mode.NeedsConfirmation(),
 	}
-	if mode == ShareAuthTemporary || mode == ShareAuthBoth {
+	switch mode {
+	case ShareAuthTemporary:
 		request.Sign = SharePassCodeSignWithSalt(salt, temporaryCode)
-	}
-	if mode == ShareAuthCustom || mode == ShareAuthBoth {
+	case ShareAuthCustom:
+		request.Sign = SharePassCodeSignWithSalt(salt, customCode)
+		request.BackupSign = request.Sign
+	case ShareAuthBoth:
+		request.Sign = SharePassCodeSignWithSalt(salt, temporaryCode)
 		request.BackupSign = SharePassCodeSignWithSalt(salt, customCode)
 	}
 	return request
@@ -356,8 +361,13 @@ type GuestShareConfirmationRequest struct {
 	NeedPassword bool   `json:"need_password"`
 }
 
-// GuestShareUploadSign calls POST /api/v1/guest/room/share/upload/sign.
+// GuestShareUploadSign publishes the verification-code signature. The v2
+// endpoint matches the controller's v2 join; the v1 endpoint remains as a
+// fallback for guest sessions the v2 endpoint rejects.
 func (c *Client) GuestShareUploadSign(session *GuestSession, request *GuestShareUploadSignRequest) (map[string]any, error) {
+	if resp, err := c.GuestShareUploadSignV2(session, request); err == nil {
+		return resp, nil
+	}
 	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/upload/sign", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload sign: %w", err)
@@ -376,8 +386,12 @@ func (c *Client) GuestShareUploadSignV2(session *GuestSession, request *GuestSha
 	return resp, nil
 }
 
-// GuestShareUploadControlMode calls POST /api/v1/guest/room/share/upload_control_mode.
+// GuestShareUploadControlMode publishes the control mode, preferring the v2
+// endpoint and falling back to v1 like GuestShareUploadSign.
 func (c *Client) GuestShareUploadControlMode(session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
+	if resp, err := c.GuestShareUploadControlModeV2(session, request); err == nil {
+		return resp, nil
+	}
 	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/upload_control_mode", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload control mode: %w", err)
@@ -434,40 +448,53 @@ type JoinRoomByShareCodeRequest struct {
 	ConnectCode string `json:"connect_code"`
 }
 
-// JoinRoomByShareCode calls POST /api/v2/room/join/share/by_code with a
-// logged-in controller identity.
-func (c *Client) JoinRoomByShareCode(connectID, deviceCode string) (*RoomConnectionInfo, error) {
+// codeAwaitingConfirmation is returned by the by_code join while the
+// controlled side has not yet confirmed the controller.
+const codeAwaitingConfirmation = 1136
+
+const joinConfirmationAttempts = 20
+
+// joinConfirmationInterval is a variable so tests can shorten the wait.
+var joinConfirmationInterval = time.Second
+
+// joinShareRoomByCode posts the v2 by_code join with the given client and
+// keeps polling while the server reports that the controlled side still has
+// to confirm the controller.
+func joinShareRoomByCode(client *Client, connectID, deviceCode, operation string) (*RoomConnectionInfo, error) {
 	body := &JoinRoomByShareCodeRequest{
 		ConnectID:   connectID,
 		ConnectCode: deviceCode,
 	}
-	resp, err := c.Do("POST", "/api/v2/room/join/share/by_code", body)
-	if err != nil {
-		return nil, fmt.Errorf("join share room: %w", err)
+	for attempt := 0; attempt < joinConfirmationAttempts; attempt++ {
+		resp, err := client.Do("POST", "/api/v2/room/join/share/by_code", body)
+		if err != nil {
+			var responseErr *ResponseError
+			if errors.As(err, &responseErr) && responseErr.Code == codeAwaitingConfirmation {
+				time.Sleep(joinConfirmationInterval)
+				continue
+			}
+			return nil, fmt.Errorf("%s: %w", operation, err)
+		}
+		data, err := responseData(resp, operation)
+		if err != nil {
+			return nil, err
+		}
+		return parseRoomConnectionInfo(data), nil
 	}
-	data, err := responseData(resp, "join share room")
-	if err != nil {
-		return nil, err
-	}
-	return parseRoomConnectionInfo(data), nil
+	return nil, fmt.Errorf("%s: timed out waiting for remote control confirmation", operation)
+}
+
+// JoinRoomByShareCode calls POST /api/v2/room/join/share/by_code with a
+// logged-in controller identity, waiting for the controlled side's
+// confirmation when the share requires one.
+func (c *Client) JoinRoomByShareCode(connectID, deviceCode string) (*RoomConnectionInfo, error) {
+	return joinShareRoomByCode(c, connectID, deviceCode, "join share room")
 }
 
 // JoinRoomByShareCodeWithGuest joins a remote-assistance share using a guest
 // identity instead of the configured user JWT.
 func (c *Client) JoinRoomByShareCodeWithGuest(session *GuestSession, connectID, deviceCode string) (*RoomConnectionInfo, error) {
-	body := &JoinRoomByShareCodeRequest{
-		ConnectID:   connectID,
-		ConnectCode: deviceCode,
-	}
-	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/join/share/by_code", body)
-	if err != nil {
-		return nil, fmt.Errorf("join share room with guest: %w", err)
-	}
-	data, err := responseData(resp, "join share room with guest")
-	if err != nil {
-		return nil, err
-	}
-	return parseRoomConnectionInfo(data), nil
+	return joinShareRoomByCode(c.guestClient(session), connectID, deviceCode, "join share room with guest")
 }
 
 // JoinRoomByConfirmation starts the v2 remote-assistance confirmation flow.

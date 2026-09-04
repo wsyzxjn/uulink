@@ -169,6 +169,84 @@ INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
 
 Once connected, bidirectional port forwarding between the two endpoints is active immediately.
 
+### Method 4: Fixed Custom Verification Code Mode
+
+Use this method when you want to establish access using a static, memorable password rather than temporary random codes. Neither endpoint requires a logged-in NetEase account; a missing `config.json` is created automatically with a stable client identity.
+
+1. Start the server with a custom code (8-16 alphanumeric characters containing both letters and digits):
+
+```bash
+./uulink -custom-serve -custom-code MyPass123 -local 19081 -remote-port 18090
+```
+
+The terminal will display the assistance connect ID:
+
+```text
+INFO custom assistance ready: connect_id=266444253 custom_code=MyPass123
+INFO client command: uulink -custom-connect 266444253 -custom-code MyPass123
+```
+
+If `-custom-code` is omitted, `uulink` generates a compliant code and prints it. The server saves its device identity, connect ID, and custom code to `config.json`, so restarting it keeps the same connect ID and code.
+
+2. Connect from the client using the connect ID and custom code:
+
+```bash
+./uulink -custom-connect 266444253 -custom-code MyPass123 -local 19090 -remote-port 18091
+```
+
+You can also specify `share_id` and `custom_code` in `config.json` for one-command startup:
+
+```json
+{
+  "share_id": "266444253",
+  "custom_code": "MyPass123",
+  "mappings": [
+    { "local_port": 19090, "remote_port": 18091 }
+  ]
+}
+```
+
+### Method 5: Remote Configuration Distribution (tslink-Compatible Zero-Config Mode)
+
+Use this method for zero-friction distribution to friends or community players. The client fetches share credentials and mapping rules from an HTTP(S) URL (or a local file path) and joins as a guest; no login is required.
+
+1. Publish or host a remote JSON configuration (e.g. on a web server, Cloudflare Worker, or GitHub Gist):
+
+```json
+{
+  "share_id": "266444253",
+  "share_code": "6W44YBPL",
+  "mappings": [
+    { "local_port": 25565, "remote_port": 25565 }
+  ],
+  "transport": "auto",
+  "lan_motd": "Minecraft Server via uulink",
+  "lan_port": 25565
+}
+```
+
+Use `custom_code` instead of `share_code` when the server runs in custom-code mode. `transport` may be `relay` to require a TURN relay on every client. When `lan_motd` is set, the client announces the first forwarded port as a Minecraft LAN server.
+
+The server can push the current share details to a webhook each time it starts using `-publish-url`; the webhook receives the same JSON document shown above:
+
+```bash
+./uulink -unbound-guest-serve -publish-url "https://example.com/sync" -publish-secret "mysecret" -mapping 25565:25565
+```
+
+2. Connect from the client using the configuration URL:
+
+```bash
+./uulink -config-url https://example.com/room.json
+```
+
+Or build a dedicated zero-argument client binary with the URL embedded via ldflags:
+
+```bash
+go build -ldflags="-X main.DefaultConfigURL=https://example.com/room.json" -o mc-link ./cmd/uulink
+```
+
+Users can simply run `./mc-link` without passing any arguments; a `config.json` with a random client identity is created next to the binary on first start.
+
 ## Configuration Reference
 
 `config.json` structure:
@@ -209,6 +287,8 @@ Field details:
 - `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
 - `sessions`: Optional relay session pool size for `-unbound-guest-serve`. Defaults to `4`; set `1` to serve a single session. The `-sessions` flag overrides it.
+- `share_id`, `share_code`, `custom_code`: Optional defaults for share joins (`-share`, `-custom-connect`). A custom-code server also records its connect ID and code here.
+- `unbound_client_id`, `unbound_device_id`: Written by `-unbound-guest-serve` and `-custom-serve` so the accountless device keeps the same connect ID across restarts.
 
 Incoming `CONNECT` requests are authorized by the receiving process. Both endpoints use the same mapping schema, and either endpoint may expose local listeners that reach services on the other endpoint, subject to the receiving endpoint's `allow_lan` and `allowed_ports` policy.
 
@@ -241,6 +321,14 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-share` | Connect to an assistance server by share ID and code | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
+| `-custom-serve` | Run assistance server with custom verification code mode | - |
+| `-custom-code <code>` | Custom verification code (8-16 alphanumeric characters) | - |
+| `-custom-connect <id>` | Connect ID of the assistance server to connect to | - |
+| `-config-url <url>` | Fetch remote share configuration and run in client mode | - |
+| `-publish-url <url>` | Webhook URL to publish share info on room start | - |
+| `-publish-secret <token>` | Optional bearer token for publish webhook | - |
+| `-lan-discovery` | Enable Minecraft LAN discovery broadcast for forwarded ports | off |
+| `-lan-motd <text>` | Override MOTD text for LAN discovery broadcast | - |
 
 `-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. Server modes reject `-transport relay`; a server-side relay requirement is represented by the signaling response, not by a local server flag.
 

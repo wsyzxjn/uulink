@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,8 @@ import (
 	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
 	"github.com/user/uulink/pkg/peer"
+	"github.com/user/uulink/pkg/remoteconfig"
+	"github.com/user/uulink/pkg/tunnel"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -335,4 +339,63 @@ func TestMultiSessionShares(t *testing.T) {
 			t.Fatal("missing room file was accepted")
 		}
 	})
+}
+
+func TestFirstNonEmpty(t *testing.T) {
+	if got := firstNonEmpty("", "", "third"); got != "third" {
+		t.Fatalf("firstNonEmpty() = %q, want third", got)
+	}
+	if got := firstNonEmpty("first", "second"); got != "first" {
+		t.Fatalf("firstNonEmpty() = %q, want first", got)
+	}
+	if got := firstNonEmpty(); got != "" {
+		t.Fatalf("firstNonEmpty() = %q, want empty", got)
+	}
+}
+
+func TestPublishShareInfoPostsRemoteConfig(t *testing.T) {
+	var (
+		method   string
+		auth     string
+		received remoteconfig.RemoteShareConfig
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		auth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode publish payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	share := &api.GuestShareInfo{ConnectID: "998877", ConnectCode: "XYZ12345"}
+	rules := []tunnel.Rule{{LocalHost: "127.0.0.1", LocalPort: 25565, TargetHost: "127.0.0.1", TargetPort: 25566}}
+	if err := publishShareInfo(server.URL, "secret-token", share, rules); err != nil {
+		t.Fatalf("publishShareInfo(): %v", err)
+	}
+	if method != http.MethodPost || auth != "Bearer secret-token" {
+		t.Fatalf("request method=%q auth=%q", method, auth)
+	}
+	if received.ShareID != "998877" || received.ShareCode != "XYZ12345" || received.UpdatedAt == "" {
+		t.Fatalf("payload = %+v", received)
+	}
+	if len(received.Mappings) != 1 || received.Mappings[0].LocalPort != 25565 || received.Mappings[0].RemotePort != 25566 {
+		t.Fatalf("payload mappings = %+v", received.Mappings)
+	}
+	if err := received.Validate(); err != nil {
+		t.Fatalf("published document is not a valid remote config: %v", err)
+	}
+}
+
+func TestPublishShareInfoReportsHTTPFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	err := publishShareInfo(server.URL, "", &api.GuestShareInfo{ConnectID: "1", ConnectCode: "2"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("publishShareInfo() error = %v, want HTTP 403 failure", err)
+	}
 }

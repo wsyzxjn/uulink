@@ -110,6 +110,15 @@ type Config struct {
 	AllowLAN     bool          `json:"allow_lan,omitempty"`
 	AllowedPorts []int         `json:"allowed_ports,omitempty"`
 	Sessions     int           `json:"sessions,omitempty"`
+	// Custom-code assistance: a fixed verification code plus the share this
+	// config connects to or serves, so a client can start without flags.
+	CustomCode string `json:"custom_code,omitempty"`
+	ShareID    string `json:"share_id,omitempty"`
+	ShareCode  string `json:"share_code,omitempty"`
+	// Identity of the accountless device registered by the unbound guest
+	// server, reused across restarts so the assistance ID stays stable.
+	UnboundClientID string `json:"unbound_client_id,omitempty"`
+	UnboundDeviceID string `json:"unbound_device_id,omitempty"`
 }
 
 // PortMapping declares one UULink listener and its peer-side target.

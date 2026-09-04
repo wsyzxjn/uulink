@@ -22,11 +22,16 @@ import (
 
 	"github.com/user/uulink/pkg/api"
 	"github.com/user/uulink/pkg/auth"
+	"github.com/user/uulink/pkg/landiscover"
 	"github.com/user/uulink/pkg/logging"
 	"github.com/user/uulink/pkg/peer"
 	"github.com/user/uulink/pkg/signaling"
 	"github.com/user/uulink/pkg/tunnel"
 )
+
+// DefaultConfigURL can be baked into a client build so it runs without flags:
+// go build -ldflags="-X main.DefaultConfigURL=https://example.com/room.json"
+var DefaultConfigURL string
 
 func main() {
 	if err := run(); err != nil {
@@ -76,6 +81,14 @@ func run() error {
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
 	sessionsFlag := flag.Int("sessions", 0, "relay session pool size (default: 4 when the connection is relayed; 1 disables pooling)")
+	customServe := flag.Bool("custom-serve", false, "run an accountless assistance server that accepts a fixed custom verification code")
+	customConnect := flag.String("custom-connect", "", "connect ID of a custom-code assistance server to connect to")
+	customCodeFlag := flag.String("custom-code", "", "custom verification code (8-16 letters and digits) for -custom-serve or -custom-connect")
+	configURL := flag.String("config-url", DefaultConfigURL, "URL or file path of a remote share configuration to connect with")
+	publishURL := flag.String("publish-url", "", "webhook URL that receives the share configuration when a guest server is ready")
+	publishSecret := flag.String("publish-secret", "", "bearer token sent with -publish-url requests")
+	lanDiscovery := flag.Bool("lan-discovery", false, "announce the first forwarded port as a Minecraft LAN server")
+	lanMotd := flag.String("lan-motd", "", "MOTD text for the Minecraft LAN announcement")
 	flag.Parse()
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
@@ -96,15 +109,49 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("parse share auth mode: %w", err)
 	}
-	if *guestCustomCode != "" && authMode != api.ShareAuthTemporary {
-		if err := api.ValidateCustomShareCode(*guestCustomCode); err != nil {
-			return fmt.Errorf("validate guest custom code: %w", err)
-		}
-	}
 
-	cfg, err := auth.LoadConfigFile(*configPath)
+	// Accountless modes create their own identity, so a missing config file
+	// is initialized instead of being an error.
+	accountless := *customServe || *customConnect != "" || *unboundGuestServe || *configURL != ""
+	var cfg *auth.Config
+	if accountless {
+		cfg, err = auth.LoadOrInitConfigFile(*configPath)
+	} else {
+		cfg, err = auth.LoadConfigFile(*configPath)
+	}
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	// A custom verification code comes from -custom-code, -guest-custom-code,
+	// or the config file, in that order. Any custom code switches the share
+	// authorization to custom mode unless "both" was requested explicitly.
+	customCode := firstNonEmpty(*customCodeFlag, *guestCustomCode, cfg.CustomCode)
+	if (customCode != "" || *customServe) && authMode == api.ShareAuthTemporary {
+		authMode = api.ShareAuthCustom
+	}
+	if customCode != "" {
+		if err := api.ValidateCustomShareCode(customCode); err != nil {
+			return fmt.Errorf("validate custom code: %w", err)
+		}
+	}
+	if *customServe && customCode == "" {
+		customCode, err = api.GenerateCustomShareCode()
+		if err != nil {
+			return fmt.Errorf("generate custom code: %w", err)
+		}
+		logging.Infof("generated custom verification code: %s", customCode)
+	}
+	shareOptions := guestShareOptions{
+		ControlID:     *guestControlID,
+		AuthMode:      authMode,
+		CustomCode:    customCode,
+		ConfigPath:    *configPath,
+		PublishURL:    *publishURL,
+		PublishSecret: *publishSecret,
+	}
+	if *customServe {
+		*unboundGuestServe = true
 	}
 
 	secPolicy, err := buildSecurityPolicy(cfg, *allowLAN, *allowedPortsFlag)
@@ -148,35 +195,51 @@ func run() error {
 		return nil
 	}
 
+	// -custom-connect is a share join whose ID/code may also come from the
+	// config file, so a distributed client can start without any flags.
+	if *customConnect != "" {
+		*shareJoin = true
+		*shareID = *customConnect
+	}
 	usesShareRoom := *shareJoin || *shareGuest || *shareConfirmation
-	if usesShareRoom && *shareID == "" {
-		return fmt.Errorf("-share-id is required")
+	if usesShareRoom {
+		*shareID = firstNonEmpty(*shareID, cfg.ShareID)
+		*shareCode = firstNonEmpty(*shareCode, customCode, cfg.ShareCode)
+		if *shareID == "" {
+			return fmt.Errorf("-share-id is required")
+		}
+		if (*shareJoin || *shareGuest) && *shareCode == "" {
+			return fmt.Errorf("-share-code is required")
+		}
 	}
-	if (*shareJoin || *shareGuest) && *shareCode == "" {
-		return fmt.Errorf("-share-code is required")
+
+	serverModes := 0
+	for _, enabled := range []bool{*serveMode, *guestServe, *unboundGuestServe} {
+		if enabled {
+			serverModes++
+		}
 	}
-	if *serveMode && *guestServe {
-		return fmt.Errorf("-serve and -guest-serve cannot be combined")
+	if serverModes > 1 {
+		return fmt.Errorf("only one of -serve, -guest-serve, -unbound-guest-serve, or -custom-serve can be used")
 	}
-	if *serveMode && *unboundGuestServe {
-		return fmt.Errorf("-serve and -unbound-guest-serve cannot be combined")
+	if serverModes > 0 && *configURL != "" {
+		return fmt.Errorf("-config-url selects the controller role and cannot be combined with a server mode")
 	}
-	if *guestServe && *unboundGuestServe {
-		return fmt.Errorf("-guest-serve and -unbound-guest-serve cannot be combined")
+	if serverModes > 0 && usesShareRoom {
+		return fmt.Errorf("share join flags cannot be combined with a server mode")
 	}
 	if *unboundGuestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		shareOptions := guestShareOptions{
-			ControlID:  *guestControlID,
-			AuthMode:   authMode,
-			CustomCode: *guestCustomCode,
-		}
 		if targetSessions > 1 {
 			// Each pooled session needs its own guest identity and room; the
 			// unbound guest server is the only mode that can create them.
+			if *customServe {
+				// A fixed identity cannot be shared by several pooled devices.
+				return fmt.Errorf("-custom-serve runs a single session; use -sessions 1")
+			}
 			return doMultiSessionUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
 		}
 		return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy)
@@ -186,11 +249,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		return doGuestServe(client, cfg, rules, *roomFile, guestShareOptions{
-			ControlID:  *guestControlID,
-			AuthMode:   authMode,
-			CustomCode: *guestCustomCode,
-		}, secPolicy, targetSessions)
+		return doGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
 	}
 	if *serveMode {
 		if *deviceID != "" {
@@ -201,6 +260,22 @@ func run() error {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
 		return doServe(client, cfg, rules, *roomFile, secPolicy, targetSessions)
+	}
+
+	if *configURL != "" {
+		return runRemoteConfigController(client, cfg, secPolicy, remoteConfigOptions{
+			url:           *configURL,
+			transportMode: transportMode,
+			lanDiscovery:  *lanDiscovery,
+			lanMotd:       *lanMotd,
+			ruleID:        *ruleIDFlag,
+			mapping:       *mappingFlag,
+			localHost:     *localHost,
+			localPort:     *localPort,
+			remoteHost:    *remoteHost,
+			remotePort:    *remotePort,
+			capability:    *capFlag,
+		})
 	}
 
 	// A controller can drive several pooled sessions at once when given one
@@ -244,6 +319,8 @@ func run() error {
 		pckSweep:          *pckSweep,
 		mixKCP:            *mixkcpMode,
 		targetSessions:    targetSessions,
+		lanDiscovery:      *lanDiscovery,
+		lanMotd:           *lanMotd,
 	}); err != nil {
 		return err
 	}
@@ -279,6 +356,13 @@ type controllerOptions struct {
 	pckSweep          bool
 	mixKCP            bool
 	targetSessions    int
+	// rules, when non-nil, replaces the config/flag derived mappings (remote
+	// configuration mode).
+	rules []tunnel.Rule
+	// lanDiscovery announces the first forwarded port as a Minecraft LAN
+	// server once the tunnel is up.
+	lanDiscovery bool
+	lanMotd      string
 }
 
 const relayTransportTimeout = 30 * time.Second
@@ -299,9 +383,13 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	if options.roomFile == "" && !usesShareRoom && (targetDevID == "" || (targetDevID == cfg.DeviceID && !options.allowSelf)) {
 		return fmt.Errorf("target device must differ from this machine (use -device)")
 	}
-	rules, err := configuredRules(cfg, options.ruleID, options.mapping, options.localHost, options.localPort, options.remoteHost, options.remotePort)
-	if err != nil {
-		return fmt.Errorf("configure mappings: %w", err)
+	rules := options.rules
+	var err error
+	if rules == nil {
+		rules, err = configuredRules(cfg, options.ruleID, options.mapping, options.localHost, options.localPort, options.remoteHost, options.remotePort)
+		if err != nil {
+			return fmt.Errorf("configure mappings: %w", err)
+		}
 	}
 
 	// Step 1: join the room created by the target device's server
@@ -474,6 +562,10 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	runErr := make(chan error, 1)
 	tunnelReady := make(chan struct{})
 	var tunnelReadyOnce sync.Once
+	// The LAN announcer is started from the data-channel callback and stopped
+	// from this goroutine, so guard it.
+	var lanMu sync.Mutex
+	var lanAnnouncer *landiscover.Service
 	p.OnFileChannelOpen(func() {
 		if err := p.ValidateTransportMode(); err != nil {
 			select {
@@ -491,6 +583,17 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 				return
 			}
 			logActiveMappings("port forwarding active", rules)
+			if options.lanDiscovery {
+				lanMu.Lock()
+				if lanAnnouncer == nil {
+					announcer, err := landiscover.Start(options.lanMotd, rules[0].LocalPort, 0)
+					if err != nil {
+						logging.Warnf("start LAN discovery: %v", err)
+					}
+					lanAnnouncer = announcer
+				}
+				lanMu.Unlock()
+			}
 		} else {
 			logging.Infof("inbound port mapping active (no local listeners configured)")
 		}
@@ -498,6 +601,14 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		tunnelReadyOnce.Do(func() { close(tunnelReady) })
 	})
 	defer tun.Stop()
+	defer func() {
+		lanMu.Lock()
+		announcer := lanAnnouncer
+		lanMu.Unlock()
+		if announcer != nil {
+			announcer.Stop()
+		}
+	}()
 
 	if options.pckSweep {
 		startPCKSweep(p, debugRule, ruleID)
@@ -577,6 +688,12 @@ type guestShareOptions struct {
 	ControlID  string
 	AuthMode   api.ShareAuthMode
 	CustomCode string
+	// ConfigPath, when set, receives the share ID / custom code and the
+	// unbound device identity so the next start reuses them.
+	ConfigPath string
+	// PublishURL, when set, receives the share configuration as JSON.
+	PublishURL    string
+	PublishSecret string
 }
 
 func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
@@ -603,7 +720,14 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
 	cfg.Platform = 1
-	logging.Debugf("unbound guest identity created")
+	// CreateUnboundGuest recorded the identity in cfg.UnboundClientID and
+	// cfg.UnboundDeviceID; persist it so the assistance ID survives restarts.
+	if shareOptions.ConfigPath != "" {
+		if err := auth.SaveConfigFile(shareOptions.ConfigPath, cfg); err != nil {
+			return fmt.Errorf("save unbound device identity: %w", err)
+		}
+	}
+	logging.Debugf("unbound guest identity ready")
 
 	room, err := client.CreateGuestRoom(session)
 	if err != nil {
@@ -753,7 +877,26 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 			}
 			logging.Debugf("saved guest share info to %s", roomFile)
 		}
-		logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
+		if shareOptions.AuthMode == api.ShareAuthCustom {
+			logging.Infof("custom assistance ready: connect_id=%s custom_code=%s", share.ConnectID, share.ConnectCode)
+			logging.Infof("client command: uulink -custom-connect %s -custom-code %s", share.ConnectID, share.ConnectCode)
+		} else {
+			logging.Infof("guest share ready: connect_id=%s connect_code=%s", share.ConnectID, share.ConnectCode)
+		}
+		if shareOptions.ConfigPath != "" && (cfg.ShareID != share.ConnectID || cfg.CustomCode != shareOptions.CustomCode) {
+			// Remember the share so the same ID and custom code are reused
+			// next time this server starts.
+			cfg.ShareID = share.ConnectID
+			cfg.CustomCode = shareOptions.CustomCode
+			if err := auth.SaveConfigFile(shareOptions.ConfigPath, cfg); err != nil {
+				return fmt.Errorf("save share identity: %w", err)
+			}
+		}
+		if shareOptions.PublishURL != "" {
+			if err := publishShareInfo(shareOptions.PublishURL, shareOptions.PublishSecret, share, rules); err != nil {
+				return fmt.Errorf("publish share info: %w", err)
+			}
+		}
 	}
 
 	var tun *tunnel.Tunnel

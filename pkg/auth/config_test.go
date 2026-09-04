@@ -108,3 +108,47 @@ func TestUnmarshalPortMappingFormats(t *testing.T) {
 		t.Errorf("mapping[2] = %+v", mappings[2])
 	}
 }
+
+func TestLoadOrInitConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "new-config.json")
+
+	// A missing file is created with a random, persistent client_id.
+	cfg, err := LoadOrInitConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadOrInitConfigFile: %v", err)
+	}
+	if cfg.ClientID == "" {
+		t.Fatal("generated config has empty ClientID")
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("generated config stat=%v err=%v, want 0600 file", info, err)
+	}
+
+	// Reloading keeps the same identity.
+	reloaded, err := LoadOrInitConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload LoadOrInitConfigFile: %v", err)
+	}
+	if reloaded.ClientID != cfg.ClientID {
+		t.Fatalf("reloaded ClientID = %s, want %s", reloaded.ClientID, cfg.ClientID)
+	}
+
+	// An existing config without client_id gets one and is saved.
+	noID := filepath.Join(dir, "no-id.json")
+	if err := os.WriteFile(noID, []byte(`{"jwt":"token","device_id":"dev"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	filled, err := LoadOrInitConfigFile(noID)
+	if err != nil || filled.ClientID == "" || filled.JWT != "token" {
+		t.Fatalf("filled config=%+v err=%v", filled, err)
+	}
+	if saved, err := LoadConfigFile(noID); err != nil || saved.ClientID != filled.ClientID {
+		t.Fatalf("saved config=%+v err=%v", saved, err)
+	}
+
+	// An unreadable path is an error, not a silently generated identity.
+	if _, err := LoadOrInitConfigFile(filepath.Join(dir, "missing", "config.json")); err == nil {
+		t.Fatal("LoadOrInitConfigFile() succeeded with an unwritable config directory")
+	}
+}
