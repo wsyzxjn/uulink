@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"container/heap"
 	"encoding/binary"
 	"errors"
@@ -365,4 +366,99 @@ func (a *poolSenderAdapter) SendFrame(msg []byte) error {
 		a.pool.ReleaseStream(frame.RuleID, frame.StreamID)
 	}
 	return err
+}
+
+
+// AdaptiveSessionPool wraps a SessionPool to implement the adaptive pooling strategy:
+// - Direct P2P mode (mode == "direct"): single session is maintained (unthrottled, zero overhead).
+// - Relay mode (mode == "relay"): automatically activates multi-session pooling up to TargetSessions (default: 4, ~48 Mbps).
+type AdaptiveSessionPool struct {
+	mu             sync.Mutex
+	pool           *SessionPool
+	targetSessions int
+	mode           string
+	isExpanding    int32
+	expandFn       func(ctx context.Context, target int) error
+	cancel         context.CancelFunc
+}
+
+// NewAdaptiveSessionPool constructs an adaptive pool controller.
+func NewAdaptiveSessionPool(targetSessions int, policy DispatchPolicy, expandFn func(ctx context.Context, target int) error) *AdaptiveSessionPool {
+	if targetSessions <= 0 {
+		targetSessions = 4
+	}
+	return &AdaptiveSessionPool{
+		pool:           NewSessionPool(policy),
+		targetSessions: targetSessions,
+		expandFn:       expandFn,
+	}
+}
+
+// TargetSessions returns the configured target session count for relay mode.
+func (a *AdaptiveSessionPool) TargetSessions() int {
+	return a.targetSessions
+}
+
+// Pool returns the underlying SessionPool.
+func (a *AdaptiveSessionPool) Pool() *SessionPool {
+	return a.pool
+}
+
+// CurrentMode returns the detected candidate pair mode ("direct", "relay", or "").
+func (a *AdaptiveSessionPool) CurrentMode() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.mode
+}
+
+// OnModeDetected reacts to the selected ICE candidate pair mode.
+func (a *AdaptiveSessionPool) OnModeDetected(mode string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.mode = mode
+
+	if mode == "direct" {
+		logging.Infof("[adaptive-pool] direct P2P connection active; single session maintained (unlimited bandwidth)")
+		return
+	}
+
+	if mode == "relay" {
+		if a.targetSessions <= 1 {
+			logging.Infof("[adaptive-pool] relay mode active; single session configured (sessions=%d)", a.targetSessions)
+			return
+		}
+
+		if !atomic.CompareAndSwapInt32(&a.isExpanding, 0, 1) {
+			return
+		}
+
+		logging.Infof("[adaptive-pool] relay mode detected; activating multi-session pool (target: %d sessions, ~%d Mbps bandwidth pool)",
+			a.targetSessions, a.targetSessions*12)
+
+		if a.expandFn != nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			a.cancel = cancel
+			go func() {
+				if err := a.expandFn(ctx, a.targetSessions); err != nil {
+					logging.Errorf("[adaptive-pool] expansion error: %v", err)
+				}
+			}()
+		}
+	}
+}
+
+// Close stops the adaptive pool and cancels any ongoing expansion.
+func (a *AdaptiveSessionPool) Close() error {
+	a.mu.Lock()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	a.mu.Unlock()
+	return a.pool.Close()
+}
+
+// SendFrame implements FrameSender to route outgoing tunnel messages through the pool.
+func (a *AdaptiveSessionPool) SendFrame(msg []byte) error {
+	adapter := &poolSenderAdapter{pool: a.pool}
+	return adapter.SendFrame(msg)
 }

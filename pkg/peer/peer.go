@@ -131,6 +131,7 @@ type Peer struct {
 	selectedPair      *webrtc.ICECandidatePair
 	statsDone         chan struct{}
 	statsRunning      bool
+	onModeChange      func(string)
 }
 
 type soacEvent struct {
@@ -1143,6 +1144,27 @@ func (p *Peer) BinaryChannelOpen() bool {
 	return dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen
 }
 
+
+// OnModeChange registers a callback invoked when the selected candidate pair mode is determined ("direct" or "relay").
+func (p *Peer) OnModeChange(fn func(string)) {
+	p.mu.Lock()
+	p.onModeChange = fn
+	p.mu.Unlock()
+}
+
+// SelectedMode returns the active candidate pair mode ("direct", "relay", or "unknown").
+func (p *Peer) SelectedMode() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.selectedPair != nil {
+		return candidatePairMode(p.selectedPair)
+	}
+	if p.forceRelay || (p.ack != nil && p.ack.ForceRelay) {
+		return "relay"
+	}
+	return "unknown"
+}
+
 func candidatePairMode(pair *webrtc.ICECandidatePair) string {
 	if pair != nil && pair.Local != nil && pair.Remote != nil &&
 		(pair.Local.Typ == webrtc.ICECandidateTypeRelay || pair.Remote.Typ == webrtc.ICECandidateTypeRelay) {
@@ -1161,11 +1183,15 @@ func (p *Peer) setSelectedCandidatePair(pc *webrtc.PeerConnection, role string, 
 	p.selectedPair = pair
 	running := p.statsRunning
 	p.statsRunning = true
+	callback := p.onModeChange
 	p.mu.Unlock()
 	if !running {
 		go p.statsLoop(pc, role)
 	}
 	p.logConnectionStats(pc, role)
+	if callback != nil {
+		callback(candidatePairMode(pair))
+	}
 }
 
 func (p *Peer) statsLoop(pc *webrtc.PeerConnection, role string) {

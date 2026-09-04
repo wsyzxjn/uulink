@@ -151,3 +151,26 @@ func TestFormatAllowedPorts(t *testing.T) {
 		}
 	}
 }
+
+
+func TestDetermineTargetSessions(t *testing.T) {
+	// 1. Default when both are zero
+	if s := determineTargetSessions(0, 0); s != 4 {
+		t.Errorf("expected default 4, got %d", s)
+	}
+
+	// 2. Config overrides default when flag is zero
+	if s := determineTargetSessions(0, 2); s != 2 {
+		t.Errorf("expected config 2, got %d", s)
+	}
+
+	// 3. CLI flag overrides config
+	if s := determineTargetSessions(8, 2); s != 8 {
+		t.Errorf("expected CLI flag 8, got %d", s)
+	}
+
+	// 4. User explicitly disables with 1
+	if s := determineTargetSessions(1, 4); s != 1 {
+		t.Errorf("expected disabled 1, got %d", s)
+	}
+}

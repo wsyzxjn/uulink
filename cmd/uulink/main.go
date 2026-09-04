@@ -72,6 +72,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
+	sessionsFlag := flag.Int("sessions", 0, "number of relay sessions in pool (default: 4 for relay mode; set 1 to disable)")
 	flag.Parse()
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
@@ -167,7 +168,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		}, secPolicy)
+		}, secPolicy, determineTargetSessions(*sessionsFlag, cfg.Sessions))
 		return
 	}
 	if *guestServe {
@@ -179,7 +180,7 @@ func main() {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		}, secPolicy)
+		}, secPolicy, determineTargetSessions(*sessionsFlag, cfg.Sessions))
 		return
 	}
 	if *serveMode {
@@ -190,7 +191,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
-		doServe(client, cfg, rules, *roomFile, *forceRelay, secPolicy)
+		doServe(client, cfg, rules, *roomFile, *forceRelay, secPolicy, determineTargetSessions(*sessionsFlag, cfg.Sessions))
 		return
 	}
 
@@ -357,7 +358,17 @@ func main() {
 	}
 
 	// Step 6: start the local listener once the PM data channel is ready.
-	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p, sig: sig})
+	targetSessions := determineTargetSessions(*sessionsFlag, cfg.Sessions)
+	adaptivePool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	adaptivePool.Pool().AddSession(tunnel.NewSimpleSession("primary", &peerSender{peer: p, sig: sig}, p.Close))
+	p.OnModeChange(func(mode string) {
+		adaptivePool.OnModeDetected(mode)
+	})
+	if *forceRelay {
+		adaptivePool.OnModeDetected("relay")
+	}
+
+	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(secPolicy)
 	p.OnFileChannelOpen(func() {
 		if len(rules) > 0 {
@@ -486,7 +497,7 @@ func main() {
 	}
 }
 
-func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, policy tunnel.SecurityPolicy) {
+func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, policy tunnel.SecurityPolicy, targetSessions int) {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		log.Fatalf("resolve hostname: %v", err)
@@ -504,7 +515,7 @@ func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile
 	if err != nil {
 		log.Fatalf("create room: %v", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, nil, forceRelay, guestShareOptions{}, policy)
+	serveRoom(client, cfg, rules, room, roomFile, nil, forceRelay, guestShareOptions{}, policy, targetSessions)
 }
 
 type guestShareOptions struct {
@@ -513,7 +524,7 @@ type guestShareOptions struct {
 	CustomCode string
 }
 
-func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
+func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) {
 	session, err := client.CreateGuest()
 	if err != nil {
 		log.Fatalf("create guest: %v", err)
@@ -522,10 +533,10 @@ func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roo
 	if err != nil {
 		log.Fatalf("create guest room: %v", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy)
+	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy, targetSessions)
 }
 
-func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
+func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		log.Fatalf("resolve hostname: %v", err)
@@ -543,10 +554,10 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	if err != nil {
 		log.Fatalf("create guest room: %v", err)
 	}
-	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy)
+	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy, targetSessions)
 }
 
-func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) {
+func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) {
 	if roomFile != "" {
 		roomInfoFile := roomFile
 		if guestSession != nil {
@@ -713,7 +724,16 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		}
 	}
 
-	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p, sig: sig})
+	adaptivePool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	adaptivePool.Pool().AddSession(tunnel.NewSimpleSession("primary", &peerSender{peer: p, sig: sig}, p.Close))
+	p.OnModeChange(func(mode string) {
+		adaptivePool.OnModeDetected(mode)
+	})
+	if forceRelay {
+		adaptivePool.OnModeDetected("relay")
+	}
+
+	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(policy)
 	p.OnFileChannelOpen(func() {
 		if len(rules) > 0 {
@@ -1570,4 +1590,14 @@ func formatAllowedPorts(ports map[int]bool) string {
 	}
 	flush(previous)
 	return out.String()
+}
+
+func determineTargetSessions(flagVal int, cfgSessions int) int {
+	if flagVal > 0 {
+		return flagVal
+	}
+	if cfgSessions > 0 {
+		return cfgSessions
+	}
+	return 4 // default 4 for relay mode
 }

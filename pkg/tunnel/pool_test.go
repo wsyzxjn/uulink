@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"context"
+	"time"
 	"bytes"
 		"sync"
 	"testing"
@@ -228,5 +230,78 @@ func TestPoolTunnelRouting(t *testing.T) {
 	key := streamKey("1001", "1")
 	if _, loaded := pool.streamMap.Load(key); loaded {
 		t.Errorf("stream 1 was not released after fin")
+	}
+}
+
+
+
+func TestAdaptiveSessionPoolDirectMode(t *testing.T) {
+	expanded := false
+	expandFn := func(ctx context.Context, target int) error {
+		expanded = true
+		return nil
+	}
+
+	ap := NewAdaptiveSessionPool(4, PolicyStreamRoundRobin, expandFn)
+	ap.Pool().AddSession(newMockSession("s0"))
+
+	ap.OnModeDetected("direct")
+	if ap.CurrentMode() != "direct" {
+		t.Errorf("expected direct mode, got %s", ap.CurrentMode())
+	}
+	if expanded {
+		t.Errorf("expandFn should not be called in direct mode")
+	}
+	if ap.Pool().SessionCount() != 1 {
+		t.Errorf("expected 1 session, got %d", ap.Pool().SessionCount())
+	}
+}
+
+func TestAdaptiveSessionPoolRelayMode(t *testing.T) {
+	var mu sync.Mutex
+	expandTarget := 0
+	expandCalled := make(chan struct{})
+
+	expandFn := func(ctx context.Context, target int) error {
+		mu.Lock()
+		expandTarget = target
+		mu.Unlock()
+		close(expandCalled)
+		return nil
+	}
+
+	ap := NewAdaptiveSessionPool(4, PolicyStreamRoundRobin, expandFn)
+	ap.Pool().AddSession(newMockSession("s0"))
+
+	ap.OnModeDetected("relay")
+	if ap.CurrentMode() != "relay" {
+		t.Errorf("expected relay mode, got %s", ap.CurrentMode())
+	}
+
+	select {
+	case <-expandCalled:
+		mu.Lock()
+		if expandTarget != 4 {
+			t.Errorf("expected expand target 4, got %d", expandTarget)
+		}
+		mu.Unlock()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for expandFn")
+	}
+}
+
+func TestAdaptiveSessionPoolUserDisabled(t *testing.T) {
+	expanded := false
+	expandFn := func(ctx context.Context, target int) error {
+		expanded = true
+		return nil
+	}
+
+	ap := NewAdaptiveSessionPool(1, PolicyStreamRoundRobin, expandFn)
+	ap.Pool().AddSession(newMockSession("s0"))
+
+	ap.OnModeDetected("relay")
+	if expanded {
+		t.Errorf("expandFn should not be called when targetSessions == 1")
 	}
 }
