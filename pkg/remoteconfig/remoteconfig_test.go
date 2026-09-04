@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"os"
 	"net/http"
 	"testing"
 
@@ -132,5 +133,66 @@ func TestRulesWithMappingOverride(t *testing.T) {
 	}
 	if len(rules2) != 1 || rules2[0].LocalPort != 7000 {
 		t.Fatalf("unexpected rules2: %+v", rules2)
+	}
+}
+
+func TestFetchCustomCodeAndDeviceID(t *testing.T) {
+	fakeClient := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			data, _ := json.Marshal(map[string]any{
+				"device_id":   "aeawn7l56uabjgfc",
+				"custom_code": "SecretPass123",
+				"mappings": []map[string]any{
+					{"local_port": 2222, "remote_port": 22},
+				},
+			})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewReader(data)),
+			}, nil
+		}),
+	}
+
+	cfg, err := FetchWithClient(fakeClient, "https://example.com/static-room.json")
+	if err != nil {
+		t.Fatalf("fetch static config: %v", err)
+	}
+
+	if cfg.EffectiveShareID() != "aeawn7l56uabjgfc" {
+		t.Errorf("EffectiveShareID = %q, want aeawn7l56uabjgfc", cfg.EffectiveShareID())
+	}
+	if cfg.EffectiveShareCode() != "SecretPass123" {
+		t.Errorf("EffectiveShareCode = %q, want SecretPass123", cfg.EffectiveShareCode())
+	}
+}
+
+func TestFetchLocalFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := dir + "/local-room.json"
+
+	data, _ := json.Marshal(map[string]any{
+		"share_id":   "888999",
+		"share_code": "Pass1234",
+	})
+	if err := os.WriteFile(filePath, data, 0600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	cfg, err := Fetch(filePath, 0)
+	if err != nil {
+		t.Fatalf("Fetch local file: %v", err)
+	}
+	if cfg.EffectiveShareID() != "888999" || cfg.EffectiveShareCode() != "Pass1234" {
+		t.Fatalf("unexpected fetched config: %+v", cfg)
+	}
+
+	// Test file:// prefix
+	cfg2, err := Fetch("file://"+filePath, 0)
+	if err != nil {
+		t.Fatalf("Fetch file:// prefix: %v", err)
+	}
+	if cfg2.EffectiveShareID() != "888999" {
+		t.Fatalf("unexpected fetched config: %+v", cfg2)
 	}
 }

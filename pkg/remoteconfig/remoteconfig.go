@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -17,10 +18,12 @@ import (
 // RemoteShareConfig holds the share information and mapping rules fetched from
 // a remote configuration URL.
 type RemoteShareConfig struct {
-	ShareID     string             `json:"share_id"`
+	ShareID     string             `json:"share_id,omitempty"`
 	ConnectID   string             `json:"connect_id,omitempty"`
-	ShareCode   string             `json:"share_code"`
+	DeviceID    string             `json:"device_id,omitempty"`
+	ShareCode   string             `json:"share_code,omitempty"`
 	ConnectCode string             `json:"connect_code,omitempty"`
+	CustomCode  string             `json:"custom_code,omitempty"`
 	Mappings    []auth.PortMapping `json:"mappings,omitempty"`
 	Mapping     string             `json:"mapping,omitempty"`
 	LocalPort   int                `json:"local_port,omitempty"`
@@ -31,16 +34,22 @@ type RemoteShareConfig struct {
 	UpdatedAt   string             `json:"updated_at,omitempty"`
 }
 
-// EffectiveShareID returns ShareID or ConnectID.
+// EffectiveShareID returns ShareID, ConnectID, or DeviceID.
 func (c *RemoteShareConfig) EffectiveShareID() string {
 	if c.ShareID != "" {
 		return c.ShareID
 	}
-	return c.ConnectID
+	if c.ConnectID != "" {
+		return c.ConnectID
+	}
+	return c.DeviceID
 }
 
-// EffectiveShareCode returns ShareCode or ConnectCode.
+// EffectiveShareCode returns CustomCode, ShareCode, or ConnectCode.
 func (c *RemoteShareConfig) EffectiveShareCode() string {
+	if c.CustomCode != "" {
+		return c.CustomCode
+	}
 	if c.ShareCode != "" {
 		return c.ShareCode
 	}
@@ -71,27 +80,39 @@ func FetchWithClient(client *http.Client, rawURL string) (*RemoteShareConfig, er
 	if rawURL == "" {
 		return nil, fmt.Errorf("remote config URL is empty")
 	}
-	req, err := http.NewRequest("GET", rawURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("User-Agent", "uulink")
-	req.Header.Set("Accept", "application/json, */*")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch remote config from %s: %w", rawURL, err)
-	}
-	defer resp.Body.Close()
+	var data []byte
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		filePath := strings.TrimPrefix(rawURL, "file://")
+		var err error
+		data, err = os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("read remote config file %s: %w", filePath, err)
+		}
+	} else {
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("User-Agent", "uulink")
+		req.Header.Set("Accept", "application/json, */*")
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("fetch remote config from %s: HTTP %d: %s", rawURL, resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("fetch remote config from %s: %w", rawURL, err)
+		}
+		defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("read remote config body: %w", err)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			return nil, fmt.Errorf("fetch remote config from %s: HTTP %d: %s", rawURL, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		var errRead error
+		data, errRead = io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+		if errRead != nil {
+			return nil, fmt.Errorf("read remote config body: %w", errRead)
+		}
 	}
 
 	var cfg RemoteShareConfig

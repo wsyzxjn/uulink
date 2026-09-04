@@ -309,6 +309,22 @@ func main() {
 		logging.Infof("joining share room as controller")
 	}
 	switch {
+	case usesRemoteConfig:
+		shareID := remoteCfg.EffectiveShareID()
+		shareCode := remoteCfg.EffectiveShareCode()
+		logging.Infof("joining share room %s via remote config", shareID)
+		guestSession, guestErr := client.CreateGuest()
+		if guestErr != nil {
+			log.Fatalf("create guest session: %v", guestErr)
+		}
+		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, shareID, shareCode)
+		if err != nil {
+			if responseErr, ok := err.(*api.ResponseError); ok {
+				data, _ := responseErr.Response["data"].(map[string]any)
+				logging.Debugf("join room via remote config error data keys=%v", mapKeys(data))
+			}
+			log.Fatalf("join share room via remote config: %v", err)
+		}
 	case *shareConfirmation:
 		if *shareControlID == "" {
 			_, controlModeErr := client.GetShareControlMode(*shareID)
@@ -361,15 +377,6 @@ func main() {
 				logging.Debugf("join room by share code error data keys=%v", mapKeys(data))
 			}
 			log.Fatalf("join share room: %v", err)
-		}
-	case usesRemoteConfig:
-		guestSession, guestErr := client.CreateGuest()
-		if guestErr != nil {
-			log.Fatalf("create guest: %v", guestErr)
-		}
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, remoteCfg.EffectiveShareID(), remoteCfg.EffectiveShareCode())
-		if err != nil {
-			log.Fatalf("join share room via remote config: %v", err)
 		}
 	case *shareGuest:
 		guestSession, guestErr := client.CreateGuest()
