@@ -164,11 +164,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("configure mappings: %v", err)
 		}
+		targetSessions := determineTargetSessions(*sessionsFlag, cfg.Sessions)
+		if targetSessions > 1 {
+			doMultiSessionUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
+				ControlID:  *guestControlID,
+				AuthMode:   authMode,
+				CustomCode: *guestCustomCode,
+			}, secPolicy, targetSessions)
+			return
+		}
 		doUnboundGuestServe(client, cfg, rules, *roomFile, *forceRelay, guestShareOptions{
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		}, secPolicy, determineTargetSessions(*sessionsFlag, cfg.Sessions))
+		}, secPolicy, 1)
 		return
 	}
 	if *guestServe {
@@ -206,6 +215,34 @@ func main() {
 	rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 	if err != nil {
 		log.Fatalf("configure mappings: %v", err)
+	}
+
+	// Check for multi-session share configuration
+	var multiShares []shareEntry
+	if *roomFile != "" && (*shareJoin || *shareGuest) {
+		if shares, err := loadGuestShareFile(*roomFile); err == nil && len(shares) > 1 {
+			for _, s := range shares {
+				multiShares = append(multiShares, shareEntry{ID: s.ConnectID, Code: s.ConnectCode})
+			}
+		}
+	} else if *shareID != "" && *shareCode != "" && strings.Contains(*shareID, ",") {
+		ids := strings.Split(*shareID, ",")
+		codes := strings.Split(*shareCode, ",")
+		if len(ids) != len(codes) {
+			log.Fatalf("mismatched number of share-ids (%d) and share-codes (%d)", len(ids), len(codes))
+		}
+		for i := range ids {
+			id := strings.TrimSpace(ids[i])
+			code := strings.TrimSpace(codes[i])
+			if id != "" && code != "" {
+				multiShares = append(multiShares, shareEntry{ID: id, Code: code})
+			}
+		}
+	}
+
+	if len(multiShares) > 1 {
+		doMultiSessionController(client, cfg, rules, multiShares, *forceRelay, secPolicy, *shareGuest)
+		return
 	}
 
 	// Step 1: join the room created by the target device's server
@@ -540,6 +577,324 @@ func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roo
 		log.Fatalf("create guest room: %v", err)
 	}
 	serveRoom(client, cfg, rules, room, roomFile, session, forceRelay, shareOptions, policy, targetSessions)
+}
+
+func doMultiSessionController(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, shares []shareEntry, forceRelay bool, secPolicy tunnel.SecurityPolicy, useGuest bool) {
+	logging.Infof("starting multi-session controller with %d sessions", len(shares))
+	adaptivePool := tunnel.NewAdaptiveSessionPool(len(shares), tunnel.PolicyStreamLeastLoaded, nil)
+	var tun *tunnel.Tunnel
+
+	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
+	tun.SetSecurityPolicy(secPolicy)
+
+	var startOnce sync.Once
+	var sigList []*signaling.Client
+	var sigMu sync.Mutex
+
+	for idx, entry := range shares {
+		go func(i int, sEntry shareEntry) {
+			time.Sleep(time.Duration(i*300) * time.Millisecond)
+			sessionID := fmt.Sprintf("session-%d", i+1)
+			var room *api.RoomConnectionInfo
+			var peerDeviceID string
+
+			// Default to unbound guest controller if guest mode requested or JWT is empty
+			if useGuest || cfg.JWT == "" {
+				guestSession, _, err := client.CreateUnboundGuest(fmt.Sprintf("guest-ctrl-%d", i+1))
+				if err != nil {
+					logging.Errorf("[controller] create guest for %s error: %v", sessionID, err)
+					return
+				}
+				peerDeviceID = guestSession.DeviceID
+				room, err = client.JoinRoomByShareCodeWithGuest(guestSession, sEntry.ID, sEntry.Code)
+				if err != nil {
+					logging.Errorf("[controller] join room for %s error: %v", sessionID, err)
+					return
+				}
+			} else {
+				peerDeviceID = cfg.DeviceID
+				var err error
+				room, err = client.JoinRoomByShareCode(sEntry.ID, sEntry.Code)
+				if err != nil {
+					logging.Errorf("[controller] join room for %s error: %v", sessionID, err)
+					return
+				}
+			}
+			gateway := room.SignalingServer
+			if gateway == "" && len(room.SignalingList) > 0 {
+				gateway = room.SignalingList[0]
+			}
+			sig, err := signaling.Connect(&signaling.ConnectConfig{
+				GatewayURL:  gateway,
+				NRDAuth:     room.Token,
+				Controlling: true,
+			})
+			if err != nil {
+				logging.Errorf("[controller] signaling connect for %s error: %v", sessionID, err)
+				return
+			}
+			sigMu.Lock()
+			sigList = append(sigList, sig)
+			sigMu.Unlock()
+
+			select {
+			case <-sig.NamespaceConnected():
+			case <-time.After(5 * time.Second):
+				logging.Warnf("[controller] signaling namespace timeout for %s", sessionID)
+			case <-sig.Done():
+				logging.Errorf("[controller] signaling closed for %s", sessionID)
+				return
+			}
+
+			p, err := peer.NewController(&peer.Config{
+				Signal:     sig,
+				DeviceID:   peerDeviceID,
+				ForceRelay: forceRelay,
+				OnSignalData: func(data []byte) {
+					if tun != nil {
+						tun.HandleMessage(data)
+					}
+				},
+			})
+			if err != nil {
+				logging.Errorf("[controller] control handshake for %s error: %v", sessionID, err)
+				return
+			}
+
+			if err := p.Connect(nil); err != nil {
+				logging.Errorf("[controller] peer connect for %s error: %v", sessionID, err)
+				return
+			}
+
+			poolSession := tunnel.NewSimpleSession(sessionID, &peerSender{peer: p, sig: sig}, p.Close)
+			adaptivePool.Pool().AddSession(poolSession)
+
+			p.OnFileChannelOpen(func() {
+				logging.Infof("[pool] controller %s ready (active in pool: %d/%d)",
+					sessionID, adaptivePool.Pool().SessionCount(), len(shares))
+				startOnce.Do(func() {
+					if len(rules) > 0 {
+						if err := tun.Start(); err != nil {
+							log.Fatalf("start tunnel: %v", err)
+						}
+						logActiveMappings("multi-session port forwarding active", rules)
+					}
+					logSecurityPolicy(secPolicy)
+				})
+			})
+		}(idx, entry)
+	}
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+	<-interrupt
+	logging.Infof("interrupted, shutting down multi-session controller")
+	if tun != nil {
+		tun.Stop()
+	}
+	adaptivePool.Close()
+	sigMu.Lock()
+	for _, s := range sigList {
+		s.Close()
+	}
+	sigMu.Unlock()
+}
+
+func doMultiSessionUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) {
+	hostname, err := cfg.EffectiveHostname()
+	if err != nil {
+		log.Fatalf("resolve hostname: %v", err)
+	}
+	logging.Infof("initializing %d unbound guest sessions for multi-session pool...", targetSessions)
+
+	adaptivePool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	var tun *tunnel.Tunnel
+
+	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
+	tun.SetSecurityPolicy(policy)
+
+	var startOnce sync.Once
+	shares := make([]*api.GuestShareInfo, targetSessions)
+	var sigList []*signaling.Client
+	var sigMu sync.Mutex
+
+	for i := 0; i < targetSessions; i++ {
+		sessionID := fmt.Sprintf("session-%d", i+1)
+		hostNameWithIdx := fmt.Sprintf("%s-%d", hostname, i+1)
+		guestSess, identity, err := client.CreateUnboundGuest(hostNameWithIdx)
+		if err != nil {
+			log.Fatalf("create unbound guest %d: %v", i+1, err)
+		}
+
+		sessCfg := *cfg
+		sessCfg.ClientID = identity.ClientID
+		sessCfg.DeviceID = identity.DeviceID
+		sessCfg.Platform = 1
+		sessClient := api.NewClient(&sessCfg)
+
+		room, err := sessClient.CreateGuestRoom(guestSess)
+		if err != nil {
+			log.Fatalf("create guest room %d: %v", i+1, err)
+		}
+
+		gateway := room.SignalingServer
+		if gateway == "" && len(room.SignalingList) > 0 {
+			gateway = room.SignalingList[0]
+		}
+		sig, err := signaling.Connect(&signaling.ConnectConfig{
+			GatewayURL:  gateway,
+			NRDAuth:     room.Token,
+			Controlling: false,
+		})
+		if err != nil {
+			log.Fatalf("signaling connect %d: %v", i+1, err)
+		}
+		sigMu.Lock()
+		sigList = append(sigList, sig)
+		sigMu.Unlock()
+
+		select {
+		case <-sig.NamespaceConnected():
+		case <-time.After(5 * time.Second):
+			log.Fatalf("signaling namespace connect timeout %d", i+1)
+		case <-sig.Done():
+			log.Fatalf("signaling closed %d", i+1)
+		}
+
+		if _, err := sessClient.GuestSetDeviceControllable(guestSess, true); err != nil {
+			log.Fatalf("set guest device controllable %d: %v", i+1, err)
+		}
+		share, err := waitForGuestConnectID(sessClient, guestSess)
+		if err != nil {
+			log.Fatalf("get guest share info %d: %v", i+1, err)
+		}
+		share, err = ensureGuestShareCode(sessClient, guestSess, share, shareOptions)
+		if err != nil {
+			log.Fatalf("prepare guest share code %d: %v", i+1, err)
+		}
+		controlModeID := shareOptions.ControlID
+		if controlModeID == "" {
+			controlModeID = share.ConnectID
+		}
+		if _, err := sessClient.GuestShareUploadControlMode(guestSess,
+			api.NewGuestShareUploadControlModeRequest(controlModeID, true, shareOptions.AuthMode)); err != nil {
+			logging.Debugf("upload guest share control mode %d: %v", i+1, err)
+		}
+		shares[i] = share
+
+		sessShare := share
+		sig.On("bmsg_push", func(ev *signaling.Event) {
+			if len(ev.Args) == 0 {
+				return
+			}
+			var push struct {
+				Type string `json:"type"`
+				Data struct {
+					ControlID string `json:"control_id"`
+					Salt      string `json:"salt"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(ev.Args[0], &push); err != nil {
+				return
+			}
+			if push.Type == "remote_control" {
+				if push.Data.ControlID == "" {
+					return
+				}
+				updatedShare, err := uploadGuestShareCode(sessClient, guestSess, sessShare, push.Data.ControlID, push.Data.Salt, shareOptions)
+				if err != nil {
+					logging.Errorf("[%s] upload remote-control guest share sign failed: %v", sessionID, err)
+					return
+				}
+				sessShare = updatedShare
+				_, err = sessClient.GuestShareConfirmation(guestSess, &api.GuestShareConfirmationRequest{
+					ControlID:    push.Data.ControlID,
+					AllowControl: true,
+					NeedPassword: shareOptions.AuthMode != api.ShareAuthCustom,
+				})
+				if err != nil {
+					logging.Errorf("[%s] confirm remote control failed: %v", sessionID, err)
+					return
+				}
+				logging.Infof("[pool] remote control confirmed for %s", sessionID)
+			}
+			if push.Type == "get_control_mode" && push.Data.ControlID != "" {
+				updatedShare, err := uploadGuestShareCode(sessClient, guestSess, sessShare, push.Data.ControlID, push.Data.Salt, shareOptions)
+				if err == nil {
+					sessShare = updatedShare
+					sessClient.GuestShareUploadControlMode(guestSess,
+						api.NewGuestShareUploadControlModeRequest(push.Data.ControlID, true, shareOptions.AuthMode))
+				}
+			}
+		})
+
+		var poolSess *tunnel.SimpleSession
+		p, err := peer.NewControlled(&peer.Config{
+			Signal: sig,
+			OnSignalData: func(data []byte) {
+				if tun != nil {
+					if frame := tunnel.DecodeFrameForTunnel(data); frame != nil {
+						adaptivePool.Pool().BindStream(frame.RuleID, frame.StreamID, poolSess)
+					}
+					tun.HandleMessage(data)
+				}
+			},
+		})
+		if err != nil {
+			log.Fatalf("create controlled peer %d: %v", i+1, err)
+		}
+
+		poolSess = tunnel.NewSimpleSession(sessionID, &peerSender{peer: p, sig: sig}, p.Close)
+		adaptivePool.Pool().AddSession(poolSess)
+
+		p.OnFileChannelOpen(func() {
+			logging.Infof("[pool] controlled %s ready; active sessions in pool: %d/%d",
+				sessionID, adaptivePool.Pool().SessionCount(), targetSessions)
+			startOnce.Do(func() {
+				if len(rules) > 0 {
+					if err := tun.Start(); err != nil {
+						log.Fatalf("start tunnel: %v", err)
+					}
+					logActiveMappings("multi-session reverse port forwarding active", rules)
+				}
+				logSecurityPolicy(policy)
+			})
+		})
+
+		if room.ReportURL != "" && room.ReportToken != "" {
+			client.ReportIP(room)
+			client.ReportEchoServers(room)
+		}
+	}
+
+	if roomFile != "" {
+		if err := saveMultiGuestShareFile(roomFile, shares); err != nil {
+			log.Fatalf("save multi guest share file: %v", err)
+		}
+		logging.Infof("saved %d guest shares to %s", len(shares), roomFile)
+	}
+
+	var ids, codes []string
+	for _, s := range shares {
+		ids = append(ids, s.ConnectID)
+		codes = append(codes, s.ConnectCode)
+	}
+	logging.Infof("multi-session guest shares ready (%d sessions):", len(shares))
+	logging.Infof("  -share-id %s -share-code %s", strings.Join(ids, ","), strings.Join(codes, ","))
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+	<-interrupt
+	logging.Infof("interrupted, shutting down multi-session server")
+	if tun != nil {
+		tun.Stop()
+	}
+	adaptivePool.Close()
+	sigMu.Lock()
+	for _, s := range sigList {
+		s.Close()
+	}
+	sigMu.Unlock()
 }
 
 func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, forceRelay bool, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) {
@@ -892,6 +1247,61 @@ type guestShareFileInfo struct {
 	TemporaryCode string `json:"temporary_code,omitempty"`
 	CustomCode    string `json:"custom_code,omitempty"`
 	ControlID     string `json:"control_id,omitempty"`
+}
+
+type shareEntry struct {
+	ID   string
+	Code string
+}
+
+func saveMultiGuestShareFile(path string, shares []*api.GuestShareInfo) error {
+	infos := make([]guestShareFileInfo, len(shares))
+	for i, s := range shares {
+		infos[i] = guestShareFileInfo{
+			ConnectID:     s.ConnectID,
+			ConnectCode:   s.ConnectCode,
+			TemporaryCode: s.TemporaryCode,
+			CustomCode:    s.CustomCode,
+			ControlID:     s.ControlID,
+		}
+	}
+	data, err := json.MarshalIndent(infos, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func loadGuestShareFile(path string) ([]*api.GuestShareInfo, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var arr []guestShareFileInfo
+	if err := json.Unmarshal(data, &arr); err == nil && len(arr) > 0 {
+		var res []*api.GuestShareInfo
+		for _, it := range arr {
+			res = append(res, &api.GuestShareInfo{
+				ConnectID:     it.ConnectID,
+				ConnectCode:   it.ConnectCode,
+				TemporaryCode: it.TemporaryCode,
+				CustomCode:    it.CustomCode,
+				ControlID:     it.ControlID,
+			})
+		}
+		return res, nil
+	}
+	var single guestShareFileInfo
+	if err := json.Unmarshal(data, &single); err == nil && single.ConnectID != "" {
+		return []*api.GuestShareInfo{{
+			ConnectID:     single.ConnectID,
+			ConnectCode:   single.ConnectCode,
+			TemporaryCode: single.TemporaryCode,
+			CustomCode:    single.CustomCode,
+			ControlID:     single.ControlID,
+		}}, nil
+	}
+	return nil, fmt.Errorf("invalid guest share file %s", path)
 }
 
 func saveGuestShareFile(path string, share *api.GuestShareInfo) error {

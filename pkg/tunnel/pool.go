@@ -146,6 +146,21 @@ func (p *SessionPool) Sessions() []Session {
 }
 
 // SelectSession chooses an appropriate session for a new or existing stream.
+// BindStream explicitly associates an existing stream with a specific session.
+func (p *SessionPool) BindStream(ruleID, streamID string, s Session) {
+	if ruleID == "" || streamID == "" || s == nil {
+		return
+	}
+	key := streamKey(ruleID, streamID)
+	if _, loaded := p.streamMap.LoadOrStore(key, s); !loaded {
+		p.mu.RLock()
+		if cntPtr := p.activeCounts[s.ID()]; cntPtr != nil {
+			atomic.AddInt64(cntPtr, 1)
+		}
+		p.mu.RUnlock()
+	}
+}
+
 func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
 	key := streamKey(ruleID, streamID)
 	if existing, ok := p.streamMap.Load(key); ok {

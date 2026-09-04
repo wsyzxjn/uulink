@@ -114,6 +114,25 @@ func TestSessionPoolLeastLoadedDispatch(t *testing.T) {
 	}
 }
 
+func TestSessionPoolBindStream(t *testing.T) {
+	pool := NewSessionPool(PolicyStreamRoundRobin)
+	s1 := newMockSession("s1")
+	s2 := newMockSession("s2")
+	pool.AddSession(s1)
+	pool.AddSession(s2)
+
+	// Explicitly bind rule1:stream1 to s2
+	pool.BindStream("rule1", "stream1", s2)
+
+	chosen, err := pool.SelectSession("rule1", "stream1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if chosen.ID() != "s2" {
+		t.Fatalf("expected session s2, got %s", chosen.ID())
+	}
+}
+
 func TestReorderBufferInOrderAndOutOfOrder(t *testing.T) {
 	rb := NewReorderBuffer()
 
