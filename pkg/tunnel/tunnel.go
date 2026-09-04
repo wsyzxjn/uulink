@@ -614,6 +614,11 @@ func (s *stream) markReady() {
 	})
 }
 
+// DecodeFrameForTunnel decodes a wire-format frame into a PortMappingFrame.
+func DecodeFrameForTunnel(data []byte) *gvpb.PortMappingFrame {
+	return decodeFrameForTunnel(data)
+}
+
 func decodeFrameForTunnel(data []byte) *gvpb.PortMappingFrame {
 	if msg, err := decodeMsg(data); err == nil && msg.PortMappingFrame != nil {
 		return msg.PortMappingFrame

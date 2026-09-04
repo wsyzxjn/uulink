@@ -118,6 +118,7 @@ type Peer struct {
 	onBinaryOpen           func()
 	onFileOpen             func()
 	onICEConnected         func()
+	onModeChange           func(string)
 	controlEchoOnce        sync.Once
 	remoteCandidates       []string
 	ackCh                  chan *ControlAckData
@@ -1211,6 +1212,14 @@ func (p *Peer) BinaryChannelOpen() bool {
 	return dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen
 }
 
+// OnModeChange registers a callback invoked with "direct" or "relay" whenever
+// a selected ICE candidate pair is established.
+func (p *Peer) OnModeChange(fn func(string)) {
+	p.mu.Lock()
+	p.onModeChange = fn
+	p.mu.Unlock()
+}
+
 func candidatePairMode(pair *webrtc.ICECandidatePair) string {
 	if pair != nil && pair.Local != nil && pair.Remote != nil &&
 		(pair.Local.Typ == webrtc.ICECandidateTypeRelay || pair.Remote.Typ == webrtc.ICECandidateTypeRelay) {
@@ -1229,11 +1238,15 @@ func (p *Peer) setSelectedCandidatePair(pc *webrtc.PeerConnection, role string, 
 	p.selectedPair = pair
 	running := p.statsRunning
 	p.statsRunning = true
+	callback := p.onModeChange
 	p.mu.Unlock()
 	if !running {
 		go p.statsLoop(pc, role)
 	}
 	p.logConnectionStats(pc, role)
+	if callback != nil {
+		callback(candidatePairMode(pair))
+	}
 }
 
 func (p *Peer) statsLoop(pc *webrtc.PeerConnection, role string) {

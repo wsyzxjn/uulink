@@ -75,6 +75,7 @@ func run() error {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
+	sessionsFlag := flag.Int("sessions", 0, "relay session pool size (default: 4 when the connection is relayed; 1 disables pooling)")
 	flag.Parse()
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
@@ -112,6 +113,7 @@ func run() error {
 	}
 
 	client := api.NewClient(cfg)
+	targetSessions := determineTargetSessions(*sessionsFlag, cfg.Sessions)
 
 	if *refreshLogin {
 		return doRefreshLogin(client, cfg, *configPath, *loginQRCodeTimeout)
@@ -167,11 +169,17 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		return doUnboundGuestServe(client, cfg, rules, *roomFile, guestShareOptions{
+		shareOptions := guestShareOptions{
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		}, secPolicy)
+		}
+		if targetSessions > 1 {
+			// Each pooled session needs its own guest identity and room; the
+			// unbound guest server is the only mode that can create them.
+			return doMultiSessionUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+		}
+		return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy)
 	}
 	if *guestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
@@ -182,7 +190,7 @@ func run() error {
 			ControlID:  *guestControlID,
 			AuthMode:   authMode,
 			CustomCode: *guestCustomCode,
-		}, secPolicy)
+		}, secPolicy, targetSessions)
 	}
 	if *serveMode {
 		if *deviceID != "" {
@@ -192,7 +200,26 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		return doServe(client, cfg, rules, *roomFile, secPolicy)
+		return doServe(client, cfg, rules, *roomFile, secPolicy, targetSessions)
+	}
+
+	// A controller can drive several pooled sessions at once when given one
+	// share per session (comma-separated flags or a multi-share room file).
+	multiShares, err := multiSessionShares(*roomFile, *shareJoin, *shareGuest, *shareID, *shareCode)
+	if err != nil {
+		return err
+	}
+	if len(multiShares) > 1 {
+		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
+		if err != nil {
+			return fmt.Errorf("configure mappings: %w", err)
+		}
+		return doMultiSessionController(client, cfg, rules, multiShares, multiSessionControllerOptions{
+			transportMode: transportMode,
+			useGuest:      *shareGuest,
+			shareIDs:      *shareID,
+			shareCodes:    *shareCode,
+		}, secPolicy)
 	}
 
 	if err := runController(client, cfg, secPolicy, controllerOptions{
@@ -216,6 +243,7 @@ func run() error {
 		transportMode:     transportMode,
 		pckSweep:          *pckSweep,
 		mixKCP:            *mixkcpMode,
+		targetSessions:    targetSessions,
 	}); err != nil {
 		return err
 	}
@@ -250,6 +278,7 @@ type controllerOptions struct {
 	transportMode     peer.TransportMode
 	pckSweep          bool
 	mixKCP            bool
+	targetSessions    int
 }
 
 const relayTransportTimeout = 30 * time.Second
@@ -278,6 +307,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	// Step 1: join the room created by the target device's server
 	var room *api.RoomConnectionInfo
 	controllerAppControlID := ""
+	controllerGuestDeviceID := ""
 	if options.shareJoin || options.shareConfirmation {
 		logging.Infof("joining share room as controller")
 	}
@@ -325,6 +355,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		if guestErr != nil {
 			return fmt.Errorf("create guest: %w", guestErr)
 		}
+		controllerGuestDeviceID = guestSession.DeviceID
 		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, options.shareID, options.shareCode)
 		if err != nil {
 			return fmt.Errorf("join guest share room: %w", err)
@@ -404,6 +435,11 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	if options.controlDeviceID != "" {
 		peerDeviceID = options.controlDeviceID
 		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
+	} else if controllerGuestDeviceID != "" {
+		// A guest controller has its own ephemeral device identity. Keep it
+		// separate from the logged-in config device used for API headers.
+		peerDeviceID = controllerGuestDeviceID
+		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
 	}
 	p, err := peer.NewController(&peer.Config{
 		Signal:        sig,
@@ -427,7 +463,13 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	}
 
 	// Step 6: start the local listener once the PM data channel is ready.
-	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p})
+	// The adaptive pool starts with this single session; without an expansion
+	// callback it only reports the detected mode and never grows.
+	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	adaptivePool.Pool().AddSession(tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil))
+	p.OnModeChange(adaptivePool.OnModeDetected)
+
+	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(secPolicy)
 	runErr := make(chan error, 1)
 	tunnelReady := make(chan struct{})
@@ -510,7 +552,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	return nil
 }
 
-func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, policy tunnel.SecurityPolicy) error {
+func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, policy tunnel.SecurityPolicy, targetSessions int) error {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		return fmt.Errorf("resolve hostname: %w", err)
@@ -528,7 +570,7 @@ func doServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile
 	if err != nil {
 		return fmt.Errorf("create room: %w", err)
 	}
-	return serveRoom(client, cfg, rules, room, roomFile, nil, guestShareOptions{}, policy)
+	return serveRoom(client, cfg, rules, room, roomFile, nil, guestShareOptions{}, policy, targetSessions)
 }
 
 type guestShareOptions struct {
@@ -537,7 +579,7 @@ type guestShareOptions struct {
 	CustomCode string
 }
 
-func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
+func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
 	session, err := client.CreateGuest()
 	if err != nil {
 		return fmt.Errorf("create guest: %w", err)
@@ -546,7 +588,7 @@ func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roo
 	if err != nil {
 		return fmt.Errorf("create guest room: %w", err)
 	}
-	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy)
+	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy, targetSessions)
 }
 
 func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
@@ -567,10 +609,10 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	if err != nil {
 		return fmt.Errorf("create guest room: %w", err)
 	}
-	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy)
+	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy, 1)
 }
 
-func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
+func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
 	if roomFile != "" {
 		roomInfoFile := roomFile
 		if guestSession != nil {
@@ -737,7 +779,13 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		}
 	}
 
-	tun = tunnel.NewTunnelWithRules(rules, &peerSender{peer: p})
+	// A single controlled room cannot grow the pool by itself (each extra
+	// session needs its own guest identity), so this pool only tracks mode.
+	adaptivePool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	adaptivePool.Pool().AddSession(tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil))
+	p.OnModeChange(adaptivePool.OnModeDetected)
+
+	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(policy)
 	runErr := make(chan error, 1)
 	p.OnFileChannelOpen(func() {

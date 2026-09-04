@@ -255,3 +255,84 @@ func TestFormatAllowedPorts(t *testing.T) {
 		}
 	}
 }
+
+func TestDetermineTargetSessions(t *testing.T) {
+	// 1. Default when both are zero
+	if s := determineTargetSessions(0, 0); s != 4 {
+		t.Errorf("expected default 4, got %d", s)
+	}
+
+	// 2. Config overrides default when flag is zero
+	if s := determineTargetSessions(0, 2); s != 2 {
+		t.Errorf("expected config 2, got %d", s)
+	}
+
+	// 3. CLI flag overrides config
+	if s := determineTargetSessions(8, 2); s != 8 {
+		t.Errorf("expected CLI flag 8, got %d", s)
+	}
+
+	// 4. User explicitly disables with 1
+	if s := determineTargetSessions(1, 4); s != 1 {
+		t.Errorf("expected disabled 1, got %d", s)
+	}
+}
+
+func TestMultiSessionShares(t *testing.T) {
+	t.Run("single share is not pooled", func(t *testing.T) {
+		shares, err := multiSessionShares("", true, false, "abc", "123456")
+		if err != nil || len(shares) != 0 {
+			t.Fatalf("shares=%v err=%v, want none", shares, err)
+		}
+	})
+
+	t.Run("comma separated flags", func(t *testing.T) {
+		shares, err := multiSessionShares("", true, false, "a1, a2 ,a3", "c1,c2,c3")
+		if err != nil {
+			t.Fatalf("multiSessionShares(): %v", err)
+		}
+		want := []shareEntry{{ID: "a1", Code: "c1"}, {ID: "a2", Code: "c2"}, {ID: "a3", Code: "c3"}}
+		if len(shares) != len(want) {
+			t.Fatalf("shares=%v, want %v", shares, want)
+		}
+		for i := range want {
+			if shares[i] != want[i] {
+				t.Fatalf("shares[%d]=%v, want %v", i, shares[i], want[i])
+			}
+		}
+	})
+
+	t.Run("mismatched counts", func(t *testing.T) {
+		if _, err := multiSessionShares("", true, false, "a1,a2", "c1"); err == nil {
+			t.Fatal("mismatched ID/code counts were accepted")
+		}
+		if _, err := multiSessionShares("", true, false, "a1,,a3", "c1,c2,c3"); err == nil {
+			t.Fatal("empty share ID was accepted")
+		}
+	})
+
+	t.Run("room file formats", func(t *testing.T) {
+		dir := t.TempDir()
+		multi := filepath.Join(dir, "multi.json")
+		if err := os.WriteFile(multi, []byte(`[{"connect_id":"a1","connect_code":"c1"},{"connect_id":"a2","connect_code":"c2"}]`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		shares, err := multiSessionShares(multi, true, false, "", "")
+		if err != nil || len(shares) != 2 || shares[1].ID != "a2" || shares[1].Code != "c2" {
+			t.Fatalf("multi-share file: shares=%v err=%v", shares, err)
+		}
+
+		single := filepath.Join(dir, "single.json")
+		if err := os.WriteFile(single, []byte(`{"connect_id":"a1","connect_code":"c1"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		shares, err = multiSessionShares(single, false, true, "", "")
+		if err != nil || len(shares) != 1 || shares[0].ID != "a1" {
+			t.Fatalf("single-share file: shares=%v err=%v", shares, err)
+		}
+
+		if _, err := multiSessionShares(filepath.Join(dir, "missing.json"), true, false, "", ""); err == nil {
+			t.Fatal("missing room file was accepted")
+		}
+	})
+}

@@ -208,6 +208,7 @@ Field details:
 - `remote_port`: Destination port on the remote end.
 - `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
+- `sessions`: Optional relay session pool size for `-unbound-guest-serve`. Defaults to `4`; set `1` to serve a single session. The `-sessions` flag overrides it.
 
 Incoming `CONNECT` requests are authorized by the receiving process. Both endpoints use the same mapping schema, and either endpoint may expose local listeners that reach services on the other endpoint, subject to the receiving endpoint's `allow_lan` and `allowed_ports` policy.
 
@@ -231,6 +232,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-remote-host <ip>` | Target host on remote end | `127.0.0.1` |
 | `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
 | `-transport <mode>` | WebRTC transport policy for controller sessions: `auto` or `relay` | `auto` |
+| `-sessions <n>` | Relay session pool size for `-unbound-guest-serve` (`1` disables pooling) | `4` |
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
@@ -241,6 +243,8 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-share-code <code>` | Remote assistance verification code | - |
 
 `-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. Server modes reject `-transport relay`; a server-side relay requirement is represented by the signaling response, not by a local server flag.
+
+Relayed connections are rate limited per TURN allocation. `-unbound-guest-serve` therefore opens one guest room per pooled session (default `4`) and prints a comma-separated `-share-id`/`-share-code` pair. Pass those values to `-share` (or `-share-guest`) on the controller and each TCP stream is pinned to one of the sessions, so the sessions share the load while every stream stays in order. Use `-sessions 1` to run a single session.
 
 ## FAQ
 

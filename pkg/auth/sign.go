@@ -109,6 +109,7 @@ type Config struct {
 	Mappings     []PortMapping `json:"mappings,omitempty"`
 	AllowLAN     bool          `json:"allow_lan,omitempty"`
 	AllowedPorts []int         `json:"allowed_ports,omitempty"`
+	Sessions     int           `json:"sessions,omitempty"`
 }
 
 // PortMapping declares one UULink listener and its peer-side target.

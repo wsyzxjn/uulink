@@ -20,6 +20,7 @@ type GuestSession struct {
 	Token    string
 	UserID   string
 	DeviceID string
+	ClientID string
 }
 
 // CreateGuest requests a guest identity without using the configured JWT.
@@ -48,7 +49,7 @@ func (c *Client) CreateGuest() (*GuestSession, error) {
 		return nil, fmt.Errorf("decode guest token: %w", err)
 	}
 
-	return &GuestSession{GuestID: guestID, Token: token, UserID: userID, DeviceID: deviceID}, nil
+	return &GuestSession{GuestID: guestID, Token: token, UserID: userID, DeviceID: deviceID, ClientID: cfg.ClientID}, nil
 }
 
 // CreateUnboundGuest registers a new device without a user account and then
@@ -72,6 +73,7 @@ func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceI
 	if err != nil {
 		return nil, identity, fmt.Errorf("create guest for unbound device: %w", err)
 	}
+	session.ClientID = identity.ClientID
 	return session, identity, nil
 }
 
@@ -104,6 +106,9 @@ func (c *Client) guestClient(session *GuestSession) *Client {
 	cfg.GuestID = session.GuestID
 	if session.DeviceID != "" {
 		cfg.DeviceID = session.DeviceID
+	}
+	if session.ClientID != "" {
+		cfg.ClientID = session.ClientID
 	}
 	return c.withConfig(&cfg)
 }
