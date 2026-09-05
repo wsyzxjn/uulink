@@ -433,6 +433,14 @@ func (p *Peer) sendControl(deviceID string) error {
 
 // Connect creates the PeerConnection with TURN servers from the control ack
 // (or the provided override), creates data channels, sends the SDP offer via soac.
+func newWebRTCAPI() *webrtc.API {
+	s := webrtc.SettingEngine{}
+	s.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
+	s.SetSCTPMinCwnd(64 * 1024)
+	s.SetSCTPRTOMax(1500 * time.Millisecond)
+	return webrtc.NewAPI(webrtc.WithSettingEngine(s))
+}
+
 func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	if iceServers == nil && p.ack != nil {
 		iceServers = p.ack.WebRTCICEServers()
@@ -457,7 +465,7 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	}
 	logging.Infof("[peer] transport mode=%s server_requires_relay=%v", mode.String(), serverRequiresRelay)
 
-	pc, err := webrtc.NewPeerConnection(rtcCfg)
+	pc, err := newWebRTCAPI().NewPeerConnection(rtcCfg)
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
 	}
@@ -786,7 +794,7 @@ func (p *Peer) answerControlledOffer(msg soacEvent) error {
 	// peer echoes that ID rather than using its own room_info client_id.
 	p.routingClientID = msg.ClientID
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	pc, err := newWebRTCAPI().NewPeerConnection(webrtc.Configuration{
 		ICEServers: controlledSTUNServers,
 	})
 	if err != nil {
