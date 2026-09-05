@@ -323,3 +323,74 @@ func TestTunnelFlowControlBackpressure(t *testing.T) {
 		t.Fatal("timeout waiting for chunk3 after DATA_ACK")
 	}
 }
+
+func TestTunnelTCPHalfClose(t *testing.T) {
+	// Target server reads request until EOF, then sends response and closes.
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen target: %v", err)
+	}
+	defer targetLn.Close()
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, _ := io.ReadAll(conn)
+		_, _ = conn.Write(append([]byte("ack:"), req...))
+	}()
+
+	senderA := newChannelSender()
+	senderB := newChannelSender()
+	defer senderA.Close()
+	defer senderB.Close()
+
+	targetPort := targetLn.Addr().(*net.TCPAddr).Port
+	tunnelA := NewTunnelWithRules([]Rule{{
+		ID:         "3001",
+		LocalHost:  "127.0.0.1",
+		LocalPort:  0,
+		TargetHost: "127.0.0.1",
+		TargetPort: targetPort,
+	}}, senderA)
+	tunnelB := NewTunnelWithRules(nil, senderB)
+	defer tunnelA.Stop()
+	defer tunnelB.Stop()
+
+	if err := tunnelA.Start(); err != nil {
+		t.Fatalf("start tunnel: %v", err)
+	}
+	senderA.Forward(tunnelB)
+	senderB.Forward(tunnelA)
+
+	listenerAddr, err := tunnelA.ListenerAddr("3001")
+	if err != nil {
+		t.Fatalf("listener addr: %v", err)
+	}
+	localConn, err := net.DialTimeout("tcp", listenerAddr.String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial local listener: %v", err)
+	}
+	defer localConn.Close()
+
+	// Write request and half-close client write side
+	if _, err := localConn.Write([]byte("request-data")); err != nil {
+		t.Fatalf("write local: %v", err)
+	}
+	if tcpConn, ok := localConn.(*net.TCPConn); ok {
+		if err := tcpConn.CloseWrite(); err != nil {
+			t.Fatalf("close write: %v", err)
+		}
+	}
+
+	// Read response back through half-closed socket
+	localConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	resp, err := io.ReadAll(localConn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if string(resp) != "ack:request-data" {
+		t.Fatalf("response = %q, want %q", string(resp), "ack:request-data")
+	}
+}

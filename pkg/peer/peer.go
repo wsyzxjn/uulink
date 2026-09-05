@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/wsyzxjn/uulink/pkg/logging"
@@ -1208,7 +1209,10 @@ func (p *Peer) SendSignalPB(msg []byte) error {
 	if dc == nil {
 		return fmt.Errorf("file data channel not ready")
 	}
-	return dc.SendText(string(msg))
+	if len(msg) == 0 {
+		return dc.SendText("")
+	}
+	return dc.SendText(unsafe.String(unsafe.SliceData(msg), len(msg)))
 }
 
 // OnBinaryChannelOpen registers a callback fired when the binary channel opens.

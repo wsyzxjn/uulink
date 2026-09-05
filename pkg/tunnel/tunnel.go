@@ -265,15 +265,19 @@ type Tunnel struct {
 }
 
 type stream struct {
-	ruleID    string
-	id        string
-	conn      net.Conn
-	tunnel    *Tunnel
-	ready     chan struct{}
-	ackSem    chan struct{}
-	closed    chan struct{}
-	closeOnce sync.Once
-	once      sync.Once
+	ruleID         string
+	id             string
+	conn           net.Conn
+	tunnel         *Tunnel
+	ready          chan struct{}
+	ackSem         chan struct{}
+	closed         chan struct{}
+	closeOnce      sync.Once
+	once           sync.Once
+	mu             sync.Mutex
+	localFinSent   bool
+	remoteFinRecv  bool
+	halfCloseTimer *time.Timer
 }
 
 // NewTunnel creates a tunnel for one rule.
@@ -354,6 +358,21 @@ func (t *Tunnel) ListenerAddr(ruleID string) (net.Addr, error) {
 		return nil, fmt.Errorf("rule %s has no listener", ruleID)
 	}
 	return ln.Addr(), nil
+}
+
+var readBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32768)
+		return &b
+	},
+}
+
+func configureTCPConn(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetNoDelay(true)
+	}
 }
 
 // SetMaxInFlight configures the maximum unacknowledged DATA frames allowed in flight
@@ -451,6 +470,7 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 			}
 		}
 
+		configureTCPConn(conn)
 		streamID := t.nextStreamID(rule.ID)
 		s := t.newStream(rule.ID, streamID, conn)
 		t.streams.Store(streamKey(rule.ID, streamID), s)
@@ -527,8 +547,8 @@ func (t *Tunnel) HandleMessage(data []byte) {
 		if !streamExists {
 			return
 		}
-		t.closeStream(frame.RuleID, frame.StreamID, false)
-		logging.Debugf("[tunnel] stream closed: rule=%s stream=%s reason=remote-fin", frame.RuleID, frame.StreamID)
+		s := v.(*stream)
+		s.handleRemoteFIN()
 
 	default:
 		logging.Debugf("[tunnel] unknown frame type ignored")
@@ -579,6 +599,7 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 		return
 	}
 
+	configureTCPConn(conn)
 	s := t.newStream(frame.RuleID, frame.StreamID, conn)
 	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
 	t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, true))
@@ -648,10 +669,70 @@ func (s *stream) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.markReady()
+		s.mu.Lock()
+		if s.halfCloseTimer != nil {
+			s.halfCloseTimer.Stop()
+		}
+		s.mu.Unlock()
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
 	})
+}
+
+func (s *stream) armHalfCloseTimeout() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.halfCloseTimer != nil {
+		s.halfCloseTimer.Stop()
+	}
+	s.halfCloseTimer = time.AfterFunc(60*time.Second, func() {
+		s.close()
+		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
+	})
+}
+
+func (s *stream) handleLocalEOF() {
+	s.mu.Lock()
+	if s.localFinSent {
+		s.mu.Unlock()
+		return
+	}
+	s.localFinSent = true
+	bothClosed := s.remoteFinRecv
+	s.mu.Unlock()
+
+	s.tunnel.sendFIN(s.ruleID, s.id)
+
+	if bothClosed {
+		s.close()
+		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
+	} else {
+		s.armHalfCloseTimeout()
+	}
+}
+
+func (s *stream) handleRemoteFIN() {
+	s.mu.Lock()
+	if s.remoteFinRecv {
+		s.mu.Unlock()
+		return
+	}
+	s.remoteFinRecv = true
+	bothClosed := s.localFinSent
+	s.mu.Unlock()
+
+	logging.Debugf("[tunnel] stream remote fin: rule=%s stream=%s (bothClosed=%v)", s.ruleID, s.id, bothClosed)
+
+	if bothClosed {
+		s.close()
+		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
+	} else {
+		if tcpConn, ok := s.conn.(interface{ CloseWrite() error }); ok {
+			_ = tcpConn.CloseWrite()
+		}
+		s.armHalfCloseTimeout()
+	}
 }
 
 func (s *stream) readLoop() {
@@ -662,13 +743,13 @@ func (s *stream) readLoop() {
 	default:
 	}
 
+	pBuf := readBufPool.Get().(*[]byte)
+	buf := *pBuf
 	defer func() {
-		s.close()
-		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
-		s.tunnel.sendFIN(s.ruleID, s.id)
+		readBufPool.Put(pBuf)
+		s.handleLocalEOF()
 	}()
 
-	buf := make([]byte, 16384)
 	for {
 		n, err := s.conn.Read(buf)
 		if n > 0 {
