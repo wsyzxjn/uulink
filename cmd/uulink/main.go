@@ -478,11 +478,10 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		if err != nil {
 			var responseErr *api.ResponseError
 			if errors.As(err, &responseErr) && responseErr.Code == api.CodeObjectNotFound {
-				return fmt.Errorf("join guest share room: %w\n"+
-					"The UU Remote API only exposes shares to logged-in users, so the "+
-					"controlling side cannot join with a guest identity. Log in on this "+
-					"machine with \"uulink -login\" and retry; the served side can stay "+
-					"accountless.", err)
+				return fmt.Errorf("join guest share room: %w; the API only exposes "+
+					"shares to logged-in users, so the controlling side cannot join "+
+					"with a guest identity: run %q on this machine and retry, the "+
+					"served side can stay accountless", err, "uulink -login")
 			}
 			return fmt.Errorf("join guest share room: %w", err)
 		}
