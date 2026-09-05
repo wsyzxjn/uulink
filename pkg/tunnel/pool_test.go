@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -266,5 +267,40 @@ func TestAdaptiveSessionPoolCloseClosesSessions(t *testing.T) {
 	}
 	if ap.Pool().SessionCount() != 0 {
 		t.Fatal("Close() left sessions in the pool")
+	}
+}
+
+func TestConcurrentLeastLoadedStreamsStayBalanced(t *testing.T) {
+	pool := NewSessionPool(PolicyStreamLeastLoaded)
+	for _, id := range []string{"a", "b", "c", "d"} {
+		pool.AddSession(newMockSession(id))
+	}
+	start := make(chan struct{})
+	chosen := make(chan string, 400)
+	var wg sync.WaitGroup
+	for i := range 400 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s, err := pool.SelectSession("rule", fmt.Sprint(i))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			chosen <- s.ID()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(chosen)
+	counts := map[string]int{}
+	for id := range chosen {
+		counts[id]++
+	}
+	for _, id := range []string{"a", "b", "c", "d"} {
+		if counts[id] != 100 {
+			t.Fatalf("unbalanced assignment: %v", counts)
+		}
 	}
 }

@@ -125,8 +125,8 @@ func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
 		return existing.(Session), nil
 	}
 
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if len(p.sessions) == 0 {
 		return nil, errors.New("no active sessions available in pool")
 	}

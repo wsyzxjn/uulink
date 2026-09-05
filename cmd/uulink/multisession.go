@@ -25,7 +25,10 @@ import (
 // controller joins every share. Streams are pinned to one session each and
 // the tunnel state is shared, so ordering within a stream is preserved.
 
-const defaultRelaySessions = 4
+const (
+	defaultRelaySessions = 4
+	maxRelaySessions     = 16
+)
 
 // determineTargetSessions resolves the pool size from the CLI flag, then the
 // config file, then the relay default. A value of 1 disables pooling.
@@ -110,6 +113,7 @@ type sessionSet struct {
 	failed   chan error
 	ready    chan struct{}
 	once     sync.Once
+	closed   bool
 }
 
 func newSessionSet() *sessionSet {
@@ -118,6 +122,11 @@ func newSessionSet() *sessionSet {
 
 func (s *sessionSet) add(rt *sessionRuntime) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		rt.close()
+		return
+	}
 	s.sessions = append(s.sessions, rt)
 	s.mu.Unlock()
 }
@@ -133,6 +142,7 @@ func (s *sessionSet) closeAll() {
 	s.mu.Lock()
 	sessions := append([]*sessionRuntime(nil), s.sessions...)
 	s.sessions = nil
+	s.closed = true
 	s.mu.Unlock()
 	for _, rt := range sessions {
 		rt.close()
@@ -296,16 +306,37 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 		return nil, fmt.Errorf("peer connect: %w", err)
 	}
 
-	pool.Pool().AddSession(tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil))
+	ready := make(chan error, 1)
 	p.OnFileChannelOpen(func() {
 		if err := p.ValidateTransportMode(); err != nil {
-			set.fail(fmt.Errorf("%s: validate transport: %w", sessionID, err))
+			select {
+			case ready <- fmt.Errorf("%s: validate transport: %w", sessionID, err):
+			default:
+			}
 			return
+		}
+		pool.Pool().AddSession(tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil))
+		select {
+		case ready <- nil:
+		default:
 		}
 		logging.Infof("[pool] controller %s ready (sessions in pool: %d)", sessionID, pool.Pool().SessionCount())
 		set.startTunnelOnce(tun, rules, secPolicy, "multi-session port forwarding active")
 	})
-	return rt, nil
+	select {
+	case err := <-ready:
+		if err == nil {
+			return rt, nil
+		}
+		rt.close()
+		return nil, err
+	case <-sig.Done():
+		rt.close()
+		return nil, fmt.Errorf("%s: signaling closed before data channel ready", sessionID)
+	case <-time.After(relayTransportTimeout):
+		rt.close()
+		return nil, fmt.Errorf("%s: data channel readiness timeout", sessionID)
+	}
 }
 
 // doMultiSessionUnboundGuestServe creates one unbound guest room per session
@@ -479,9 +510,8 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 	}
 	rt.peer = p
 	poolSession = tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil)
-	pool.Pool().AddSession(poolSession)
-
 	p.OnFileChannelOpen(func() {
+		pool.Pool().AddSession(poolSession)
 		logging.Infof("[pool] controlled %s ready (sessions in pool: %d)", sessionID, pool.Pool().SessionCount())
 		set.startTunnelOnce(tun, rules, policy, "multi-session reverse port forwarding active")
 	})

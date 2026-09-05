@@ -111,6 +111,10 @@ type Peer struct {
 	binaryDC               *webrtc.DataChannel
 	controlDC              *webrtc.DataChannel
 	textDC                 *webrtc.DataChannel
+	onTextMessage          func([]byte)
+	pendingText            [][]byte
+	textOpen               chan struct{}
+	textOpenOnce           sync.Once
 	fileDC                 *webrtc.DataChannel
 	mu                     sync.Mutex
 	onBinaryData           func([]byte)
@@ -160,6 +164,7 @@ func NewController(cfg *Config) (*Peer, error) {
 	}
 
 	p := &Peer{
+		textOpen:      make(chan struct{}),
 		sig:           cfg.Signal,
 		appControlID:  appControlID,
 		sdpOfferFile:  cfg.SDPOfferFile,
@@ -232,6 +237,7 @@ func NewController(cfg *Config) (*Peer, error) {
 // the UULink-side replacement for running the official controlled client.
 func NewControlled(cfg *Config) (*Peer, error) {
 	p := &Peer{
+		textOpen:        make(chan struct{}),
 		sig:             cfg.Signal,
 		onBinaryData:    cfg.OnBinaryData,
 		onSignalData:    cfg.OnSignalData,
@@ -510,6 +516,10 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	p.mu.Unlock()
 	textDC.OnOpen(func() {
 		logging.Debugf("[peer] text channel open")
+		p.markTextOpen()
+	})
+	textDC.OnMessage(func(msg webrtc.DataChannelMessage) {
+		p.handleTextMessage(msg.Data)
 	})
 
 	// FILE_DATA_CHANNEL carries the pb channel (PortMappingFrame messages)
@@ -885,7 +895,11 @@ func (p *Peer) setupControlledDataChannel(dc *webrtc.DataChannel) {
 		p.mu.Lock()
 		p.textDC = dc
 		p.mu.Unlock()
-		dc.OnOpen(func() { logging.Debugf("[peer] controlled text channel open") })
+		dc.OnOpen(func() {
+			logging.Debugf("[peer] controlled text channel open")
+			p.markTextOpen()
+		})
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) { p.handleTextMessage(msg.Data) })
 	case LabelFile:
 		p.mu.Lock()
 		p.fileDC = dc
@@ -1096,6 +1110,57 @@ func readPBVarint(data []byte) (uint64, int) {
 		}
 	}
 	return 0, 0
+}
+
+func (p *Peer) markTextOpen() {
+	p.textOpenOnce.Do(func() { close(p.textOpen) })
+}
+
+// TextChannelOpen reports when TEXT_DATA_CHANNEL is usable. The mode callback
+// fires while ICE is still selecting a candidate pair, well before the data
+// channels exist, so anything that sends on this channel has to wait for it.
+func (p *Peer) TextChannelOpen() <-chan struct{} {
+	return p.textOpen
+}
+
+// maxPendingText bounds the messages held for a handler that is not installed
+// yet. The channel carries short control messages only.
+const maxPendingText = 16
+
+// OnTextMessage registers a handler for TEXT_DATA_CHANNEL payloads. uulink
+// uses this channel for its own peer-to-peer control messages; the official
+// client only sends a fixed protobuf handshake on it, which the handler is
+// expected to ignore.
+//
+// Messages that arrived before this call are replayed, because the peer is
+// wired up while the channel is already open and the remote side may have
+// spoken first.
+func (p *Peer) OnTextMessage(fn func([]byte)) {
+	p.mu.Lock()
+	p.onTextMessage = fn
+	pending := p.pendingText
+	p.pendingText = nil
+	p.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	for _, data := range pending {
+		fn(data)
+	}
+}
+
+func (p *Peer) handleTextMessage(data []byte) {
+	p.mu.Lock()
+	fn := p.onTextMessage
+	if fn == nil {
+		if len(p.pendingText) < maxPendingText {
+			p.pendingText = append(p.pendingText, append([]byte(nil), data...))
+		}
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	fn(data)
 }
 
 func (p *Peer) SendText(data []byte) error {

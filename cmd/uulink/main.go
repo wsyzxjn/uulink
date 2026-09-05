@@ -164,8 +164,8 @@ func run() error {
 
 	client := api.NewClient(cfg)
 	targetSessions := determineTargetSessions(*sessionsFlag, cfg.Sessions)
-	if *customServe && *sessionsFlag <= 0 {
-		targetSessions = 1
+	if targetSessions > maxRelaySessions {
+		return fmt.Errorf("sessions must not exceed %d", maxRelaySessions)
 	}
 
 	if *refreshLogin {
@@ -247,16 +247,16 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		if targetSessions > 1 {
+		// A fixed custom code has to keep its published identity, so that mode
+		// starts as a single session and grows in band once a controller
+		// reports a relay. Plain pooled mode still mints every room up front,
+		// which keeps -room-file usable for controllers that join by hand.
+		if targetSessions > 1 && !*customServe {
 			// Each pooled session needs its own guest identity and room; the
 			// unbound guest server is the only mode that can create them.
-			if *customServe {
-				// A fixed identity cannot be shared by several pooled devices.
-				return fmt.Errorf("-custom-serve runs a single session; use -sessions 1")
-			}
 			return doMultiSessionUnboundGuestServe(cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
 		}
-		return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy)
+		return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
 	}
 	if *guestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
@@ -568,6 +568,8 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		peerDeviceID = controllerGuestDeviceID
 		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
 	}
+	var primarySession tunnel.Session
+	var expandPool *tunnel.AdaptiveSessionPool
 	p, err := peer.NewController(&peer.Config{
 		Signal:        sig,
 		DeviceID:      peerDeviceID,
@@ -576,6 +578,11 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		TransportMode: options.transportMode,
 		OnSignalData: func(data []byte) {
 			if tun != nil {
+				if frame := tunnel.DecodeFrameForTunnel(data); frame != nil && primarySession != nil {
+					if expandPool != nil {
+						expandPool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
+					}
+				}
 				tun.HandleMessage(data)
 			}
 		}})
@@ -584,16 +591,21 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	}
 	defer p.Close()
 
-	// Step 5: create PeerConnection + data channels + send soac offer
-	if err := p.Connect(nil); err != nil {
-		return fmt.Errorf("peer connect: %w", err)
-	}
-
 	// Step 6: start the local listener once the PM data channel is ready.
-	// The adaptive pool starts with this single session; without an expansion
-	// callback it only reports the detected mode and never grows.
-	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
-	adaptivePool.Pool().AddSession(tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil))
+	// A relayed session is rate limited per TURN allocation, so the pool asks
+	// the served side for additional rooms in band and joins them here. The
+	// negotiator has to be in place before the peer reports its mode.
+	negotiator := newExpandNegotiator()
+	expandSet := newSessionSet()
+	defer expandSet.closeAll()
+	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyStreamLeastLoaded,
+		func(target int) error {
+			return expandControllerPool(client, cfg, negotiator, p, tun, expandPool, expandSet, target, options.transportMode, secPolicy)
+		})
+	expandPool = adaptivePool
+	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
+	adaptivePool.Pool().AddSession(primarySession)
+	p.OnTextMessage(func(data []byte) { negotiator.handle(data) })
 	p.OnModeChange(adaptivePool.OnModeDetected)
 
 	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
@@ -648,6 +660,10 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 			announcer.Stop()
 		}
 	}()
+
+	if err := p.Connect(nil); err != nil {
+		return fmt.Errorf("peer connect: %w", err)
+	}
 
 	if options.pckSweep {
 		startPCKSweep(p, debugRule, ruleID)
@@ -747,7 +763,7 @@ func doGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roo
 	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy, targetSessions)
 }
 
-func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy) error {
+func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		return fmt.Errorf("resolve hostname: %w", err)
@@ -772,7 +788,7 @@ func doUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Ru
 	if err != nil {
 		return fmt.Errorf("create guest room: %w", err)
 	}
-	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy, 1)
+	return serveRoom(client, cfg, rules, room, roomFile, session, shareOptions, policy, targetSessions)
 }
 
 func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
@@ -939,10 +955,15 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 	}
 
 	var tun *tunnel.Tunnel
+	var primarySession tunnel.Session
+	var adaptivePool *tunnel.AdaptiveSessionPool
 	p, err := peer.NewControlled(&peer.Config{
 		Signal: sig,
 		OnSignalData: func(data []byte) {
 			if tun != nil {
+				if frame := tunnel.DecodeFrameForTunnel(data); frame != nil && primarySession != nil {
+					adaptivePool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
+				}
 				tun.HandleMessage(data)
 			}
 		},
@@ -961,14 +982,22 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		}
 	}
 
-	// A single controlled room cannot grow the pool by itself (each extra
-	// session needs its own guest identity), so this pool only tracks mode.
-	adaptivePool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
-	adaptivePool.Pool().AddSession(tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil))
+	// The controller drives pool growth: it is the side that can tell whether
+	// the connection landed on a relay. Each extra session needs a room of its
+	// own, which this side mints on request.
+	adaptivePool = tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
+	adaptivePool.Pool().AddSession(primarySession)
 	p.OnModeChange(adaptivePool.OnModeDetected)
 
 	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(policy)
+
+	expandSet := newSessionSet()
+	defer expandSet.closeAll()
+	p.OnTextMessage(serveExpandRequests(p, targetSessions-1, func(extra int) ([]expandShare, error) {
+		return mintExpansionRooms(cfg, tun, adaptivePool, expandSet, shareOptions, policy, extra)
+	}))
 	runErr := make(chan error, 1)
 	p.OnFileChannelOpen(func() {
 		if len(rules) > 0 {
