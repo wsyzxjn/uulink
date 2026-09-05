@@ -90,6 +90,7 @@ func run() error {
 	publishSecret := flag.String("publish-secret", "", "bearer token sent with -publish-url requests")
 	lanDiscovery := flag.Bool("lan-discovery", false, "announce the first forwarded port as a Minecraft LAN server")
 	lanMotd := flag.String("lan-motd", "", "MOTD text for the Minecraft LAN announcement")
+	p2pTimeout := flag.Duration("p2p-timeout", 12*time.Second, "timeout for P2P connection attempts before falling back to relay (0 disables fallback)")
 	flag.Parse()
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
@@ -295,6 +296,7 @@ func run() error {
 			remoteHost:    *remoteHost,
 			remotePort:    *remotePort,
 			capability:    *capFlag,
+			p2pTimeout:    *p2pTimeout,
 		})
 	}
 
@@ -317,8 +319,9 @@ func run() error {
 		}, secPolicy)
 	}
 
+	currentTransportMode := transportMode
 	if err := recoverTunnel(*configPath, cfg, func() error {
-		return runController(client, cfg, secPolicy, controllerOptions{
+		opts := controllerOptions{
 			deviceID:          *deviceID,
 			allowSelf:         *allowSelf,
 			controlDeviceID:   *controlDeviceID,
@@ -336,14 +339,21 @@ func run() error {
 			remoteHost:        *remoteHost,
 			remotePort:        *remotePort,
 			capability:        *capFlag,
-			transportMode:     transportMode,
+			transportMode:     currentTransportMode,
 			pckSweep:          *pckSweep,
 			mixKCP:            *mixkcpMode,
 			targetSessions:    targetSessions,
 			lanDiscovery:      *lanDiscovery,
 			lanMotd:           *lanMotd,
 			configPath:        *configPath,
-		})
+			p2pTimeout:        *p2pTimeout,
+		}
+		err := runController(client, cfg, secPolicy, opts)
+		if errors.Is(err, errP2PTimeout) && currentTransportMode == peer.TransportAuto {
+			logging.Warnf("[peer] P2P punch-through timed out after %s; falling back to relay transport for subsequent attempts", opts.p2pTimeout)
+			currentTransportMode = peer.TransportRelay
+		}
+		return err
 	}); err != nil {
 		return err
 	}
@@ -387,14 +397,18 @@ type controllerOptions struct {
 	lanDiscovery bool
 	lanMotd      string
 	configPath   string
+	p2pTimeout   time.Duration
 }
 
-const relayTransportTimeout = 30 * time.Second
+const (
+	defaultP2PTimeout     = 12 * time.Second
+	relayTransportTimeout = 30 * time.Second
+)
 
-// errSignalingClosed reports a signaling connection that ended without a local
-// shutdown request. It is a runtime failure, so the process must not exit 0
-// and let service managers mistake a dropped network path for a clean stop.
-var errSignalingClosed = errors.New("signaling connection closed unexpectedly")
+var (
+	errP2PTimeout      = errors.New("p2p connection timeout")
+	errSignalingClosed = errors.New("signaling connection closed unexpectedly")
+)
 
 func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options controllerOptions) error {
 	usesShareRoom := options.shareJoin || options.shareGuest || options.shareConfirmation
@@ -706,11 +720,39 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	defer signal.Stop(interrupt)
 
 	{
+		effectiveP2PTimeout := options.p2pTimeout
+		if effectiveP2PTimeout == 0 {
+			effectiveP2PTimeout = defaultP2PTimeout
+		}
+		var p2pTimer <-chan time.Time
+		if options.transportMode == peer.TransportAuto && effectiveP2PTimeout > 0 {
+			p2pTimer = time.After(effectiveP2PTimeout)
+		}
+
 		select {
 		case <-tunnelReady:
-			logging.Infof("transport relay ready")
+			logging.Infof("transport connection ready (mode=%s)", p.SelectedPairMode())
+		case <-p2pTimer:
+			state := p.ConnectionState()
+			logging.Infof("[peer] %s countdown: peer connection state is %s", effectiveP2PTimeout, state)
+			if state != "connected" {
+				return fmt.Errorf("%w: peer connection state is %s after %s countdown", errP2PTimeout, state, effectiveP2PTimeout)
+			}
+			select {
+			case <-tunnelReady:
+				logging.Infof("transport connection ready (mode=%s)", p.SelectedPairMode())
+			case <-time.After(relayTransportTimeout):
+				return fmt.Errorf("transport connection timeout: connection not ready within %s", relayTransportTimeout)
+			case <-interrupt:
+				logging.Infof("interrupted, shutting down")
+				return nil
+			case <-sig.Done():
+				return errSignalingClosed
+			case err := <-runErr:
+				return err
+			}
 		case <-time.After(relayTransportTimeout):
-			return fmt.Errorf("transport relay required: connection not ready within %s", relayTransportTimeout)
+			return fmt.Errorf("transport connection timeout: connection not ready within %s", relayTransportTimeout)
 		case <-interrupt:
 			logging.Infof("interrupted, shutting down")
 			return nil

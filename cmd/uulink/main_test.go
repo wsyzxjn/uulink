@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/api"
 	"github.com/wsyzxjn/uulink/pkg/auth"
@@ -397,5 +400,15 @@ func TestPublishShareInfoReportsHTTPFailure(t *testing.T) {
 	err := publishShareInfo(server.URL, "", &api.GuestShareInfo{ConnectID: "1", ConnectCode: "2"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("publishShareInfo() error = %v, want HTTP 403 failure", err)
+	}
+}
+
+func TestP2PTimeoutDefinition(t *testing.T) {
+	if defaultP2PTimeout != 12*time.Second {
+		t.Fatalf("defaultP2PTimeout = %v, want 12s", defaultP2PTimeout)
+	}
+	wrapped := fmt.Errorf("%w: detail", errP2PTimeout)
+	if !errors.Is(wrapped, errP2PTimeout) {
+		t.Fatalf("expected errors.Is(wrapped, errP2PTimeout) to be true")
 	}
 }

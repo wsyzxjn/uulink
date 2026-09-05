@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -349,6 +350,10 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 					return
 				}
 				rt, err := startPooledController(client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, mode, nil, policy)
+				if errors.Is(err, errP2PTimeout) && mode == peer.TransportAuto {
+					logging.Infof("[expand] P2P timed out, retrying session with relay transport")
+					rt, err = startPooledController(client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, peer.TransportRelay, nil, policy)
+				}
 				if err != nil {
 					logging.Warnf("[recovery] join extra room failed: %v", err)
 					return

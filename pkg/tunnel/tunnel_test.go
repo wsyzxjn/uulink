@@ -228,3 +228,98 @@ func echoTCP(t *testing.T, address, payload string, result chan<- string) {
 	}
 	result <- string(buf)
 }
+
+func TestTunnelFlowControlBackpressure(t *testing.T) {
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen target: %v", err)
+	}
+	defer targetLn.Close()
+
+	senderA := newChannelSender()
+	defer senderA.Close()
+
+	targetPort := targetLn.Addr().(*net.TCPAddr).Port
+	tunnelA := NewTunnelWithRules([]Rule{{
+		ID:         "2001",
+		LocalHost:  "127.0.0.1",
+		LocalPort:  0,
+		TargetHost: "127.0.0.1",
+		TargetPort: targetPort,
+	}}, senderA)
+	// Limit window to 2 in-flight frames
+	tunnelA.SetMaxInFlight(2)
+	if tunnelA.MaxInFlight() != 2 {
+		t.Fatalf("MaxInFlight = %d, want 2", tunnelA.MaxInFlight())
+	}
+	if err := tunnelA.Start(); err != nil {
+		t.Fatalf("start tunnel: %v", err)
+	}
+	defer tunnelA.Stop()
+
+	listenerAddr, err := tunnelA.ListenerAddr("2001")
+	if err != nil {
+		t.Fatalf("listener addr: %v", err)
+	}
+	localConn, err := net.DialTimeout("tcp", listenerAddr.String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial local listener: %v", err)
+	}
+	defer localConn.Close()
+
+	// 1. Consume CONNECT frame and emulate remote SYN_ACK
+	_ = receiveFrame(t, senderA.ch)
+	synAck, err := newSynAckMsg("2001", "1", true)
+	if err != nil {
+		t.Fatalf("synAck msg: %v", err)
+	}
+	tunnelA.HandleMessage(synAck)
+
+	// 2. Write 2 chunks to localConn (should be emitted immediately)
+	if _, err := localConn.Write([]byte("chunk1")); err != nil {
+		t.Fatalf("write chunk1: %v", err)
+	}
+	f1 := receiveDataFrame(t, senderA.ch)
+	if f1 == nil {
+		t.Fatal("expected frame 1")
+	}
+
+	if _, err := localConn.Write([]byte("chunk2")); err != nil {
+		t.Fatalf("write chunk2: %v", err)
+	}
+	f2 := receiveDataFrame(t, senderA.ch)
+	if f2 == nil {
+		t.Fatal("expected frame 2")
+	}
+
+	// 3. Write chunk3. Since in-flight is 2 (equal to window limit), readLoop must block
+	if _, err := localConn.Write([]byte("chunk3")); err != nil {
+		t.Fatalf("write chunk3: %v", err)
+	}
+
+	select {
+	case msg := <-senderA.ch:
+		if f := decodeFrameForTunnel(msg); f != nil && f.Type == "DATA" {
+			t.Fatalf("expected backpressure to block chunk3, but got frame: %v", f)
+		}
+	case <-time.After(100 * time.Millisecond):
+		// Expected: paused by backpressure
+	}
+
+	// 4. Send 1 DATA_ACK to acknowledge one frame
+	ackMsg, err := newACKMsg("2001", "1")
+	if err != nil {
+		t.Fatalf("ack msg: %v", err)
+	}
+	tunnelA.HandleMessage(ackMsg)
+
+	// 5. chunk3 should now be unblocked and sent
+	select {
+	case msg := <-senderA.ch:
+		if f := decodeFrameForTunnel(msg); f == nil || f.Type != "DATA" || string(f.Payload) != "chunk3" {
+			t.Fatalf("expected chunk3 DATA frame, got: %v", f)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for chunk3 after DATA_ACK")
+	}
+}

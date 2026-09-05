@@ -247,6 +247,8 @@ func GenerateRuleID() string {
 	return strconv.FormatUint(v, 10)
 }
 
+const defaultMaxInFlight = 128
+
 // Tunnel manages one or more local mapping rules and all PM streams.
 type Tunnel struct {
 	sender         FrameSender
@@ -259,15 +261,19 @@ type Tunnel struct {
 	securityPolicy SecurityPolicy
 	remoteLogTime  time.Time
 	remoteLogged   bool
+	maxInFlight    int
 }
 
 type stream struct {
-	ruleID string
-	id     string
-	conn   net.Conn
-	tunnel *Tunnel
-	ready  chan struct{}
-	once   sync.Once
+	ruleID    string
+	id        string
+	conn      net.Conn
+	tunnel    *Tunnel
+	ready     chan struct{}
+	ackSem    chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+	once      sync.Once
 }
 
 // NewTunnel creates a tunnel for one rule.
@@ -350,6 +356,49 @@ func (t *Tunnel) ListenerAddr(ruleID string) (net.Addr, error) {
 	return ln.Addr(), nil
 }
 
+// SetMaxInFlight configures the maximum unacknowledged DATA frames allowed in flight
+// per stream before pausing reads from the local connection. Pass 0 for default (128).
+// Pass a negative value to disable flow control.
+func (t *Tunnel) SetMaxInFlight(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxInFlight = n
+}
+
+// MaxInFlight returns the configured maximum in-flight DATA frames per stream.
+func (t *Tunnel) MaxInFlight() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.maxInFlight
+}
+
+func (t *Tunnel) effectiveMaxInFlight() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.maxInFlight < 0 {
+		return 0
+	}
+	if t.maxInFlight == 0 {
+		return defaultMaxInFlight
+	}
+	return t.maxInFlight
+}
+
+func (t *Tunnel) newStream(ruleID, streamID string, conn net.Conn) *stream {
+	s := &stream{
+		ruleID: ruleID,
+		id:     streamID,
+		conn:   conn,
+		tunnel: t,
+		ready:  make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+	if limit := t.effectiveMaxInFlight(); limit > 0 {
+		s.ackSem = make(chan struct{}, limit)
+	}
+	return s
+}
+
 // SetSecurityPolicy configures inbound connection restrictions.
 func (t *Tunnel) SetSecurityPolicy(policy SecurityPolicy) {
 	t.mu.Lock()
@@ -384,7 +433,7 @@ func (t *Tunnel) Stop() {
 		ln.Close()
 	}
 	t.streams.Range(func(_, v any) bool {
-		v.(*stream).conn.Close()
+		v.(*stream).close()
 		return true
 	})
 }
@@ -403,7 +452,7 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 		}
 
 		streamID := t.nextStreamID(rule.ID)
-		s := &stream{ruleID: rule.ID, id: streamID, conn: conn, tunnel: t, ready: make(chan struct{})}
+		s := t.newStream(rule.ID, streamID, conn)
 		t.streams.Store(streamKey(rule.ID, streamID), s)
 		msg, err := newConnectMsg(rule.ID, streamID, rule.TargetHost, rule.TargetPort)
 		if err != nil {
@@ -469,7 +518,10 @@ func (t *Tunnel) HandleMessage(data []byte) {
 		t.sendBuiltMsg(newACKMsg(frame.RuleID, frame.StreamID))
 
 	case gvpb.TypeDataAck:
-		// Per-message acknowledgements are currently informational.
+		if streamExists {
+			s := v.(*stream)
+			s.onACK()
+		}
 
 	case gvpb.TypeFin:
 		if !streamExists {
@@ -527,13 +579,7 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 		return
 	}
 
-	s := &stream{
-		ruleID: frame.RuleID,
-		id:     frame.StreamID,
-		conn:   conn,
-		tunnel: t,
-		ready:  make(chan struct{}),
-	}
+	s := t.newStream(frame.RuleID, frame.StreamID, conn)
 	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
 	t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, true))
 	s.markReady()
@@ -581,19 +627,43 @@ func (t *Tunnel) closeStream(ruleID, streamID string, sendFin bool) {
 	key := streamKey(ruleID, streamID)
 	if v, ok := t.streams.Load(key); ok {
 		s := v.(*stream)
-		s.conn.Close()
+		s.close()
 		t.streams.Delete(key)
-		s.markReady()
 		if sendFin {
 			t.sendFIN(ruleID, streamID)
 		}
 	}
 }
 
+func (s *stream) onACK() {
+	if s.ackSem != nil {
+		select {
+		case <-s.ackSem:
+		default:
+		}
+	}
+}
+
+func (s *stream) close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.markReady()
+		if s.conn != nil {
+			_ = s.conn.Close()
+		}
+	})
+}
+
 func (s *stream) readLoop() {
 	<-s.ready
+	select {
+	case <-s.closed:
+		return
+	default:
+	}
+
 	defer func() {
-		s.conn.Close()
+		s.close()
 		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
 		s.tunnel.sendFIN(s.ruleID, s.id)
 	}()
@@ -602,6 +672,16 @@ func (s *stream) readLoop() {
 	for {
 		n, err := s.conn.Read(buf)
 		if n > 0 {
+			if s.ackSem != nil {
+				select {
+				case s.ackSem <- struct{}{}:
+				case <-s.closed:
+					return
+				case <-s.tunnel.done:
+					return
+				}
+			}
+
 			payload := make([]byte, n)
 			copy(payload, buf[:n])
 			msg, msgErr := newDataMsg(s.ruleID, s.id, payload)

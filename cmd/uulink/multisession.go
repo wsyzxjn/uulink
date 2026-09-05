@@ -316,6 +316,10 @@ func doMultiSessionController(client *api.Client, cfg *auth.Config, rules []tunn
 	for index, entry := range shares {
 		sessionID := fmt.Sprintf("session-%d", index+1)
 		rt, err := startPooledController(client, cfg, tun, pool, set, sessionID, entry, useGuest, options.transportMode, rules, secPolicy)
+		if errors.Is(err, errP2PTimeout) && options.transportMode == peer.TransportAuto {
+			logging.Infof("[multisession] %s: P2P timed out, retrying with relay transport", sessionID)
+			rt, err = startPooledController(client, cfg, tun, pool, set, sessionID, entry, useGuest, peer.TransportRelay, rules, secPolicy)
+		}
 		if err != nil {
 			return fmt.Errorf("%s: %w", sessionID, err)
 		}
@@ -390,6 +394,11 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 		logging.Infof("[pool] controller %s ready (sessions in pool: %d)", sessionID, pool.Pool().SessionCount())
 		set.startTunnelOnce(tun, rules, secPolicy, "multi-session port forwarding active")
 	})
+	var p2pTimer <-chan time.Time
+	if transportMode == peer.TransportAuto {
+		p2pTimer = time.After(defaultP2PTimeout)
+	}
+
 	select {
 	case err := <-ready:
 		if err == nil {
@@ -398,6 +407,31 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 		}
 		rt.close()
 		return nil, err
+	case <-p2pTimer:
+		state := p.ConnectionState()
+		logging.Infof("[peer] %s: 12s countdown: peer connection state is %s", sessionID, state)
+		if state != "connected" {
+			rt.close()
+			return nil, fmt.Errorf("%w: %s peer connection state is %s after 12s countdown", errP2PTimeout, sessionID, state)
+		}
+		select {
+		case err := <-ready:
+			if err == nil {
+				monitorSession(set, rt, tun, pool.Pool())
+				return rt, nil
+			}
+			rt.close()
+			return nil, err
+		case <-set.ctx.Done():
+			rt.close()
+			return nil, set.ctx.Err()
+		case <-sig.Done():
+			rt.close()
+			return nil, fmt.Errorf("%s: signaling closed before data channel ready", sessionID)
+		case <-time.After(relayTransportTimeout):
+			rt.close()
+			return nil, fmt.Errorf("%s: data channel readiness timeout", sessionID)
+		}
 	case <-set.ctx.Done():
 		rt.close()
 		return nil, set.ctx.Err()

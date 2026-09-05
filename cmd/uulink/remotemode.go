@@ -30,6 +30,7 @@ type remoteConfigOptions struct {
 	remoteHost    string
 	remotePort    string
 	capability    string
+	p2pTimeout    time.Duration
 }
 
 func runRemoteConfigController(client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options remoteConfigOptions) error {
@@ -72,6 +73,7 @@ func runRemoteConfigController(client *api.Client, cfg *auth.Config, secPolicy t
 		rules:         rules,
 		lanDiscovery:  options.lanDiscovery || remoteCfg.LANMOTD != "",
 		lanMotd:       lanMotd,
+		p2pTimeout:    options.p2pTimeout,
 	})
 }
 
