@@ -194,17 +194,6 @@ func (s *sessionSet) remove(id string) {
 	}
 }
 
-func (s *sessionSet) find(id string) *sessionRuntime {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, rt := range s.sessions {
-		if rt.id == id {
-			return rt
-		}
-	}
-	return nil
-}
-
 func (s *sessionSet) fail(err error) {
 	select {
 	case s.failed <- err:
