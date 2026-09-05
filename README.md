@@ -15,7 +15,7 @@ uulink is a lightweight TCP port forwarding tool built on the NetEase UU Remote 
 - P2P direct connection with NAT traversal: Automatically prioritizes direct peer-to-peer tunnels, falling back to official relay nodes when direct traversal is restricted.
 - Bidirectional multi-port forwarding: Forward ports in both directions over a single session (controller to server and server to controller).
 - Batch mapping rules: Define multiple local-to-remote port mappings in a configuration file for instant batch activation.
-- Terminal QR code login: Generate a login QR code directly in the terminal to authenticate and write credentials into the configuration file.
+- Headless account login: Prints an official login link to the terminal for you to open or scan on the UU Remote mobile client, then writes the resulting credentials into the configuration file. (No QR image is rendered; the link itself is printed.)
 - Share code mode: Connect using temporary remote-assistance share codes without requiring devices to belong to the same account.
 - Cross-platform: Runs on macOS, Linux, and Windows.
 - Container-ready: Multi-architecture Docker images (`linux/amd64`, `linux/arm64`) published by CI for headless deployments.
@@ -36,21 +36,26 @@ GOOS=windows GOARCH=amd64 go build -o uulink.exe ./cmd/uulink
 
 ### 2. Initialize Configuration
 
-Create a configuration file from the template:
+`uulink` creates `config.json` with a fresh client identity on its first run, so
+no manual setup is needed to get started.
 
-```bash
-cp config.example.json config.json
-```
-
-See [config.example.json](config.example.json) for reference.
+[config.example.json](config.example.json) documents every supported field and is
+useful as a reference when you want to pre-declare mappings or a security policy.
+Copy it only for those fields — its `jwt`, `client_id`, `device_id`, and `user_id`
+entries are placeholders, and leaving them in place makes account commands fail
+with `code 1001: 无效的请求参数` until the login step below overwrites them.
 
 ### 3. Log In to Your Account
 
-Run the following command to generate a login QR code:
+Request the login QR code:
 
 ```bash
 ./uulink -login-qrcode
 ```
+
+On a config that has never been used, uulink registers a device identity with UU
+Remote first and stores it, because the login handshake has to identify this
+machine. That happens automatically and only once.
 
 The terminal will display a login QR code URL. Open or scan this link on your mobile client to authorize the login. The credentials will be saved directly to `config.json`.
 
@@ -73,17 +78,21 @@ Example output:
 ```text
 DEVICE_ID                NAME             STATUS         PLAT     CLIENT_ID    VERSION
 --------                 ----             ------         ----     ---------    -------
-aeawqa5txeafoxl4         MyMac            CONNECTED      4        c1a2b3c4     4.38.0
-aeawn7l56uabjgfc         HomePC           CONNECTED      1        d5e6f7a8     2.2.2.2400
+aeawqa5txeafoxl4         MyMac            CONNECTED      4                     4.38.0
+aeawn7l56uabjgfc         HomePC           CONNECTED      1                     2.2.2.2400
 ```
 
-Note the `DEVICE_ID` of the target machine you want to connect to.
+Note the `DEVICE_ID` of the target machine you want to connect to. The
+`CLIENT_ID` column is normally blank because the device listing API does not
+return that field.
 
 ## Usage
 
 ### Method 1: Same-Account Device Pairing (Recommended)
 
-Use this method when both machines are registered under the same UU Remote account.
+Use this method when both machines are registered under the same UU Remote
+account. Both endpoints must be logged in; `-serve` on a config without
+credentials fails with `code 1001: 无效的请求参数`.
 
 1. Start the server on the target (controlled) machine:
 
@@ -154,13 +163,21 @@ Use this method when machines belong to different accounts or for temporary acce
 
 ```bash
 # Start an unbound guest server (no login required on this machine)
-./uulink -unbound-guest-serve -local 19081 -remote-port 18090
+./uulink -unbound-guest-serve -sessions 1 -local 19081 -remote-port 18090
 ```
 
-The terminal will display a `connect_id` and an 8-character `connect_code`:
+With `-sessions 1` the terminal displays one `connect_id` and an 8-character
+`connect_code`:
 
 ```text
 INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
+```
+
+The default pooled server (`-sessions 4`) instead opens one room per session and
+prints the whole set on a single line, for direct use as flag values:
+
+```text
+INFO multi-session guest shares ready (4 sessions): -share-id 266444253,266444254,... -share-code 6W44YBPL,7X55ZCQM,...
 ```
 
 2. Connect from the controlling machine using your credentials and the share code:
@@ -169,17 +186,20 @@ INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
 ./uulink -share -share-id 266444253 -share-code 6W44YBPL -local 19090 -remote-port 18091
 ```
 
-Alternatively, connect using an ephemeral guest identity (no login required on the controller machine either):
-
-```bash
-./uulink -share-guest -share-id 266444253 -share-code 6W44YBPL -local 19090 -remote-port 18091
-```
-
 Once connected, bidirectional port forwarding between the two endpoints is active immediately.
+
+The controller must be logged in. `-share-guest`, which joins with an ephemeral
+guest identity so that neither side needs an account, is rejected by the API —
+see [Known Issues](#known-issues).
 
 ### Method 4: Fixed Custom Verification Code Mode
 
-Use this method when you want to establish access using a static, memorable password rather than temporary random codes. Neither endpoint requires a logged-in NetEase account; a missing `config.json` is created automatically with a stable client identity.
+Use this method when you want to establish access using a static, memorable
+password rather than temporary random codes. The server side needs no account: a
+missing `config.json` is created automatically with a stable client identity.
+The connecting side, however, must be logged in: `-custom-connect` falls back to
+an ephemeral guest identity when the config has no `jwt`, and the API rejects
+guest identities on share joins (see [Known Issues](#known-issues)).
 
 1. Start the server with a custom code (8-16 alphanumeric characters containing both letters and digits):
 
@@ -194,7 +214,7 @@ INFO custom assistance ready: connect_id=266444253 custom_code=MyPass123
 INFO client command: uulink -custom-connect 266444253 -custom-code MyPass123
 ```
 
-If `-custom-code` is omitted, `uulink` generates a compliant code and prints it. The server saves its device identity, connect ID, and custom code to `config.json`, so restarting it keeps the same connect ID and code.
+If `-custom-code` is omitted, `uulink` generates a compliant code and prints it. The server saves its device identity, connect ID, and custom code to `config.json`, so restarting it keeps the same connect ID and code. (`-custom-serve` implies a single session, which is what makes this persistence happen; a pooled `-unbound-guest-serve` does not persist anything.)
 
 2. Connect from the client using the connect ID and custom code:
 
@@ -216,7 +236,13 @@ You can also specify `share_id` and `custom_code` in `config.json` for one-comma
 
 ### Method 5: Remote Configuration Distribution (tslink-Compatible Zero-Config Mode)
 
-Use this method for zero-friction distribution to friends or community players. The client fetches share credentials and mapping rules from an HTTP(S) URL (or a local file path) and joins as a guest; no login is required.
+Use this method for zero-friction distribution to friends or community players. The client fetches share credentials and mapping rules from an HTTP(S) URL (or a local file path).
+
+The client joins with its own account when `config.json` contains a `jwt`, and
+otherwise falls back to an ephemeral guest identity. Only the logged-in variant
+works: the API does not let guest identities join shares (see
+[Known Issues](#known-issues)), so recipients of a distributed client still need
+to log in once, even though the machine being shared does not.
 
 1. Publish or host a remote JSON configuration (e.g. on a web server, Cloudflare Worker, or GitHub Gist):
 
@@ -260,10 +286,16 @@ Users can simply run `./mc-link` without passing any arguments; a `config.json` 
 Multi-architecture images (`linux/amd64`, `linux/arm64`) are built and published by CI to this repository's GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/wsyzxjn/uulink:latest
+# Currently the only published moving tag (see the note below):
+docker pull ghcr.io/wsyzxjn/uulink:edge
 ```
 
 Available tags: `latest` and semantic versions (`1.2.3`, `1.2`, `1`) from `v*` releases, `edge` from the `main` branch, and `sha-<commit>` for every build.
+
+> **No release has been published yet.** Until a `v*` tag runs the release
+> workflow, only `edge` and `sha-<commit>` exist, and pulling `latest` fails.
+> Use `ghcr.io/wsyzxjn/uulink:edge` (or set `UULINK_IMAGE` for Compose) in the
+> meantime.
 
 ### Run
 
@@ -273,13 +305,13 @@ The image sets `WORKDIR /data`, so the default `-config` path resolves to `/data
 docker volume create uulink-data
 
 # Log in once (interactive terminal required for the QR code)
-docker run --rm -it -v uulink-data:/data ghcr.io/wsyzxjn/uulink:latest -login
+docker run --rm -it --network host -v uulink-data:/data ghcr.io/wsyzxjn/uulink:edge -login
 
 # Then run the forwarder
 docker run -d --name uulink --restart unless-stopped \
   --network host --hostname uulink-docker \
   -v uulink-data:/data \
-  ghcr.io/wsyzxjn/uulink:latest -device TARGET_DEVICE_ID -local-host 0.0.0.0 -mapping 25565:25565
+  ghcr.io/wsyzxjn/uulink:edge -device TARGET_DEVICE_ID -local-host 0.0.0.0 -mapping 25565:25565
 ```
 
 Replace `TARGET_DEVICE_ID` with the ID of a remote device running `uulink -serve`. Use `-list` to find device IDs.
@@ -294,7 +326,7 @@ UULINK_DEVICE=TARGET_DEVICE_ID docker compose up -d
 UULINK_DEVICE=TARGET_DEVICE_ID docker compose up -d --build
 
 # Pin a specific tag
-UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.0 docker compose up -d
+UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.1 docker compose up -d
 ```
 
 ### Deployment notes
@@ -362,7 +394,7 @@ Field details:
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
 - `sessions`: Optional relay session pool size for `-unbound-guest-serve`. Defaults to `4`; set `1` to serve a single session. The `-sessions` flag overrides it.
 - `share_id`, `share_code`, `custom_code`: Optional defaults for share joins (`-share`, `-custom-connect`). A custom-code server also records its connect ID and code here.
-- `unbound_client_id`, `unbound_device_id`: Written by `-unbound-guest-serve` and `-custom-serve` so the accountless device keeps the same connect ID across restarts.
+- `unbound_client_id`, `unbound_device_id`: Written by `-unbound-guest-serve` and `-custom-serve` so the accountless device keeps the same connect ID across restarts. Only the single-session server persists them: with a pooled `-unbound-guest-serve` (the default `-sessions 4`) the identity is regenerated on every start, and both the connect IDs and codes change. Use `-sessions 1` when a stable connect ID matters.
 
 Incoming `CONNECT` requests are authorized by the receiving process. Both endpoints use the same mapping schema, and either endpoint may expose local listeners that reach services on the other endpoint, subject to the receiving endpoint's `allow_lan` and `allowed_ports` policy.
 
@@ -388,7 +420,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
 | `-rule-id <id>` | Target registered rule ID on remote device | - |
 | `-transport <mode>` | WebRTC transport policy for controller sessions: `auto` or `relay` | `auto` |
-| `-sessions <n>` | Relay session pool size for `-unbound-guest-serve` (`1` disables pooling) | `4` |
+| `-sessions <n>` | Relay session pool size for `-unbound-guest-serve` (`1` disables pooling and is required to persist the accountless identity) | `4` |
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
@@ -402,6 +434,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-share-control-mode` | Query remote assistance control mode and exit | - |
 | `-share-id <id>` | Remote assistance connect ID | - |
 | `-share-code <code>` | Remote assistance verification code | - |
+| `-share-control-id <id>` | Controller control ID for `-share-confirmation` | generated |
 | `-custom-serve` | Run assistance server with custom verification code mode | - |
 | `-custom-code <code>` | Custom verification code (8-16 alphanumeric characters) | - |
 | `-custom-connect <id>` | Connect ID of the assistance server to connect to | - |
@@ -415,6 +448,30 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 
 Relayed connections are rate limited per TURN allocation. `-unbound-guest-serve` therefore opens one guest room per pooled session (default `4`) and prints a comma-separated `-share-id`/`-share-code` pair. Pass those values to `-share` (or `-share-guest`) on the controller and each TCP stream is pinned to one of the sessions, so the sessions share the load while every stream stays in order. Use `-sessions 1` to run a single session.
 
+## Known Issues
+
+- **The controlling side must be logged in.** A share join performed with an
+  ephemeral guest identity — `-share-guest`, or `-custom-connect` / `-config-url`
+  on a config without a `jwt` — always fails with
+  `code 1002: 查询对象不存在`. This is a server-side restriction rather than a
+  missing step in uulink: the API scopes share lookups to logged-in users, and no
+  guest-namespace join endpoint exists. Probing confirmed that the guest token
+  itself is accepted (omitting it returns `1120`, not `1002`), that
+  `/api/v2/room/join/share/by_code` and its v1 twin both answer `1002` for
+  guests while every `/api/v1/guest/room/join/...` candidate returns HTTP 404,
+  and that the result is identical for temporary-code and custom-code shares and
+  unchanged by creating a guest room first. The *served* side can still stay
+  accountless, which is what Methods 3, 4, and 5 are for; only the connecting
+  side needs an account. uulink now reports this with an explicit message
+  instead of the raw API error.
+- **A restarted server can strand its controller.** The controlled side keeps a
+  stale WebRTC session when a controller disappears, and the reconnecting
+  controller's ICE candidates are then rejected
+  (`dropping candidate ... doesn't match the current ufrags`), leaving it looping
+  on `transport relay required: connection not ready within 30s`. Recover by
+  restarting in order: stop the controller, restart the server, then start the
+  controller.
+
 ## FAQ
 
 **Q: The client reports that the target device is offline or cannot connect.**
@@ -426,6 +483,11 @@ Relayed connections are rate limited per TURN allocation. `-unbound-guest-serve`
 **Q: What is the expected transfer speed and latency?**
 
 Whenever network conditions allow, uulink negotiates a direct peer-to-peer (P2P) connection. Traffic flows directly between the two endpoints without intermediate server bottlenecks, bound only by your actual upload and download bandwidth. If both sides are behind symmetric NATs that prevent direct traversal, traffic automatically falls back to official relay nodes.
+
+Note that NAT type is not the only factor: the signaling response can mark a room
+as relay-only (`server_requires_relay=true`), which is common for share and guest
+rooms. In that case every stream goes through a TURN relay even when both peers
+are directly reachable, and latency is dominated by the relay path.
 
 **Q: Can other devices on my local network access the forwarded port?**
 
