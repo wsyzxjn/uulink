@@ -667,3 +667,11 @@ func decodeFrameForTunnel(data []byte) *gvpb.PortMappingFrame {
 func streamKey(ruleID, streamID string) string {
 	return ruleID + "\x00" + streamID
 }
+
+// CloseStreams aborts only streams whose session has failed. Data from an old
+// TCP stream must never be moved to a replacement transport without replay.
+func (t *Tunnel) CloseStreams(refs []StreamRef) {
+	for _, ref := range refs {
+		t.closeStream(ref.RuleID, ref.StreamID, false)
+	}
+}

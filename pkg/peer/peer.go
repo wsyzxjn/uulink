@@ -134,6 +134,8 @@ type Peer struct {
 	selectedPair           *webrtc.ICECandidatePair
 	statsDone              chan struct{}
 	statsRunning           bool
+	restartRequested       chan struct{}
+	restartOnce            sync.Once
 }
 
 type soacEvent struct {
@@ -164,16 +166,17 @@ func NewController(cfg *Config) (*Peer, error) {
 	}
 
 	p := &Peer{
-		textOpen:      make(chan struct{}),
-		sig:           cfg.Signal,
-		appControlID:  appControlID,
-		sdpOfferFile:  cfg.SDPOfferFile,
-		sdpAnswerFile: cfg.SDPAnswerFile,
-		transportMode: cfg.TransportMode,
-		onBinaryData:  cfg.OnBinaryData,
-		onSignalData:  cfg.OnSignalData,
-		ackCh:         make(chan *ControlAckData, 1),
-		statsDone:     make(chan struct{}),
+		textOpen:         make(chan struct{}),
+		restartRequested: make(chan struct{}),
+		sig:              cfg.Signal,
+		appControlID:     appControlID,
+		sdpOfferFile:     cfg.SDPOfferFile,
+		sdpAnswerFile:    cfg.SDPAnswerFile,
+		transportMode:    cfg.TransportMode,
+		onBinaryData:     cfg.OnBinaryData,
+		onSignalData:     cfg.OnSignalData,
+		ackCh:            make(chan *ControlAckData, 1),
+		statsDone:        make(chan struct{}),
 	}
 
 	// Register soac handler before starting
@@ -237,12 +240,13 @@ func NewController(cfg *Config) (*Peer, error) {
 // the UULink-side replacement for running the official controlled client.
 func NewControlled(cfg *Config) (*Peer, error) {
 	p := &Peer{
-		textOpen:        make(chan struct{}),
-		sig:             cfg.Signal,
-		onBinaryData:    cfg.OnBinaryData,
-		onSignalData:    cfg.OnSignalData,
-		controlledReady: make(chan struct{}),
-		statsDone:       make(chan struct{}),
+		textOpen:         make(chan struct{}),
+		restartRequested: make(chan struct{}),
+		sig:              cfg.Signal,
+		onBinaryData:     cfg.OnBinaryData,
+		onSignalData:     cfg.OnSignalData,
+		controlledReady:  make(chan struct{}),
+		statsDone:        make(chan struct{}),
 	}
 
 	// A controller can emit its offer immediately after room/create returns,
@@ -456,7 +460,9 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
 	}
+	p.mu.Lock()
 	p.pc = pc
+	p.mu.Unlock()
 
 	pc.OnICECandidate(p.onICECandidate)
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -715,6 +721,11 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 	p.soacMu.Lock()
 	defer p.soacMu.Unlock()
 
+	select {
+	case <-p.statsDone:
+		return
+	default:
+	}
 	msg, ok := parseSOACEvent(ev)
 	if !ok {
 		logging.Errorf("[peer] controlled soac parse error")
@@ -724,6 +735,10 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 	switch msg.Data.Type {
 	case "offer":
 		if p.pc != nil {
+			if msg.Data.IceID != "" && msg.Data.IceID != p.iceID {
+				p.restartOnce.Do(func() { close(p.restartRequested) })
+				logging.Infof("[peer] replacement controller offer; requesting fresh session")
+			}
 			logging.Debugf("[peer] controlled peer already has an offer; ignoring duplicate")
 			return
 		}
@@ -735,6 +750,9 @@ func (p *Peer) handleControlledSOAC(ev *signaling.Event) {
 		}
 
 	case "candidate":
+		if msg.Data.IceID != "" && msg.Data.IceID != p.iceID {
+			return
+		}
 		if p.pc == nil {
 			logging.Debugf("[peer] controlled candidate before offer ignored")
 			return
@@ -1364,9 +1382,9 @@ func (p *Peer) Close() error {
 	}
 	p.mu.Unlock()
 
-	p.soacMu.Lock()
+	p.mu.Lock()
 	pc := p.pc
-	p.soacMu.Unlock()
+	p.mu.Unlock()
 	if pc != nil {
 		return pc.Close()
 	}
@@ -1413,4 +1431,18 @@ func randomUUID() (string, error) {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// RestartRequested closes when this room receives a new controller incarnation.
+func (p *Peer) RestartRequested() <-chan struct{} { return p.restartRequested }
+
+// ConnectionState returns a synchronized snapshot for transport watchdogs.
+func (p *Peer) ConnectionState() string {
+	p.mu.Lock()
+	pc := p.pc
+	p.mu.Unlock()
+	if pc == nil {
+		return "new"
+	}
+	return pc.ConnectionState().String()
 }

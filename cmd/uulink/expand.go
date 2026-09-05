@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -46,11 +47,12 @@ const (
 
 // expandMessage is the wire format of the in-band pool expansion exchange.
 type expandMessage struct {
-	UULink   int           `json:"uulink"`
-	Type     string        `json:"type"`
-	Sessions int           `json:"sessions,omitempty"`
-	Shares   []expandShare `json:"shares,omitempty"`
-	Message  string        `json:"message,omitempty"`
+	RequestID string        `json:"request_id,omitempty"`
+	UULink    int           `json:"uulink"`
+	Type      string        `json:"type"`
+	Sessions  int           `json:"sessions,omitempty"`
+	Shares    []expandShare `json:"shares,omitempty"`
+	Message   string        `json:"message,omitempty"`
 }
 
 // expandShare is one additional room the controller may join.
@@ -96,8 +98,11 @@ func sendExpandMessage(p textSender, msg *expandMessage) error {
 
 // expandNegotiator collects the peer's reply to one expansion request.
 type expandNegotiator struct {
-	mu     sync.Mutex
-	result chan *expandMessage
+	mu        sync.Mutex
+	requestMu sync.Mutex
+	next      uint64
+	active    string
+	result    chan *expandMessage
 }
 
 func newExpandNegotiator() *expandNegotiator {
@@ -115,6 +120,9 @@ func (n *expandNegotiator) handle(data []byte) bool {
 	case expandTypeOffer, expandTypeError:
 		n.mu.Lock()
 		defer n.mu.Unlock()
+		if msg.RequestID != "" && msg.RequestID != n.active {
+			return true
+		}
 		select {
 		case n.result <- msg:
 		default:
@@ -127,7 +135,22 @@ func (n *expandNegotiator) handle(data []byte) bool {
 
 // request asks the peer for extra sessions and returns the offered rooms.
 func (n *expandNegotiator) request(p textSender, extra int) ([]expandShare, error) {
-	if err := sendExpandMessage(p, &expandMessage{Type: expandTypeRequest, Sessions: extra}); err != nil {
+	return n.requestContext(context.Background(), p, extra)
+}
+
+func (n *expandNegotiator) requestContext(ctx context.Context, p textSender, extra int) ([]expandShare, error) {
+	n.requestMu.Lock()
+	defer n.requestMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	n.mu.Lock()
+	n.next++
+	n.active = fmt.Sprint(n.next)
+	id := n.active
+	n.mu.Unlock()
+
+	if err := sendExpandMessage(p, &expandMessage{Type: expandTypeRequest, Sessions: extra, RequestID: id}); err != nil {
 		return nil, err
 	}
 	select {
@@ -149,6 +172,8 @@ func (n *expandNegotiator) request(p textSender, extra int) ([]expandShare, erro
 			seen[share.ID] = true
 		}
 		return msg.Shares, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-time.After(expandOfferTimeout):
 		return nil, fmt.Errorf("peer did not answer the expansion request within %s", expandOfferTimeout)
 	}
@@ -158,170 +183,191 @@ func (n *expandNegotiator) request(p textSender, extra int) ([]expandShare, erro
 // shares a controller may join, and is expected to be safe to call once.
 type expandMinter func(extra int) ([]expandShare, error)
 
-// serveExpandRequests answers expansion requests from the controller. Only the
-// first request is honoured: the pool is sized once, and re-minting rooms on
-// every request would let a reconnect loop leak guest devices.
+// Requests are replayable. The minter reconciles a bounded set of room slots,
+// so repeated requests repair failed rooms instead of leaking guest identities.
 func serveExpandRequests(p textSender, maxExtra int, mint expandMinter) func([]byte) {
-	var once sync.Once
+	var mu sync.Mutex
+	var previous *expandMessage
 	return func(data []byte) {
 		msg, ok := parseExpandMessage(data)
 		if !ok || msg.Type != expandTypeRequest {
 			return
 		}
-		once.Do(func() {
-			extra := msg.Sessions
-			if extra > maxExtra {
-				extra = maxExtra
-			}
-			if extra > maxExpandSessions {
-				extra = maxExpandSessions
-			}
-			if extra <= 0 {
-				_ = sendExpandMessage(p, &expandMessage{
-					Type:    expandTypeError,
-					Message: "this endpoint is configured for a single session",
-				})
-				return
-			}
+		mu.Lock()
+		defer mu.Unlock()
+		if previous != nil && previous.RequestID == msg.RequestID {
+			_ = sendExpandMessage(p, previous)
+			return
+		}
+		extra := min(msg.Sessions, maxExtra, maxExpandSessions)
+		reply := &expandMessage{RequestID: msg.RequestID, Type: expandTypeOffer}
+		if extra <= 0 {
+			reply.Type = expandTypeError
+			reply.Message = "this endpoint is configured for a single session"
+		} else {
 			logging.Infof("[expand] controller requested %d additional session(s)", extra)
 			shares, err := mint(extra)
 			if err != nil {
-				logging.Errorf("[expand] could not create additional rooms: %v", err)
-				_ = sendExpandMessage(p, &expandMessage{Type: expandTypeError, Message: err.Error()})
-				return
+				reply.Type = expandTypeError
+				reply.Message = err.Error()
+			} else {
+				reply.Shares = shares
 			}
-			if err := sendExpandMessage(p, &expandMessage{Type: expandTypeOffer, Shares: shares}); err != nil {
-				logging.Errorf("[expand] could not send the room offer: %v", err)
-				return
-			}
-			logging.Infof("[expand] offered %d additional room(s) to the controller", len(shares))
-		})
-	}
-}
-
-// mintExpansionRooms creates extra guest rooms on the served side and attaches
-// each one to the running tunnel, so the controller can spread streams over
-// several TURN allocations. Rooms that fail to come up are skipped rather than
-// failing the whole request: a smaller pool still beats a single session.
-func mintExpansionRooms(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, extra int) ([]expandShare, error) {
-	hostname, err := cfg.EffectiveHostname()
-	if err != nil {
-		return nil, fmt.Errorf("resolve hostname: %w", err)
-	}
-
-	// Each pooled room needs its own accountless device, so the identity of the
-	// published share is never reused or disturbed.
-	roomOptions := shareOptions
-	roomOptions.ConfigPath = ""
-	roomOptions.PublishURL = ""
-
-	// Registering a guest device, creating its room and waiting for the connect
-	// ID costs several seconds each, so the rooms are prepared concurrently.
-	// The tunnel keeps serving on its primary session throughout.
-	type mintResult struct {
-		share expandShare
-		err   error
-	}
-	results := make([]mintResult, extra)
-	var wg sync.WaitGroup
-	for index := range extra {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sessionID := fmt.Sprintf("expand-%d", index+1)
-			sessionCfg := *cfg
-			sessionCfg.UnboundClientID = ""
-			sessionCfg.UnboundDeviceID = ""
-			sessionCfg.CustomCode = ""
-			sessionCfg.ShareID = ""
-
-			rt, share, err := startPooledGuestServer(api.NewClient(&sessionCfg), tun, pool, set, sessionID,
-				fmt.Sprintf("%s-x%d", hostname, index+1), roomOptions, nil, policy)
-			if err != nil {
-				results[index] = mintResult{err: err}
-				return
-			}
-			set.add(rt)
-			results[index] = mintResult{share: expandShare{ID: share.ConnectID, Code: share.ConnectCode}}
-		}()
-	}
-	wg.Wait()
-
-	shares := make([]expandShare, 0, extra)
-	for index, result := range results {
-		if result.err != nil {
-			logging.Warnf("[expand] expand-%d could not be created: %v", index+1, result.err)
-			continue
 		}
-		shares = append(shares, result.share)
+		previous = reply
+		if err := sendExpandMessage(p, reply); err != nil {
+			logging.Warnf("[expand] offer failed: %v", err)
+		}
 	}
-	if len(shares) == 0 {
-		return nil, fmt.Errorf("no additional room could be created")
-	}
-	return shares, nil
 }
 
-// expandControllerPool negotiates extra rooms with the served side and joins
-// them, widening the pool to target sessions. It runs on the adaptive pool's
-// expansion callback, off the connection path, so a failure only leaves the
-// tunnel on its single session.
-func expandControllerPool(client *api.Client, cfg *auth.Config, negotiator *expandNegotiator, p *peer.Peer, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, target int, transportMode peer.TransportMode, secPolicy tunnel.SecurityPolicy) error {
-	extra := target - pool.Pool().SessionCount()
-	if extra <= 0 {
+// Every slot keeps its own guest identity across repair attempts. Healthy rooms
+// and their TCP connections remain untouched when another slot is repaired.
+func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, options guestShareOptions, policy tunnel.SecurityPolicy) expandMinter {
+	type slot struct {
+		config auth.Config
+		rt     *sessionRuntime
+		share  expandShare
+	}
+	slots := make([]slot, maxExpandSessions)
+	for i := range slots {
+		slots[i].config = *cfg
+		slots[i].config.UnboundClientID = ""
+		slots[i].config.UnboundDeviceID = ""
+		slots[i].config.CustomCode = ""
+		slots[i].config.ShareID = ""
+	}
+	options.ConfigPath = ""
+	options.PublishURL = ""
+	options.ControlID = ""
+	var mu sync.Mutex
+	return func(extra int) ([]expandShare, error) {
+		if !set.begin() {
+			return nil, context.Canceled
+		}
+		defer set.jobs.Done()
+		mu.Lock()
+		defer mu.Unlock()
+		if err := set.ctx.Err(); err != nil {
+			return nil, err
+		}
+		extra = min(extra, len(slots))
+		var wg sync.WaitGroup
+		for i := range extra {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slot := &slots[i]
+				if slot.rt != nil {
+					select {
+					case <-slot.rt.done:
+						slot.rt = nil
+					default:
+						return
+					}
+				}
+				copyConfig := slot.config
+				rt, share, err := startPooledGuestServer(api.NewClient(&copyConfig), tun, pool, set, nextSessionID(fmt.Sprintf("expand-%d", i+1)), fmt.Sprintf("uulink-expand-%d", i+1), options, nil, policy)
+				slot.config = copyConfig
+				if err != nil {
+					logging.Warnf("[expand] room %d repair failed: %v", i+1, err)
+					return
+				}
+				set.add(rt)
+				slot.rt = rt
+				slot.share = expandShare{ID: share.ConnectID, Code: share.ConnectCode}
+			}()
+		}
+		wg.Wait()
+		if err := set.ctx.Err(); err != nil {
+			return nil, err
+		}
+		var shares []expandShare
+		for i := range extra {
+			if slots[i].rt != nil {
+				select {
+				case <-slots[i].rt.done:
+				default:
+					shares = append(shares, slots[i].share)
+				}
+			}
+		}
+		if len(shares) == 0 {
+			return nil, fmt.Errorf("no additional room could be created")
+		}
+		return shares, nil
+	}
+}
+
+// maintainControllerPool is the sole repair coordinator. It retries partial
+// expansion with capped backoff and never rejoins an already healthy room.
+func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegotiator, p *peer.Peer, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, target int, mode peer.TransportMode, policy tunnel.SecurityPolicy) error {
+	if !set.begin() {
 		return nil
 	}
+	defer set.jobs.Done()
 	if cfg.JWT == "" {
-		// A guest identity cannot join a share at all, so widening the pool
-		// would only produce a series of 1002 failures.
-		logging.Infof("[expand] staying on a single session: pool expansion needs a logged-in account")
 		return nil
 	}
-
-	// The mode callback fires while ICE is still selecting a pair, so the
-	// control channel usually is not up yet.
-	select {
-	case <-p.TextChannelOpen():
-	case <-time.After(expandChannelTimeout):
-		return fmt.Errorf("control channel did not open within %s", expandChannelTimeout)
-	}
-
-	logging.Infof("[expand] relay detected; asking the served side for %d more session(s)", extra)
-	shares, err := negotiator.request(p, extra)
-	if err != nil {
-		return err
-	}
-
-	// Joining is another round of room joins and WebRTC handshakes, so the
-	// offered rooms are taken in parallel as well.
-	errs := make([]error, len(shares))
-	var wg sync.WaitGroup
-	for index, share := range shares {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sessionID := fmt.Sprintf("expand-%d", index+1)
-			rt, err := startPooledController(client, cfg, tun, pool, set, sessionID,
-				shareEntry(share), false, transportMode, nil, secPolicy)
-			if err != nil {
-				errs[index] = err
-				return
+	known := make(map[string]*sessionRuntime)
+	return reconcileLoop(set.ctx, func(ctx context.Context) error {
+		for id, rt := range known {
+			select {
+			case <-rt.done:
+				delete(known, id)
+			default:
 			}
-			set.add(rt)
-		}()
-	}
-	wg.Wait()
-
-	joined := 0
-	for index, err := range errs {
-		if err != nil {
-			logging.Warnf("[expand] expand-%d could not join room %s: %v", index+1, shares[index].ID, err)
-			continue
 		}
-		joined++
-	}
-	if joined == 0 {
-		return fmt.Errorf("none of the %d offered rooms could be joined", len(shares))
-	}
-	logging.Infof("[expand] pool widened to %d session(s)", pool.Pool().SessionCount())
-	return nil
+		if pool.Pool().SessionCount() >= target {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.TextChannelOpen():
+		case <-time.After(expandChannelTimeout):
+			return fmt.Errorf("control channel readiness timeout")
+		}
+		shares, err := n.requestContext(ctx, p, target-1)
+		if err != nil {
+			return err
+		}
+		type joined struct {
+			share expandShare
+			rt    *sessionRuntime
+		}
+		results := make([]joined, len(shares))
+		var wg sync.WaitGroup
+		for i, share := range shares {
+			if known[share.ID] != nil {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if ctx.Err() != nil {
+					return
+				}
+				rt, err := startPooledController(client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, mode, nil, policy)
+				if err != nil {
+					logging.Warnf("[recovery] join extra room failed: %v", err)
+					return
+				}
+				set.add(rt)
+				results[i] = joined{share, rt}
+			}()
+		}
+		wg.Wait()
+		for _, r := range results {
+			if r.rt != nil {
+				known[r.share.ID] = r.rt
+			}
+		}
+		count := pool.Pool().SessionCount()
+		logging.Infof("[expand] pool ready: %d/%d session(s)", count, target)
+		if count < target {
+			return fmt.Errorf("pool below target: %d/%d", count, target)
+		}
+		return nil
+	})
 }

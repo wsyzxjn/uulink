@@ -450,7 +450,7 @@ For automatic relay pooling, use `-custom-serve` on the server and join its sing
 
 `-unbound-guest-serve` also supports preparing rooms up front and printing comma-separated share IDs and codes. Pass all pairs to `-share` on the controller. These temporary room identities change after a restart.
 
-If the controller is restarted and cannot reconnect, stop it, restart the served side, then start the controller again. Automatic replacement of disconnected sessions is not yet supported.
+The tunnel now retries transient signaling and transport failures with bounded backoff. Pooled relay sessions are monitored independently: a failed session is removed, its affected TCP streams are closed, and the pool requests a replacement while healthy sessions continue serving new streams. An interrupted TCP stream cannot be moved transparently to another transport, so the application must retry that transfer.
 
 ## Known Issues
 
@@ -468,13 +468,6 @@ If the controller is restarted and cannot reconnect, stop it, restart the served
   accountless, which is what Methods 3, 4, and 5 are for; only the connecting
   side needs an account. uulink now reports this with an explicit message
   instead of the raw API error.
-- **A restarted server can strand its controller.** The controlled side keeps a
-  stale WebRTC session when a controller disappears, and the reconnecting
-  controller's ICE candidates are then rejected
-  (`dropping candidate ... doesn't match the current ufrags`), leaving it looping
-  on `transport relay required: connection not ready within 30s`. Recover by
-  restarting in order: stop the controller, restart the server, then start the
-  controller.
 
 ## FAQ
 

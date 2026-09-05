@@ -2,7 +2,7 @@ package tunnel
 
 import (
 	"errors"
-	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -67,6 +67,7 @@ type SessionPool struct {
 	rrIndex      atomic.Uint64
 	streamMap    sync.Map // stream key -> Session
 	activeCounts map[string]*int64
+	closed       bool
 }
 
 // NewSessionPool creates an empty pool with the given dispatch policy.
@@ -81,6 +82,9 @@ func (p *SessionPool) AddSession(s Session) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
 	for _, existing := range p.sessions {
 		if existing.ID() == s.ID() {
 			return
@@ -92,6 +96,45 @@ func (p *SessionPool) AddSession(s Session) {
 		p.activeCounts[s.ID()] = &count
 	}
 	logging.Infof("[pool] session %s added; active sessions: %d", s.ID(), len(p.sessions))
+}
+
+// StreamRef identifies a TCP stream whose transport was lost.
+type StreamRef struct{ RuleID, StreamID string }
+
+// RemoveSession excludes a failed path and returns its streams for local close.
+// Callers use a unique session ID for every connection incarnation.
+func (p *SessionPool) RemoveSession(id string) []StreamRef {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := p.sessions[:0]
+	for _, s := range p.sessions {
+		if s.ID() != id {
+			kept = append(kept, s)
+		}
+	}
+	p.sessions = kept
+	delete(p.activeCounts, id)
+	var refs []StreamRef
+	p.streamMap.Range(func(key, value any) bool {
+		if value.(Session).ID() == id {
+			p.streamMap.Delete(key)
+			rule, stream, _ := strings.Cut(key.(string), "\x00")
+			refs = append(refs, StreamRef{rule, stream})
+		}
+		return true
+	})
+	return refs
+}
+
+func (p *SessionPool) HasSession(id string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, s := range p.sessions {
+		if s.ID() == id {
+			return true
+		}
+	}
+	return false
 }
 
 // SessionCount returns the number of registered sessions.
@@ -107,26 +150,27 @@ func (p *SessionPool) BindStream(ruleID, streamID string, s Session) {
 	if ruleID == "" || streamID == "" || s == nil {
 		return
 	}
-	if _, loaded := p.streamMap.LoadOrStore(streamKey(ruleID, streamID), s); loaded {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := p.activeCounts[s.ID()]
+	if p.closed || count == nil {
 		return
 	}
-	p.mu.RLock()
-	if count := p.activeCounts[s.ID()]; count != nil {
+	if _, loaded := p.streamMap.LoadOrStore(streamKey(ruleID, streamID), s); !loaded {
 		atomic.AddInt64(count, 1)
 	}
-	p.mu.RUnlock()
 }
 
 // SelectSession returns the session bound to the stream, choosing and binding
 // one according to the dispatch policy when the stream is new.
 func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	key := streamKey(ruleID, streamID)
 	if existing, ok := p.streamMap.Load(key); ok {
 		return existing.(Session), nil
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if len(p.sessions) == 0 {
 		return nil, errors.New("no active sessions available in pool")
 	}
@@ -161,15 +205,15 @@ func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
 
 // ReleaseStream drops the stream binding once the stream has finished.
 func (p *SessionPool) ReleaseStream(ruleID, streamID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	val, loaded := p.streamMap.LoadAndDelete(streamKey(ruleID, streamID))
 	if !loaded {
 		return
 	}
-	p.mu.RLock()
 	if count := p.activeCounts[val.(Session).ID()]; count != nil {
 		atomic.AddInt64(count, -1)
 	}
-	p.mu.RUnlock()
 }
 
 // SendFrame implements FrameSender: the frame is routed to the session bound
@@ -179,7 +223,17 @@ func (p *SessionPool) SendFrame(msg []byte) error {
 	if frame == nil {
 		return errors.New("pool: frame is not a port mapping message")
 	}
-	session, err := p.SelectSession(frame.RuleID, frame.StreamID)
+	var session Session
+	var err error
+	if frame.Type == gvpb.TypeConnect {
+		session, err = p.SelectSession(frame.RuleID, frame.StreamID)
+	} else {
+		bound, ok := p.streamMap.Load(streamKey(frame.RuleID, frame.StreamID))
+		if !ok {
+			return errors.New("stream transport no longer exists")
+		}
+		session = bound.(Session)
+	}
 	if err != nil {
 		return err
 	}
@@ -193,19 +247,19 @@ func (p *SessionPool) SendFrame(msg []byte) error {
 // Close terminates all sessions and empties the pool.
 func (p *SessionPool) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.closed = true
+	sessions := p.sessions
+	p.sessions = nil
+	p.activeCounts = make(map[string]*int64)
+	p.streamMap.Clear()
+	p.mu.Unlock()
 	var errs []error
-	for _, s := range p.sessions {
+	for _, s := range sessions {
 		if err := s.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	p.sessions = nil
-	p.activeCounts = make(map[string]*int64)
-	if len(errs) > 0 {
-		return fmt.Errorf("close sessions: %v", errs)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // AdaptiveSessionPool keeps a single session on a direct connection and, once

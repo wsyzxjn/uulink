@@ -254,16 +254,22 @@ func run() error {
 		if targetSessions > 1 && !*customServe {
 			// Each pooled session needs its own guest identity and room; the
 			// unbound guest server is the only mode that can create them.
-			return doMultiSessionUnboundGuestServe(cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+			return recoverTunnel(*configPath, cfg, func() error {
+				return doMultiSessionUnboundGuestServe(cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+			})
 		}
-		return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+		return recoverTunnel(*configPath, cfg, func() error {
+			return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+		})
 	}
 	if *guestServe {
 		rules, err := configuredRules(cfg, *ruleIDFlag, *mappingFlag, *localHost, *localPort, *remoteHost, *remotePort)
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		return doGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+		return recoverTunnel(*configPath, cfg, func() error {
+			return doGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+		})
 	}
 	if *serveMode {
 		if *deviceID != "" {
@@ -273,7 +279,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure mappings: %w", err)
 		}
-		return doServe(client, cfg, rules, *roomFile, secPolicy, targetSessions)
+		return recoverTunnel(*configPath, cfg, func() error { return doServe(client, cfg, rules, *roomFile, secPolicy, targetSessions) })
 	}
 
 	if *configURL != "" {
@@ -311,31 +317,33 @@ func run() error {
 		}, secPolicy)
 	}
 
-	if err := runController(client, cfg, secPolicy, controllerOptions{
-		deviceID:          *deviceID,
-		allowSelf:         *allowSelf,
-		controlDeviceID:   *controlDeviceID,
-		roomFile:          *roomFile,
-		shareJoin:         *shareJoin,
-		shareConfirmation: *shareConfirmation,
-		shareControlID:    *shareControlID,
-		shareGuest:        *shareGuest,
-		shareID:           *shareID,
-		shareCode:         *shareCode,
-		ruleID:            *ruleIDFlag,
-		mapping:           *mappingFlag,
-		localHost:         *localHost,
-		localPort:         *localPort,
-		remoteHost:        *remoteHost,
-		remotePort:        *remotePort,
-		capability:        *capFlag,
-		transportMode:     transportMode,
-		pckSweep:          *pckSweep,
-		mixKCP:            *mixkcpMode,
-		targetSessions:    targetSessions,
-		lanDiscovery:      *lanDiscovery,
-		lanMotd:           *lanMotd,
-		configPath:        *configPath,
+	if err := recoverTunnel(*configPath, cfg, func() error {
+		return runController(client, cfg, secPolicy, controllerOptions{
+			deviceID:          *deviceID,
+			allowSelf:         *allowSelf,
+			controlDeviceID:   *controlDeviceID,
+			roomFile:          *roomFile,
+			shareJoin:         *shareJoin,
+			shareConfirmation: *shareConfirmation,
+			shareControlID:    *shareControlID,
+			shareGuest:        *shareGuest,
+			shareID:           *shareID,
+			shareCode:         *shareCode,
+			ruleID:            *ruleIDFlag,
+			mapping:           *mappingFlag,
+			localHost:         *localHost,
+			localPort:         *localPort,
+			remoteHost:        *remoteHost,
+			remotePort:        *remotePort,
+			capability:        *capFlag,
+			transportMode:     transportMode,
+			pckSweep:          *pckSweep,
+			mixKCP:            *mixkcpMode,
+			targetSessions:    targetSessions,
+			lanDiscovery:      *lanDiscovery,
+			lanMotd:           *lanMotd,
+			configPath:        *configPath,
+		})
 	}); err != nil {
 		return err
 	}
@@ -568,6 +576,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		peerDeviceID = controllerGuestDeviceID
 		logging.Debugf("control ConnectOptions device_id=%s auth_device_id=%s", peerDeviceID, cfg.DeviceID)
 	}
+	wired := make(chan struct{})
 	var primarySession tunnel.Session
 	var expandPool *tunnel.AdaptiveSessionPool
 	p, err := peer.NewController(&peer.Config{
@@ -577,6 +586,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		Passive:       room.IsRoomFileController,
 		TransportMode: options.transportMode,
 		OnSignalData: func(data []byte) {
+			<-wired
 			if tun != nil {
 				if frame := tunnel.DecodeFrameForTunnel(data); frame != nil && primarySession != nil {
 					if expandPool != nil {
@@ -598,9 +608,10 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	negotiator := newExpandNegotiator()
 	expandSet := newSessionSet()
 	defer expandSet.closeAll()
+	recoveryConfig := *cfg
 	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyStreamLeastLoaded,
 		func(target int) error {
-			return expandControllerPool(client, cfg, negotiator, p, tun, expandPool, expandSet, target, options.transportMode, secPolicy)
+			return maintainControllerPool(client, &recoveryConfig, negotiator, p, tun, expandPool, expandSet, target, options.transportMode, secPolicy)
 		})
 	expandPool = adaptivePool
 	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
@@ -610,7 +621,9 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 
 	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(secPolicy)
+	close(wired)
 	runErr := make(chan error, 1)
+	monitorPrimary(expandSet.ctx, p, runErr)
 	tunnelReady := make(chan struct{})
 	var tunnelReadyOnce sync.Once
 	// The LAN announcer is started from the data-channel callback and stopped
@@ -652,6 +665,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		tunnelReadyOnce.Do(func() { close(tunnelReady) })
 	})
 	defer tun.Stop()
+	defer expandSet.closeAll()
 	defer func() {
 		lanMu.Lock()
 		announcer := lanAnnouncer
@@ -691,7 +705,7 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
-	if p.TransportMode() == peer.TransportRelay {
+	{
 		select {
 		case <-tunnelReady:
 			logging.Infof("transport relay ready")
@@ -955,11 +969,13 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 	}
 
 	var tun *tunnel.Tunnel
+	wired := make(chan struct{})
 	var primarySession tunnel.Session
 	var adaptivePool *tunnel.AdaptiveSessionPool
 	p, err := peer.NewControlled(&peer.Config{
 		Signal: sig,
 		OnSignalData: func(data []byte) {
+			<-wired
 			if tun != nil {
 				if frame := tunnel.DecodeFrameForTunnel(data); frame != nil && primarySession != nil {
 					adaptivePool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
@@ -992,13 +1008,13 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 
 	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
 	tun.SetSecurityPolicy(policy)
+	close(wired)
 
 	expandSet := newSessionSet()
 	defer expandSet.closeAll()
-	p.OnTextMessage(serveExpandRequests(p, targetSessions-1, func(extra int) ([]expandShare, error) {
-		return mintExpansionRooms(cfg, tun, adaptivePool, expandSet, shareOptions, policy, extra)
-	}))
+	p.OnTextMessage(serveExpandRequests(p, targetSessions-1, newExpansionMinter(cfg, tun, adaptivePool, expandSet, shareOptions, policy)))
 	runErr := make(chan error, 1)
+	monitorPrimary(expandSet.ctx, p, runErr)
 	p.OnFileChannelOpen(func() {
 		if len(rules) > 0 {
 			if err := tun.Start(); err != nil {
@@ -1015,6 +1031,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		logSecurityPolicy(policy)
 	})
 	defer tun.Stop()
+	defer expandSet.closeAll()
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)

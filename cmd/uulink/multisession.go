@@ -91,17 +91,42 @@ type multiSessionControllerOptions struct {
 
 // sessionRuntime owns the signaling connection and peer of one pooled session.
 type sessionRuntime struct {
-	id   string
-	sig  *signaling.Client
-	peer *peer.Peer
+	id      string
+	sig     *signaling.Client
+	peer    *peer.Peer
+	once    sync.Once
+	mu      sync.Mutex
+	closed  bool
+	done    chan struct{}
+	cleanup func()
 }
 
 func (s *sessionRuntime) close() {
-	if s.peer != nil {
-		_ = s.peer.Close()
-	}
-	if s.sig != nil {
-		_ = s.sig.Close()
+	s.once.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		if s.cleanup != nil {
+			s.cleanup()
+		}
+		s.mu.Unlock()
+		if s.peer != nil {
+			_ = s.peer.Close()
+		}
+		if s.sig != nil {
+			_ = s.sig.Close()
+		}
+		if s.done != nil {
+			close(s.done)
+		}
+	})
+}
+
+// activate serializes readiness callbacks with teardown.
+func (s *sessionRuntime) activate(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		fn()
 	}
 }
 
@@ -114,10 +139,24 @@ type sessionSet struct {
 	ready    chan struct{}
 	once     sync.Once
 	closed   bool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	jobs     sync.WaitGroup
 }
 
 func newSessionSet() *sessionSet {
-	return &sessionSet{failed: make(chan error, 1), ready: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &sessionSet{failed: make(chan error, 1), ready: make(chan struct{}), ctx: ctx, cancel: cancel}
+}
+
+func (s *sessionSet) begin() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.jobs.Add(1)
+	return true
 }
 
 func (s *sessionSet) add(rt *sessionRuntime) {
@@ -127,8 +166,43 @@ func (s *sessionSet) add(rt *sessionRuntime) {
 		rt.close()
 		return
 	}
+	select {
+	case <-rt.done:
+		s.mu.Unlock()
+		return
+	default:
+	}
 	s.sessions = append(s.sessions, rt)
 	s.mu.Unlock()
+}
+
+func (s *sessionSet) remove(id string) {
+	s.mu.Lock()
+	var removed *sessionRuntime
+	kept := s.sessions[:0]
+	for _, rt := range s.sessions {
+		if rt.id == id {
+			removed = rt
+		} else {
+			kept = append(kept, rt)
+		}
+	}
+	s.sessions = kept
+	s.mu.Unlock()
+	if removed != nil {
+		removed.close()
+	}
+}
+
+func (s *sessionSet) find(id string) *sessionRuntime {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rt := range s.sessions {
+		if rt.id == id {
+			return rt
+		}
+	}
+	return nil
 }
 
 func (s *sessionSet) fail(err error) {
@@ -143,10 +217,12 @@ func (s *sessionSet) closeAll() {
 	sessions := append([]*sessionRuntime(nil), s.sessions...)
 	s.sessions = nil
 	s.closed = true
+	s.cancel()
 	s.mu.Unlock()
 	for _, rt := range sessions {
 		rt.close()
 	}
+	s.jobs.Wait()
 }
 
 // watchSignaling turns an unexpected signaling disconnect into a pool failure.
@@ -288,7 +364,9 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 	if err != nil {
 		return nil, err
 	}
-	rt := &sessionRuntime{id: sessionID, sig: sig}
+	rt := &sessionRuntime{id: sessionID, sig: sig, done: make(chan struct{})}
+	// Cleanup is installed before readiness can race with a timeout.
+	rt.cleanup = func() { tun.CloseStreams(pool.Pool().RemoveSession(sessionID)) }
 
 	p, err := peer.NewController(&peer.Config{
 		Signal:        sig,
@@ -315,7 +393,7 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 			}
 			return
 		}
-		pool.Pool().AddSession(tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil))
+		rt.activate(func() { pool.Pool().AddSession(tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil)) })
 		select {
 		case ready <- nil:
 		default:
@@ -326,10 +404,14 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 	select {
 	case err := <-ready:
 		if err == nil {
+			monitorSession(set, rt, tun, pool.Pool())
 			return rt, nil
 		}
 		rt.close()
 		return nil, err
+	case <-set.ctx.Done():
+		rt.close()
+		return nil, set.ctx.Err()
 	case <-sig.Done():
 		rt.close()
 		return nil, fmt.Errorf("%s: signaling closed before data channel ready", sessionID)
@@ -410,7 +492,8 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 	if err != nil {
 		return nil, nil, err
 	}
-	rt := &sessionRuntime{id: sessionID, sig: sig}
+	rt := &sessionRuntime{id: sessionID, sig: sig, done: make(chan struct{})}
+	rt.cleanup = func() { tun.CloseStreams(pool.Pool().RemoveSession(sessionID)) }
 
 	if _, err := client.GuestSetDeviceControllable(guestSession, true); err != nil {
 		rt.close()
@@ -493,9 +576,11 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 	})
 
 	var poolSession *tunnel.SimpleSession
+	wired := make(chan struct{})
 	p, err := peer.NewControlled(&peer.Config{
 		Signal: sig,
 		OnSignalData: func(data []byte) {
+			<-wired
 			// Replies for a stream must leave through the session its CONNECT
 			// arrived on; bind the stream before the tunnel handles the frame.
 			if frame := tunnel.DecodeFrameForTunnel(data); frame != nil {
@@ -510,8 +595,9 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 	}
 	rt.peer = p
 	poolSession = tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil)
+	close(wired)
 	p.OnFileChannelOpen(func() {
-		pool.Pool().AddSession(poolSession)
+		rt.activate(func() { pool.Pool().AddSession(poolSession) })
 		logging.Infof("[pool] controlled %s ready (sessions in pool: %d)", sessionID, pool.Pool().SessionCount())
 		set.startTunnelOnce(tun, rules, policy, "multi-session reverse port forwarding active")
 	})
@@ -526,6 +612,7 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 			logging.Debugf("[%s] report relay echo servers: %v", sessionID, err)
 		}
 	}
+	monitorSession(set, rt, tun, pool.Pool())
 	return rt, share, nil
 }
 
