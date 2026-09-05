@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 // TestLiveRoomJoinOnline joins the local Mac (QmQ, always online as this

@@ -1,6 +1,6 @@
-module github.com/user/uulink
+module github.com/wsyzxjn/uulink
 
-go 1.25.4
+go 1.27.1
 
 require (
 	github.com/google/uuid v1.6.0

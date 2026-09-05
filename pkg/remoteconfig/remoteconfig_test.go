@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 type roundTripperFunc func(req *http.Request) (*http.Response, error)

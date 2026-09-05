@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 func TestGenerateSharePassCode(t *testing.T) {
 	seen := make(map[string]struct{})
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		code, err := GenerateSharePassCode()
 		if err != nil {
 			t.Fatalf("GenerateSharePassCode: %v", err)
@@ -215,7 +215,7 @@ func TestJoinRoomByShareCodeRequestBody(t *testing.T) {
 }
 
 func TestGenerateAndValidateCustomShareCode(t *testing.T) {
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		code, err := GenerateCustomShareCode()
 		if err != nil {
 			t.Fatalf("GenerateCustomShareCode: %v", err)
@@ -236,13 +236,13 @@ func TestJoinRoomByShareCodeWaitsForConfirmation(t *testing.T) {
 	joinConfirmationInterval = time.Millisecond
 	defer func() { joinConfirmationInterval = previous }()
 
-	var calls int32
+	var calls atomic.Int32
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Path != "/api/v2/room/join/share/by_code" {
 			t.Fatalf("unexpected path %q", request.URL.Path)
 		}
 		body := `{"code":1136,"msg":"waiting for confirmation"}`
-		if atomic.AddInt32(&calls, 1) >= 3 {
+		if calls.Add(1) >= 3 {
 			body = `{"code":0,"data":{"signaling_server":"wss://sig.example","token":"nrd-token"}}`
 		}
 		return &http.Response{
@@ -263,7 +263,7 @@ func TestJoinRoomByShareCodeWaitsForConfirmation(t *testing.T) {
 	if room.SignalingServer != "wss://sig.example" || room.Token != "nrd-token" {
 		t.Fatalf("room = %+v", room)
 	}
-	if got := atomic.LoadInt32(&calls); got != 3 {
+	if got := calls.Load(); got != 3 {
 		t.Fatalf("join attempts = %d, want 3", got)
 	}
 }

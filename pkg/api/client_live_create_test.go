@@ -2,10 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"testing"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 // TestLiveRoomCreate tries POST /api/v1/room/create to see the room creation
@@ -34,17 +35,13 @@ func TestLiveRoomCreate(t *testing.T) {
 
 func redactRoomCreateResponse(resp map[string]any) map[string]any {
 	out := make(map[string]any, len(resp))
-	for key, value := range resp {
-		out[key] = value
-	}
+	maps.Copy(out, resp)
 	data, ok := out["data"].(map[string]any)
 	if !ok {
 		return out
 	}
 	redactedData := make(map[string]any, len(data))
-	for key, value := range data {
-		redactedData[key] = value
-	}
+	maps.Copy(redactedData, data)
 	for _, key := range []string{"token", "report_token", "nrd_auth", "auth"} {
 		if _, exists := redactedData[key]; exists {
 			redactedData[key] = "<redacted>"

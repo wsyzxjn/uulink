@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 )
 
 // FrameSender sends a Message-wrapped PortMappingFrame to the remote peer.
@@ -87,8 +87,8 @@ func ParseAllowedPorts(s string) (map[int]bool, error) {
 		return nil, nil
 	}
 	ports := make(map[int]bool)
-	parts := strings.Split(s, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(s, ",")
+	for part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			return nil, fmt.Errorf("empty port entry")
@@ -170,7 +170,7 @@ func ExpandPortRange(localSpec, remoteSpec string) ([]PortPair, error) {
 	}
 
 	pairs := make([]PortPair, localCount)
-	for i := 0; i < localCount; i++ {
+	for i := range localCount {
 		pairs[i] = PortPair{
 			LocalPort:  localStart + i,
 			RemotePort: remoteStart + i,

@@ -4,7 +4,7 @@ syntax = "proto3";
 
 package gv_pb;
 
-option go_package = "github.com/user/uulink/pkg/proto/gvpb";
+option go_package = "github.com/wsyzxjn/uulink/pkg/proto/gvpb";
 
 message PortMappingFrame {
   uint32 session_id = 1;

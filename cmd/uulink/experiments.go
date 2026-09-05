@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/peer"
-	"github.com/user/uulink/pkg/tunnel"
-	"github.com/user/uulink/pkg/tunnel/mixsend"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/peer"
+	"github.com/wsyzxjn/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/tunnel/mixsend"
 )
 
 // startPCKSweep replicates the observed channel setup and probes which PCK
@@ -76,7 +76,7 @@ func startMixKCPProbe(p *peer.Peer, rule tunnel.Rule, ruleID string) {
 			peerAddr, ruleID, rule.TargetHost, rule.TargetPort)
 
 		payload := base64.StdEncoding.EncodeToString(
-			[]byte(fmt.Sprintf(`{"version":1,"target_port":%d,"target_host":"%s"}`, rule.TargetPort, rule.TargetHost)),
+			fmt.Appendf(nil, `{"version":1,"target_port":%d,"target_host":"%s"}`, rule.TargetPort, rule.TargetHost),
 		)
 		connectJSON := fmt.Sprintf(
 			`{"seq":"6","timestamp":"%d","portMappingFrame":{"sessionId":"1","ruleId":"%s","streamId":"1","payload":"%s"}}`,

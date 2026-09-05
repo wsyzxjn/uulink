@@ -265,7 +265,7 @@ func frameTypeName(v uint64) FrameType {
 // NewConnect builds a CONNECT frame payload.
 func NewConnect(targetHost string, targetPort int) []byte {
 	// Keep the official client's JSON key order for byte-for-byte comparison.
-	return []byte(fmt.Sprintf(`{"target_host":"%s","target_port":%d,"version":1}`, targetHost, targetPort))
+	return fmt.Appendf(nil, `{"target_host":"%s","target_port":%d,"version":1}`, targetHost, targetPort)
 }
 
 // NewSynAck builds a SYN_ACK frame payload.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 func TestLiveGuestQRCodeAbstract(t *testing.T) {

@@ -43,3 +43,7 @@ Thumbs.db
 *.test
 *.out
 coverage.*
+
+# Docker local overrides and bind-mount state
+docker-compose.override.yml
+/data/

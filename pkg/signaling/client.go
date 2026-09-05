@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/user/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/logging"
 )
 
 // EIO4 packet types

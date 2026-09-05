@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/user/uulink/pkg/signaling"
+	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
 
 func TestControlledOfferFailureLeavesPeerReadyForNextOffer(t *testing.T) {

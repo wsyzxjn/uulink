@@ -1,0 +1,46 @@
+# Keep the build context small and free of local credentials.
+
+# Version control and CI metadata
+.git
+.github
+.gitignore
+
+# Local credentials and runtime state (never bake these into an image)
+config.json
+config.test.local.json
+*.log
+*.jsonl
+
+# Local-only working directories
+doc/
+workspace/
+dist/
+
+# Prebuilt binaries and release archives
+/uulink
+/uulink.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.zip
+*.tar.gz
+*.test
+*.out
+coverage.*
+
+# Docs and Docker assets are not needed inside the build
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.override.yml
+data/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

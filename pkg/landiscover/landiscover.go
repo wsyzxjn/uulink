@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/logging"
 )
 
 // FormatMessage creates the Minecraft LAN discovery broadcast string.

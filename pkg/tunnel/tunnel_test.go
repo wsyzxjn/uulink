@@ -196,7 +196,7 @@ func TestTunnelForwardsMultipleRulesConcurrently(t *testing.T) {
 	echoes := make(chan string, 2)
 	go echoTCP(t, addr1.String(), "rule-one", echoes)
 	go echoTCP(t, addr2.String(), "rule-two", echoes)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case echo := <-echoes:
 			if echo != "rule-one" && echo != "rule-two" {

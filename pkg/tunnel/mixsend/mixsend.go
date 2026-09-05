@@ -13,8 +13,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/tunnel/mixkcp"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/tunnel/mixkcp"
 )
 
 // Sender writes mix-kcp frames to a fixed UDP peer.

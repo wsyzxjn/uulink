@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/user/uulink/pkg/api"
-	"github.com/user/uulink/pkg/auth"
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/peer"
-	"github.com/user/uulink/pkg/signaling"
-	"github.com/user/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/api"
+	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/peer"
+	"github.com/wsyzxjn/uulink/pkg/signaling"
+	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
 // Multi-session relay pooling: a single TURN allocation is rate limited, so a
@@ -310,7 +310,7 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 
 // doMultiSessionUnboundGuestServe creates one unbound guest room per session
 // and serves the configured rules through the pooled sessions.
-func doMultiSessionUnboundGuestServe(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
+func doMultiSessionUnboundGuestServe(cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		return fmt.Errorf("resolve hostname: %w", err)
@@ -329,7 +329,7 @@ func doMultiSessionUnboundGuestServe(client *api.Client, cfg *auth.Config, rules
 	defer close(done)
 
 	shares := make([]*api.GuestShareInfo, 0, targetSessions)
-	for index := 0; index < targetSessions; index++ {
+	for index := range targetSessions {
 		sessionID := fmt.Sprintf("session-%d", index+1)
 		sessionCfg := *cfg
 		if index > 0 {

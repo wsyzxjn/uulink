@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/user/uulink/pkg/signaling"
-	"github.com/user/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/signaling"
+	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
 type fakeSignalingServer struct {
@@ -92,21 +92,21 @@ func (s *fakeSignalingServer) handleText(role string, conn *websocket.Conn, text
 	case strings.HasPrefix(text, "42"):
 		if strings.Contains(text, `"room_info"`) {
 			rest := text[2:]
-			end := strings.IndexByte(rest, '[')
-			if end < 0 {
+			before, _, ok := strings.Cut(rest, "[")
+			if !ok {
 				return nil
 			}
-			ackID := rest[:end]
+			ackID := before
 			s.write(conn, `43`+ackID+`[{"room_id":"fake-room","you":{"client_id":"controlled-client","device_id":"controlled-device"}}]`)
 			return nil
 		}
 		if strings.Contains(text, `"refresh_reconnect_key"`) {
 			rest := text[2:]
-			end := strings.IndexByte(rest, '[')
-			if end < 0 {
+			before, _, ok := strings.Cut(rest, "[")
+			if !ok {
 				return nil
 			}
-			ackID := rest[:end]
+			ackID := before
 			if role == "controller" {
 				s.recordControllerEvent("refresh_reconnect_key")
 			}
@@ -146,11 +146,11 @@ func (s *fakeSignalingServer) handleBinary(role string, attachment []byte) {
 			return
 		}
 		rest = rest[dash+1:]
-		end := strings.IndexByte(rest, '[')
-		if end < 0 {
+		before, _, ok := strings.Cut(rest, "[")
+		if !ok {
 			return
 		}
-		ackID := rest[:end]
+		ackID := before
 		conn := s.connection(role)
 		if conn != nil {
 			s.write(conn, `43`+ackID+`["success",{"code":0,"client_id":"controller-client","ice_id":"fake-ice","force_relay":false,"iceServers":[]}]`)
@@ -354,7 +354,7 @@ func TestControllerAndControlledPeersCarrySymmetricTunnel(t *testing.T) {
 	go echoThroughTunnel(t, listenerAddr.String(), "controller-to-controlled", echoes)
 	go echoThroughTunnel(t, reverseListenerAddr.String(), "controlled-to-controller", echoes)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case echo := <-echoes:
 			switch echo {

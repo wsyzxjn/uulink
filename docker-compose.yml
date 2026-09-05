@@ -1,0 +1,53 @@
+# Example deployment. Defaults to the CI-built image; override UULINK_IMAGE to
+# pin a tag, or run `docker compose up --build` to build from this checkout.
+services:
+  uulink:
+    image: ${UULINK_IMAGE:-ghcr.io/wsyzxjn/uulink:latest}
+    build:
+      context: .
+    container_name: uulink
+    restart: unless-stopped
+
+    # Host networking lets WebRTC ICE see the real interface addresses, which
+    # keeps far more sessions on a direct P2P path instead of falling back to a
+    # TURN relay. It is also required for -lan-discovery broadcasts.
+    # Linux only; see the bridge-mode block below for Docker Desktop.
+    network_mode: host
+
+    # uulink registers this name as the device name on UU Remote. Without it the
+    # random container ID is used and the device is renamed on every recreate.
+    hostname: uulink-docker
+
+    volumes:
+      # Named volume keeps config.json (credentials and the accountless device
+      # identity) across restarts and image upgrades.
+      - uulink-data:/data
+
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+
+    # WORKDIR is /data, so the default -config path already resolves to
+    # /data/config.json. Replace the arguments below with your own mapping.
+    command:
+      - -config
+      - /data/config.json
+      - -device
+      - "${UULINK_DEVICE:?Set UULINK_DEVICE to the remote device ID}"
+      - -log-level
+      - info
+      # Bind on all interfaces: 127.0.0.1 inside a container is not reachable
+      # from the host or the LAN.
+      - -local-host
+      - 0.0.0.0
+      - -mapping
+      - "25565:25565"
+
+    # Bridge mode alternative (Docker Desktop on macOS/Windows, or when host
+    # networking is unavailable). Comment out `network_mode: host` above and
+    # uncomment the block below. NAT traversal still works via STUN/TURN, but
+    # relay fallback becomes more likely.
+    # ports:
+    #   - "25565:25565"
+
+volumes:
+  uulink-data:

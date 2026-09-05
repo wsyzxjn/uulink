@@ -37,11 +37,9 @@ func TestClientCloseIsConcurrentSafe(t *testing.T) {
 
 	var wait sync.WaitGroup
 	for range 32 {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			_ = client.Close()
-		}()
+		})
 	}
 	wait.Wait()
 	select {

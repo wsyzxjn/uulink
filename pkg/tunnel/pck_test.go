@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/user/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 )
 
 func TestBuildConnectPCKWrapsProtobufMessage(t *testing.T) {

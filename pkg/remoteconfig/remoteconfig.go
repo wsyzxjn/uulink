@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/uulink/pkg/auth"
-	"github.com/user/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
 // RemoteShareConfig holds the share information and mapping rules fetched from

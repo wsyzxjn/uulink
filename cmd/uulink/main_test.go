@@ -11,11 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/user/uulink/pkg/api"
-	"github.com/user/uulink/pkg/auth"
-	"github.com/user/uulink/pkg/peer"
-	"github.com/user/uulink/pkg/remoteconfig"
-	"github.com/user/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/api"
+	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/peer"
+	"github.com/wsyzxjn/uulink/pkg/remoteconfig"
+	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

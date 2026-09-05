@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 const defaultBaseURL = "https://api.nrd.nie.163.com"

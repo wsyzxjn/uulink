@@ -21,13 +21,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/user/uulink/pkg/api"
-	"github.com/user/uulink/pkg/auth"
-	"github.com/user/uulink/pkg/landiscover"
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/peer"
-	"github.com/user/uulink/pkg/signaling"
-	"github.com/user/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/api"
+	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/landiscover"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/peer"
+	"github.com/wsyzxjn/uulink/pkg/signaling"
+	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
 // DefaultConfigURL can be baked into a client build so it runs without flags:
@@ -252,7 +252,7 @@ func run() error {
 				// A fixed identity cannot be shared by several pooled devices.
 				return fmt.Errorf("-custom-serve runs a single session; use -sessions 1")
 			}
-			return doMultiSessionUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
+			return doMultiSessionUnboundGuestServe(cfg, rules, *roomFile, shareOptions, secPolicy, targetSessions)
 		}
 		return doUnboundGuestServe(client, cfg, rules, *roomFile, shareOptions, secPolicy)
 	}
@@ -994,7 +994,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 
 func waitForGuestConnectID(client *api.Client, session *api.GuestSession) (*api.GuestShareInfo, error) {
 	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
+	for range 5 {
 		share, err := client.GetGuestShareInfo(session)
 		if err == nil && share.ConnectID != "" {
 			return share, nil

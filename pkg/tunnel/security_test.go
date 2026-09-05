@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 )
 
 func TestIsLoopbackHost(t *testing.T) {

@@ -32,9 +32,7 @@ func TestLoopbackExchange(t *testing.T) {
 	out := NewFrame(0x43, payload)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		buf := make([]byte, 1500)
 		resp.SetReadDeadline(time.Now().Add(3 * time.Second))
 		n, from, err := resp.ReadFromUDP(buf)
@@ -62,7 +60,7 @@ func TestLoopbackExchange(t *testing.T) {
 		if err != nil {
 			t.Errorf("responder write: %v", err)
 		}
-	}()
+	})
 
 	if _, err := init.Write(out.Build()); err != nil {
 		t.Fatalf("initiator write: %v", err)

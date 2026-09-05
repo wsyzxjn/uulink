@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 func TestLiveWebLoginTicket(t *testing.T) {

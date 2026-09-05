@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/uulink/pkg/api"
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/api"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 // TestLiveSignalingConnect creates a room and connects to the signaling

@@ -175,7 +175,7 @@ func GenerateSharePassCode() (string, error) {
 // GenerateCustomShareCode creates an eight-character code that satisfies the
 // official custom-code rule of containing both letters and digits.
 func GenerateCustomShareCode() (string, error) {
-	for attempt := 0; attempt < 32; attempt++ {
+	for range 32 {
 		code, err := GenerateSharePassCode()
 		if err != nil {
 			return "", err
@@ -468,7 +468,7 @@ func joinShareRoomByCode(client *Client, connectID, deviceCode, operation string
 		ConnectID:   connectID,
 		ConnectCode: deviceCode,
 	}
-	for attempt := 0; attempt < joinConfirmationAttempts; attempt++ {
+	for range joinConfirmationAttempts {
 		resp, err := client.Do("POST", "/api/v2/room/join/share/by_code", body)
 		if err != nil {
 			var responseErr *ResponseError

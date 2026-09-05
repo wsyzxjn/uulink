@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/user/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 )
 
 var msgSeqCounter atomic.Uint64

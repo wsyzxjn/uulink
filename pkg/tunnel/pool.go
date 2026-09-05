@@ -6,8 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 )
 
 // Session is one independent WebRTC data path, typically backed by its own
@@ -64,7 +64,7 @@ type SessionPool struct {
 	mu           sync.RWMutex
 	sessions     []Session
 	policy       DispatchPolicy
-	rrIndex      uint64
+	rrIndex      atomic.Uint64
 	streamMap    sync.Map // stream key -> Session
 	activeCounts map[string]*int64
 }
@@ -146,7 +146,7 @@ func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
 			}
 		}
 	default:
-		idx := atomic.AddUint64(&p.rrIndex, 1) - 1
+		idx := p.rrIndex.Add(1) - 1
 		chosen = p.sessions[idx%uint64(len(p.sessions))]
 	}
 

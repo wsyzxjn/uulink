@@ -18,6 +18,7 @@ uulink is a lightweight TCP port forwarding tool built on the NetEase UU Remote 
 - Terminal QR code login: Generate a login QR code directly in the terminal to authenticate and write credentials into the configuration file.
 - Share code mode: Connect using temporary remote-assistance share codes without requiring devices to belong to the same account.
 - Cross-platform: Runs on macOS, Linux, and Windows.
+- Container-ready: Multi-architecture Docker images (`linux/amd64`, `linux/arm64`) published by CI for headless deployments.
 
 ## Quick Start
 
@@ -253,6 +254,60 @@ go build -ldflags="-X main.DefaultConfigURL=https://example.com/room.json" -o mc
 ```
 
 Users can simply run `./mc-link` without passing any arguments; a `config.json` with a random client identity is created next to the binary on first start.
+
+## Docker
+
+Multi-architecture images (`linux/amd64`, `linux/arm64`) are built and published by CI to this repository's GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/wsyzxjn/uulink:latest
+```
+
+Available tags: `latest` and semantic versions (`1.2.3`, `1.2`, `1`) from `v*` releases, `edge` from the `main` branch, and `sha-<commit>` for every build.
+
+### Run
+
+The image sets `WORKDIR /data`, so the default `-config` path resolves to `/data/config.json`. Mount a volume there to persist credentials and the accountless device identity across restarts:
+
+```bash
+docker volume create uulink-data
+
+# Log in once (interactive terminal required for the QR code)
+docker run --rm -it -v uulink-data:/data ghcr.io/wsyzxjn/uulink:latest -login
+
+# Then run the forwarder
+docker run -d --name uulink --restart unless-stopped \
+  --network host --hostname uulink-docker \
+  -v uulink-data:/data \
+  ghcr.io/wsyzxjn/uulink:latest -device TARGET_DEVICE_ID -local-host 0.0.0.0 -mapping 25565:25565
+```
+
+Replace `TARGET_DEVICE_ID` with the ID of a remote device running `uulink -serve`. Use `-list` to find device IDs.
+
+Or use the bundled `docker-compose.yml`, which defaults to the published image:
+
+```bash
+docker compose pull
+UULINK_DEVICE=TARGET_DEVICE_ID docker compose up -d
+
+# Build from source instead of pulling
+UULINK_DEVICE=TARGET_DEVICE_ID docker compose up -d --build
+
+# Pin a specific tag
+UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.0 docker compose up -d
+```
+
+### Deployment notes
+
+- **Networking:** `--network host` (Linux) lets WebRTC ICE see the real interface addresses, which keeps far more sessions on a direct P2P path instead of falling back to a TURN relay. It is also required for `-lan-discovery` broadcasts. Under bridge networking, traversal still works through STUN/TURN, but publish each forwarded port explicitly with `-p`.
+- **Bind address:** always pass `-local-host 0.0.0.0` (or set `local_host` in the mappings). The default `127.0.0.1` is the container's own loopback and is unreachable from the host or the LAN.
+- **Device name:** uulink registers the system hostname as the device name. Set `--hostname` (or the `hostname` config field), otherwise the random container ID appears in `-list` and changes on every recreate.
+- **Non-root user:** the container runs as UID `10001`. Named volumes inherit the correct ownership automatically; for a bind mount, run `chown 10001:10001 ./data` on the host first, or add `--user "$(id -u):$(id -g)"`. Binding local ports below 1024 additionally needs `--user 0` or `--sysctl net.ipv4.ip_unprivileged_port_start=0`.
+- **Zero-argument images:** bake a remote share configuration URL into a custom build for the distribution mode described above:
+
+  ```bash
+  docker build --build-arg DEFAULT_CONFIG_URL=https://example.com/room.json -t mc-link .
+  ```
 
 ## Configuration Reference
 

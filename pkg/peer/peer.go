@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"github.com/user/uulink/pkg/logging"
-	"github.com/user/uulink/pkg/signaling"
+	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
 
 // Data channel labels used by UU Remote (from libstreamer.dylib).
@@ -956,7 +956,7 @@ func (p *Peer) handleControlEcho(data []byte) {
 		return
 	}
 	p.controlEchoOnce.Do(func() {
-		args := []byte(fmt.Sprintf(`{"seq":%d}`, remoteSeq))
+		args := fmt.Appendf(nil, `{"seq":%d}`, remoteSeq)
 		inner := appendPBVarintField(nil, 1, 1)
 		inner = appendPBBytesField(inner, 2, args)
 		inner = appendPBBytesField(inner, 4, remoteFeatureFlags)

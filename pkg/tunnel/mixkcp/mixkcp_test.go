@@ -101,10 +101,3 @@ func TestParseRejectsShortFrames(t *testing.T) {
 		t.Fatalf("minimal 18-byte frame should parse: %v", err)
 	}
 }
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}

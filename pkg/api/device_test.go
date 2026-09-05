@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/user/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
 func windowsInitTestClient(t *testing.T, cfg *auth.Config, captured *map[string]any) *Client {

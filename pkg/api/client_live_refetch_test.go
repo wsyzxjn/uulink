@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/uulink/pkg/auth"
-	"github.com/user/uulink/pkg/signaling"
+	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
 
 func TestLiveRoomJoinRefetch(t *testing.T) {
