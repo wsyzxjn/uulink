@@ -62,7 +62,11 @@ func NextSeq() string {
 
 // Encode serializes the Message as protobuf.
 func (m *Message) Encode() ([]byte, error) {
-	var buf []byte
+	capEstimate := 64
+	if m.PortMappingFrame != nil {
+		capEstimate += 48 + len(m.PortMappingFrame.Payload)
+	}
+	buf := make([]byte, 0, capEstimate)
 	if m.Seq != "" {
 		v, err := strconv.ParseUint(m.Seq, 10, 64)
 		if err != nil {
@@ -138,7 +142,7 @@ func DecodeMessage(data []byte) (*Message, error) {
 }
 
 func (f *PortMappingFrame) encode() ([]byte, error) {
-	var buf []byte
+	buf := make([]byte, 0, 48+len(f.Payload))
 	if f.SessionID != "" {
 		v, err := strconv.ParseUint(f.SessionID, 10, 32)
 		if err != nil {

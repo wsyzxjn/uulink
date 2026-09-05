@@ -485,6 +485,28 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 			t.closeStream(rule.ID, streamID, false)
 			continue
 		}
+		// Hedged dual-send: send duplicate CONNECT after 10ms to eliminate handshake loss penalty on WAN
+		go func(connectMsg []byte, st *stream) {
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-st.ready:
+				return
+			case <-st.closed:
+				return
+			case <-t.done:
+				return
+			}
+			select {
+			case <-st.ready:
+				return
+			case <-st.closed:
+				return
+			case <-t.done:
+				return
+			default:
+				_ = t.sender.SendFrame(connectMsg)
+			}
+		}(msg, s)
 		go s.readLoop()
 	}
 }
@@ -602,9 +624,30 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	configureTCPConn(conn)
 	s := t.newStream(frame.RuleID, frame.StreamID, conn)
 	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
-	t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, true))
+	synAckMsg, synAckErr := newSynAckMsg(frame.RuleID, frame.StreamID, true)
+	t.sendBuiltMsg(synAckMsg, synAckErr)
 	s.markReady()
 	logging.Debugf("[tunnel] stream connected: rule=%s stream=%s target=%q", frame.RuleID, frame.StreamID, target.TargetHost)
+	if synAckErr == nil {
+		// Hedged dual-send: send duplicate SYN_ACK after 10ms
+		go func(msg []byte, st *stream) {
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-st.closed:
+				return
+			case <-t.done:
+				return
+			}
+			select {
+			case <-st.closed:
+				return
+			case <-t.done:
+				return
+			default:
+				t.sendBuiltMsg(msg, nil)
+			}
+		}(synAckMsg, s)
+	}
 	go s.readLoop()
 }
 
@@ -631,7 +674,14 @@ func (t *Tunnel) nextStreamID(ruleID string) string {
 }
 
 func (t *Tunnel) sendFIN(ruleID, streamID string) {
-	t.sendBuiltMsg(newFINMsg(ruleID, streamID))
+	msg, err := newFINMsg(ruleID, streamID)
+	t.sendBuiltMsg(msg, err)
+	if err == nil {
+		go func(finMsg []byte) {
+			time.Sleep(10 * time.Millisecond)
+			t.sendBuiltMsg(finMsg, nil)
+		}(msg)
+	}
 }
 
 func (t *Tunnel) sendBuiltMsg(msg []byte, err error) {

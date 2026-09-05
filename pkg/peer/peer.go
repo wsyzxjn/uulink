@@ -24,6 +24,10 @@ import (
 	"time"
 	"unsafe"
 
+	"net"
+
+	"github.com/pion/transport/v4"
+	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/webrtc/v4"
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
@@ -433,11 +437,51 @@ func (p *Peer) sendControl(deviceID string) error {
 
 // Connect creates the PeerConnection with TURN servers from the control ack
 // (or the provided override), creates data channels, sends the SDP offer via soac.
+type bufferedNet struct {
+	transport.Net
+}
+
+func (b *bufferedNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport.UDPConn, error) {
+	conn, err := b.Net.ListenUDP(network, locAddr)
+	if err == nil {
+		if uconn, ok := conn.(*net.UDPConn); ok {
+			_ = uconn.SetReadBuffer(4 * 1024 * 1024)
+			_ = uconn.SetWriteBuffer(4 * 1024 * 1024)
+		}
+	}
+	return conn, err
+}
+
+func (b *bufferedNet) ListenPacket(network string, address string) (net.PacketConn, error) {
+	conn, err := b.Net.ListenPacket(network, address)
+	if err == nil {
+		if uconn, ok := conn.(*net.UDPConn); ok {
+			_ = uconn.SetReadBuffer(4 * 1024 * 1024)
+			_ = uconn.SetWriteBuffer(4 * 1024 * 1024)
+		}
+	}
+	return conn, err
+}
+
+func (b *bufferedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
+	conn, err := b.Net.DialUDP(network, laddr, raddr)
+	if err == nil {
+		if uconn, ok := conn.(*net.UDPConn); ok {
+			_ = uconn.SetReadBuffer(4 * 1024 * 1024)
+			_ = uconn.SetWriteBuffer(4 * 1024 * 1024)
+		}
+	}
+	return conn, err
+}
+
 func newWebRTCAPI() *webrtc.API {
 	s := webrtc.SettingEngine{}
 	s.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	s.SetSCTPMinCwnd(64 * 1024)
 	s.SetSCTPRTOMax(1500 * time.Millisecond)
+	if stdNet, err := stdnet.NewNet(); err == nil {
+		s.SetNet(&bufferedNet{Net: stdNet})
+	}
 	return webrtc.NewAPI(webrtc.WithSettingEngine(s))
 }
 
