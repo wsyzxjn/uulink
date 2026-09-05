@@ -111,11 +111,13 @@ func run() error {
 		return fmt.Errorf("parse share auth mode: %w", err)
 	}
 
-	// Accountless modes create their own identity, so a missing config file
-	// is initialized instead of being an error.
+	// Accountless modes create their own identity, and the login commands run on
+	// a machine that has nothing yet, so both initialize a missing config file
+	// instead of treating it as an error.
 	accountless := *customServe || *customConnect != "" || *unboundGuestServe || *configURL != "" || *shareGuest
+	bootstrapsConfig := accountless || *interactiveLogin || *loginQRCode || *refreshLogin || *loginMobile != ""
 	var cfg *auth.Config
-	if accountless {
+	if bootstrapsConfig {
 		cfg, err = auth.LoadOrInitConfigFile(*configPath)
 	} else {
 		cfg, err = auth.LoadConfigFile(*configPath)
