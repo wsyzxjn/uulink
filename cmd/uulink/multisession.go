@@ -272,27 +272,43 @@ func (s *sessionSet) waitForShutdown(requireReady bool) error {
 }
 
 func connectSignaling(room *api.RoomConnectionInfo, controlling bool) (*signaling.Client, error) {
-	gateway := room.SignalingServer
-	if gateway == "" && len(room.SignalingList) > 0 {
-		gateway = room.SignalingList[0]
+	var candidates []string
+	if room.SignalingServer != "" {
+		candidates = append(candidates, room.SignalingServer)
 	}
-	sig, err := signaling.Connect(&signaling.ConnectConfig{
-		GatewayURL:  gateway,
-		NRDAuth:     room.Token,
-		Controlling: controlling,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("signaling connect: %w", err)
+	for _, g := range room.SignalingList {
+		if g != "" && g != room.SignalingServer {
+			candidates = append(candidates, g)
+		}
 	}
-	select {
-	case <-sig.NamespaceConnected():
-	case <-time.After(5 * time.Second):
-		sig.Close()
-		return nil, fmt.Errorf("signaling namespace connect timeout")
-	case <-sig.Done():
-		return nil, fmt.Errorf("signaling closed before namespace connection")
+	if len(candidates) == 0 {
+		return nil, errors.New("no signaling gateways provided in room info")
 	}
-	return sig, nil
+
+	var lastErr error
+	for _, gateway := range candidates {
+		sig, err := signaling.Connect(&signaling.ConnectConfig{
+			GatewayURL:  gateway,
+			NRDAuth:     room.Token,
+			Controlling: controlling,
+		})
+		if err != nil {
+			lastErr = fmt.Errorf("gateway %s: %w", gateway, err)
+			continue
+		}
+		select {
+		case <-sig.NamespaceConnected():
+			return sig, nil
+		case <-time.After(5 * time.Second):
+			sig.Close()
+			lastErr = fmt.Errorf("gateway %s: namespace connect timeout", gateway)
+			continue
+		case <-sig.Done():
+			lastErr = fmt.Errorf("gateway %s: closed before namespace connection", gateway)
+			continue
+		}
+	}
+	return nil, fmt.Errorf("all signaling gateways failed (last error: %w)", lastErr)
 }
 
 // doMultiSessionController joins one share per pooled session and forwards the
