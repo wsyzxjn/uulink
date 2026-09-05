@@ -455,6 +455,12 @@ type JoinRoomByShareCodeRequest struct {
 // controlled side has not yet confirmed the controller.
 const codeAwaitingConfirmation = 1136
 
+// CodeObjectNotFound is the API's "queried object does not exist" error. A
+// share join returns it when the caller cannot see the share at all, which is
+// what happens for every guest identity: the server scopes share lookups to
+// logged-in users, and no guest-namespace join endpoint exists.
+const CodeObjectNotFound = 1002
+
 const joinConfirmationAttempts = 20
 
 // joinConfirmationInterval is a variable so tests can shorten the wait.

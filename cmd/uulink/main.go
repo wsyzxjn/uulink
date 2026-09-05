@@ -476,6 +476,14 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		controllerGuestDeviceID = guestSession.DeviceID
 		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, options.shareID, options.shareCode)
 		if err != nil {
+			var responseErr *api.ResponseError
+			if errors.As(err, &responseErr) && responseErr.Code == api.CodeObjectNotFound {
+				return fmt.Errorf("join guest share room: %w\n"+
+					"The UU Remote API only exposes shares to logged-in users, so the "+
+					"controlling side cannot join with a guest identity. Log in on this "+
+					"machine with \"uulink -login\" and retry; the served side can stay "+
+					"accountless.", err)
+			}
 			return fmt.Errorf("join guest share room: %w", err)
 		}
 	case options.roomFile != "":
@@ -1476,8 +1484,40 @@ func doRefreshLogin(client *api.Client, cfg *auth.Config, configPath string, tim
 	return doLoginQRCode(client, cfg, configPath, timeout)
 }
 
+// ensureBootstrapGuest returns a guest session usable for account bootstrap
+// calls such as QR-code login.
+//
+// POST /guest/create sends this machine's device_id, and the server rejects it
+// with code 1001 when that device was never registered. A fresh config.json has
+// no device_id, so fall back to registering an accountless device first and
+// persist the identity, which keeps later runs on the cheap path.
+func ensureBootstrapGuest(client *api.Client, cfg *auth.Config, configPath, name string) (*api.GuestSession, error) {
+	if cfg.DeviceID != "" && cfg.ClientID != "" && (cfg.Platform == 1 || runtime.GOOS == "windows") {
+		session, err := client.CreateGuest()
+		if err == nil {
+			return session, nil
+		}
+		logging.Debugf("guest create with configured identity failed, registering a device: %v", err)
+	}
+	session, identity, err := client.CreateUnboundGuest(name)
+	if err != nil {
+		return nil, err
+	}
+	if identity != nil {
+		cfg.ClientID = identity.ClientID
+		cfg.DeviceID = identity.DeviceID
+		cfg.Platform = 1
+		if configPath != "" {
+			if saveErr := auth.SaveConfigFile(configPath, cfg); saveErr != nil {
+				logging.Warnf("could not persist the registered device identity: %v", saveErr)
+			}
+		}
+	}
+	return session, nil
+}
+
 func doLoginQRCode(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) error {
-	guest, err := client.CreateGuest()
+	guest, err := ensureBootstrapGuest(client, cfg, configPath, "uulink-login")
 	if err != nil {
 		return fmt.Errorf("create guest: %w", err)
 	}
