@@ -88,6 +88,7 @@ func (a *ControlAckData) WebRTCICEServers() []webrtc.ICEServer {
 type Config struct {
 	Signal        *signaling.Client
 	DeviceID      string // our device id (for streamer_data)
+	VersionName   string // optional client version name override for ConnectOptions field 12
 	AppControlID  string
 	Passive       bool          // skip signaling control handshake (room-file controller)
 	TransportMode TransportMode // controller transport policy: auto or relay
@@ -111,6 +112,7 @@ type Peer struct {
 	sdpOfferFile           string
 	sdpAnswerFile          string
 	transportMode          TransportMode
+	versionName            string
 	effectiveTransportMode TransportMode
 	pc                     *webrtc.PeerConnection
 	binaryDC               *webrtc.DataChannel
@@ -178,6 +180,7 @@ func NewController(cfg *Config) (*Peer, error) {
 		sdpOfferFile:     cfg.SDPOfferFile,
 		sdpAnswerFile:    cfg.SDPAnswerFile,
 		transportMode:    cfg.TransportMode,
+		versionName:      cfg.VersionName,
 		onBinaryData:     cfg.OnBinaryData,
 		onSignalData:     cfg.OnSignalData,
 		ackCh:            make(chan *ControlAckData, 1),
@@ -393,6 +396,16 @@ func (p *Peer) sendControl(deviceID string) error {
 		pb, err = replacePBBytesField(pb, 9, []byte(deviceID))
 		if err != nil {
 			return fmt.Errorf("replace control device id: %w", err)
+		}
+	}
+	vn := p.versionName
+	if vn == "" {
+		vn = os.Getenv("UULINK_CLIENT_VN")
+	}
+	if vn != "" {
+		pb, err = replacePBBytesField(pb, 12, []byte(vn))
+		if err != nil {
+			return fmt.Errorf("replace control version name: %w", err)
 		}
 	}
 

@@ -73,6 +73,20 @@ func platformParams(goos string, cfgPlatform int) (platform, versionName, versio
 // BuildHeaders returns the full set of authentication headers for an API request.
 func BuildHeaders(cfg *Config, ts string) map[string]string {
 	platform, versionName, versionCode := platformParams(runtime.GOOS, cfg.Platform)
+	if cfg != nil {
+		if cfg.VersionName != "" {
+			versionName = cfg.VersionName
+		}
+		if cfg.VersionCode != "" {
+			versionCode = cfg.VersionCode
+		}
+	}
+	if envVN := os.Getenv("UULINK_CLIENT_VN"); envVN != "" {
+		versionName = envVN
+	}
+	if envVC := os.Getenv("UULINK_CLIENT_VC"); envVC != "" {
+		versionCode = envVC
+	}
 	headers := map[string]string{
 		"X-Param-PLAT":      platform,
 		"X-Param-VN":        versionName,
@@ -99,17 +113,20 @@ func BuildHeaders(cfg *Config, ts string) map[string]string {
 
 // Config holds credentials and identifiers for UU Remote API auth.
 type Config struct {
-	JWT          string        `json:"jwt"`
-	ClientID     string        `json:"client_id"` // IOPlatformUUID
-	DeviceID     string        `json:"device_id"` // this device id
-	UserID       string        `json:"user_id"`
-	Hostname     string        `json:"hostname,omitempty"`
-	GuestID      string        `json:"guest_id,omitempty"`
-	Platform     int           `json:"platform,omitempty"`
-	Mappings     []PortMapping `json:"mappings,omitempty"`
-	AllowLAN     bool          `json:"allow_lan,omitempty"`
-	AllowedPorts []int         `json:"allowed_ports,omitempty"`
-	Sessions     int           `json:"sessions,omitempty"`
+	JWT             string        `json:"jwt"`
+	ClientID        string        `json:"client_id"` // IOPlatformUUID
+	DeviceID        string        `json:"device_id"` // this device id
+	UserID          string        `json:"user_id"`
+	Hostname        string        `json:"hostname,omitempty"`
+	GuestID         string        `json:"guest_id,omitempty"`
+	Platform        int           `json:"platform,omitempty"`
+	Mappings        []PortMapping `json:"mappings,omitempty"`
+	AllowLAN        bool          `json:"allow_lan,omitempty"`
+	AllowedPorts    []int         `json:"allowed_ports,omitempty"`
+	Sessions        int           `json:"sessions,omitempty"`
+	VersionName     string        `json:"version_name,omitempty"`
+	VersionCode     string        `json:"version_code,omitempty"`
+	StreamerVersion string        `json:"streamer_version,omitempty"`
 	// Custom-code assistance: a fixed verification code plus the share this
 	// config connects to or serves, so a client can start without flags.
 	CustomCode string `json:"custom_code,omitempty"`

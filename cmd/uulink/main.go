@@ -91,7 +91,14 @@ func run() error {
 	lanDiscovery := flag.Bool("lan-discovery", false, "announce the first forwarded port as a Minecraft LAN server")
 	lanMotd := flag.String("lan-motd", "", "MOTD text for the Minecraft LAN announcement")
 	p2pTimeout := flag.Duration("p2p-timeout", 12*time.Second, "timeout for P2P connection attempts before falling back to relay (0 disables fallback)")
+	showVersion := flag.Bool("version", false, "show version information and exit")
+	flag.BoolVar(showVersion, "v", false, "show version information and exit (shorthand)")
 	flag.Parse()
+
+	if *showVersion || (flag.NArg() > 0 && flag.Arg(0) == "version") {
+		fmt.Println(formatVersion())
+		return nil
+	}
 
 	parsedLogLevel, err := logging.ParseLevel(*logLevel)
 	if err != nil {

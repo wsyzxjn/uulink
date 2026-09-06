@@ -18,6 +18,9 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION="edge"
+ARG GIT_COMMIT=""
+ARG BUILD_DATE=""
 # Optional: bake a remote share configuration URL into the image so the
 # container runs with zero arguments (README "Remote Configuration
 # Distribution" mode).
@@ -26,7 +29,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath \
-        -ldflags "-s -w -X main.DefaultConfigURL=${DEFAULT_CONFIG_URL}" \
+        -ldflags "-s -w -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildDate=${BUILD_DATE} -X main.DefaultConfigURL=${DEFAULT_CONFIG_URL}" \
         -o /out/uulink ./cmd/uulink
 
 # Runtime stage.

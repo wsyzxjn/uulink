@@ -18,6 +18,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +98,9 @@ type ConnectConfig struct {
 // Connect establishes a socket.io connection to the signaling gateway.
 func Connect(cfg *ConnectConfig) (*Client, error) {
 	version := cfg.Version
+	if version == "" {
+		version = os.Getenv("UULINK_STREAMER_VERSION")
+	}
 	if version == "" {
 		version = "V4.5.3"
 	}

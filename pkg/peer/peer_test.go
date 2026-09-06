@@ -70,6 +70,17 @@ func TestReplacePBBytesFieldUpdatesControlDeviceAndCapability(t *testing.T) {
 	if !bytes.Contains(updated, capability) {
 		t.Fatal("capability field was not replaced")
 	}
+
+	updated, err = replacePBBytesField(updated, 12, []byte("4.39.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(updated, []byte("4.39.0")) {
+		t.Fatal("version name field was not replaced")
+	}
+	if bytes.Contains(updated, []byte("4.38.0")) {
+		t.Fatal("default version name remained in ConnectOptions")
+	}
 }
 
 func TestParseControlEchoUsesOuterMessageSeqAndRemoteFeatureFlags(t *testing.T) {

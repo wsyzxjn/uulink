@@ -82,3 +82,29 @@ func TestBuildHeadersOmitsEmptyAuthorization(t *testing.T) {
 		t.Fatalf("BuildHeaders() dropped guest request identifiers: %#v", headers)
 	}
 }
+
+func TestBuildHeadersVersionOverrides(t *testing.T) {
+	cfg := &Config{
+		ClientID:    "client",
+		DeviceID:    "device",
+		VersionName: "4.39.0",
+		VersionCode: "9999",
+	}
+	headers := BuildHeaders(cfg, "123")
+	if headers["X-Param-VN"] != "4.39.0" {
+		t.Fatalf("expected X-Param-VN to be 4.39.0, got %q", headers["X-Param-VN"])
+	}
+	if headers["X-Param-VC"] != "9999" {
+		t.Fatalf("expected X-Param-VC to be 9999, got %q", headers["X-Param-VC"])
+	}
+
+	t.Setenv("UULINK_CLIENT_VN", "4.40.0")
+	t.Setenv("UULINK_CLIENT_VC", "10000")
+	headersEnv := BuildHeaders(cfg, "123")
+	if headersEnv["X-Param-VN"] != "4.40.0" {
+		t.Fatalf("expected env override X-Param-VN to be 4.40.0, got %q", headersEnv["X-Param-VN"])
+	}
+	if headersEnv["X-Param-VC"] != "10000" {
+		t.Fatalf("expected env override X-Param-VC to be 10000, got %q", headersEnv["X-Param-VC"])
+	}
+}
