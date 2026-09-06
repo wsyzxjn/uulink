@@ -489,3 +489,12 @@ are directly reachable, and latency is dominated by the relay path.
 **Q: Can other devices on my local network access the forwarded port?**
 
 Yes. By default, local listeners bind to `127.0.0.1` for security. To expose the port across your local network (e.g., for a phone or another computer), set `-local-host 0.0.0.0` on the command line or set `"local_host": "0.0.0.0"` in your `config.json` mapping rule.
+
+## Disclaimer
+
+This project is an independent open-source tool and is not affiliated with, sponsored by, or endorsed by NetEase, Inc. or NetEase UU Remote. All product names, trademarks, and registered trademarks belong to their respective owners.
+
+- Educational and research purpose: This project is developed and shared solely for technical research, learning, and network interoperability testing. Do not use this tool for unauthorized access, commercial purposes, or unlawful activities.
+- No warranty: This software is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement.
+- Limitation of liability: In no event shall the authors or contributors be liable for any direct, indirect, incidental, special, or consequential damages, service disruptions, account restrictions, or data loss arising from the use of or inability to use this software.
+- Compliance: Users are solely responsible for ensuring that their use of this software complies with applicable local laws, regulations, and third-party terms of service.
