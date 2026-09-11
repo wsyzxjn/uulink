@@ -265,8 +265,8 @@ func TestFormatAllowedPorts(t *testing.T) {
 
 func TestDetermineTargetSessions(t *testing.T) {
 	// 1. Default when both are zero
-	if s := determineTargetSessions(0, 0); s != 4 {
-		t.Errorf("expected default 4, got %d", s)
+	if s := determineTargetSessions(0, 0); s != 1 {
+		t.Errorf("expected default 1, got %d", s)
 	}
 
 	// 2. Config overrides default when flag is zero

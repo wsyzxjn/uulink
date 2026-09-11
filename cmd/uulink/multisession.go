@@ -26,12 +26,12 @@ import (
 // the tunnel state is shared, so ordering within a stream is preserved.
 
 const (
-	defaultRelaySessions = 4
-	maxRelaySessions     = 16
+	defaultSessions  = 1
+	maxRelaySessions = 16
 )
 
 // determineTargetSessions resolves the pool size from the CLI flag, then the
-// config file, then the relay default. A value of 1 disables pooling.
+// config file, then the single-session default. A value of 1 disables pooling.
 func determineTargetSessions(flagValue, configValue int) int {
 	if flagValue > 0 {
 		return flagValue
@@ -39,7 +39,7 @@ func determineTargetSessions(flagValue, configValue int) int {
 	if configValue > 0 {
 		return configValue
 	}
-	return defaultRelaySessions
+	return defaultSessions
 }
 
 type shareEntry struct {

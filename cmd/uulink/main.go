@@ -81,7 +81,7 @@ func run() error {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
-	sessionsFlag := flag.Int("sessions", 0, "relay session pool size (default: 4 when the connection is relayed; 1 disables pooling)")
+	sessionsFlag := flag.Int("sessions", 0, "relay session pool size (default: 1; set >1 to enable pooling)")
 	customServe := flag.Bool("custom-serve", false, "run an accountless assistance server that accepts a fixed custom verification code")
 	customConnect := flag.String("custom-connect", "", "connect ID of a custom-code assistance server to connect to")
 	customCodeFlag := flag.String("custom-code", "", "custom verification code (8-16 letters and digits) for -custom-serve or -custom-connect")
@@ -1613,7 +1613,11 @@ func ensureBootstrapGuest(client *api.Client, cfg *auth.Config, configPath, name
 }
 
 func doLoginQRCode(client *api.Client, cfg *auth.Config, configPath string, timeout time.Duration) error {
-	guest, err := ensureBootstrapGuest(client, cfg, configPath, "uulink-login")
+	loginDeviceName, err := cfg.EffectiveHostname()
+	if err != nil {
+		return fmt.Errorf("resolve login device name: %w", err)
+	}
+	guest, err := ensureBootstrapGuest(client, cfg, configPath, loginDeviceName)
 	if err != nil {
 		return fmt.Errorf("create guest: %w", err)
 	}

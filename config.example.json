@@ -9,7 +9,7 @@
     22,
     8080
   ],
-  "sessions": 4,
+  "sessions": 1,
   "mappings": [
     {
       "local_host": "127.0.0.1",

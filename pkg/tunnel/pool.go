@@ -275,10 +275,10 @@ type AdaptiveSessionPool struct {
 }
 
 // NewAdaptiveSessionPool constructs an adaptive pool controller. A target of
-// zero or less selects the relay default of four sessions.
+// zero or less selects the single-session default.
 func NewAdaptiveSessionPool(targetSessions int, policy DispatchPolicy, expandFn func(target int) error) *AdaptiveSessionPool {
 	if targetSessions <= 0 {
-		targetSessions = 4
+		targetSessions = 1
 	}
 	return &AdaptiveSessionPool{
 		pool:           NewSessionPool(policy),
