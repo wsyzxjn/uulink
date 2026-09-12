@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
@@ -29,6 +30,9 @@ const (
 	// PolicyStreamLeastLoaded assigns each new stream to the session with the
 	// fewest active streams.
 	PolicyStreamLeastLoaded
+	// PolicyHealthAware prefers sessions with recent receive throughput and
+	// penalizes sessions that already carry active streams.
+	PolicyHealthAware
 )
 
 // SimpleSession adapts a FrameSender and an optional close function to Session.
@@ -67,12 +71,25 @@ type SessionPool struct {
 	rrIndex      atomic.Uint64
 	streamMap    sync.Map // stream key -> Session
 	activeCounts map[string]*int64
+	received     sync.Map // session ID -> *atomic.Uint64
+	health       map[string]*sessionHealth
 	closed       bool
+}
+
+type sessionHealth struct {
+	sampledAt time.Time
+	bytes     uint64
+	rate      float64
+	hasRate   bool
 }
 
 // NewSessionPool creates an empty pool with the given dispatch policy.
 func NewSessionPool(policy DispatchPolicy) *SessionPool {
-	return &SessionPool{policy: policy, activeCounts: make(map[string]*int64)}
+	return &SessionPool{
+		policy:       policy,
+		activeCounts: make(map[string]*int64),
+		health:       make(map[string]*sessionHealth),
+	}
 }
 
 // AddSession registers a session. Duplicate IDs and nil sessions are ignored.
@@ -95,7 +112,23 @@ func (p *SessionPool) AddSession(s Session) {
 		var count int64
 		p.activeCounts[s.ID()] = &count
 	}
+	var received atomic.Uint64
+	p.received.Store(s.ID(), &received)
+	if _, ok := p.health[s.ID()]; !ok {
+		p.health[s.ID()] = &sessionHealth{}
+	}
 	logging.Infof("[pool] session %s added; active sessions: %d", s.ID(), len(p.sessions))
+}
+
+// ObserveReceived records bytes received from a session. The scheduler uses
+// this passive signal to avoid assigning new streams to decayed rooms.
+func (p *SessionPool) ObserveReceived(id string, n int) {
+	if n <= 0 {
+		return
+	}
+	if value, ok := p.received.Load(id); ok {
+		value.(*atomic.Uint64).Add(uint64(n))
+	}
 }
 
 // StreamRef identifies a TCP stream whose transport was lost.
@@ -114,6 +147,8 @@ func (p *SessionPool) RemoveSession(id string) []StreamRef {
 	}
 	p.sessions = kept
 	delete(p.activeCounts, id)
+	p.received.Delete(id)
+	delete(p.health, id)
 	var refs []StreamRef
 	p.streamMap.Range(func(key, value any) bool {
 		if value.(Session).ID() == id {
@@ -177,6 +212,19 @@ func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
 
 	var chosen Session
 	switch p.policy {
+	case PolicyHealthAware:
+		maxScore := -1.0
+		for _, s := range p.sessions {
+			var active int64
+			if ptr := p.activeCounts[s.ID()]; ptr != nil {
+				active = atomic.LoadInt64(ptr)
+			}
+			score := p.healthScore(s.ID(), active)
+			if score > maxScore {
+				maxScore = score
+				chosen = s
+			}
+		}
 	case PolicyStreamLeastLoaded:
 		minCount := int64(-1)
 		for _, s := range p.sessions {
@@ -251,6 +299,8 @@ func (p *SessionPool) Close() error {
 	sessions := p.sessions
 	p.sessions = nil
 	p.activeCounts = make(map[string]*int64)
+	p.health = make(map[string]*sessionHealth)
+	p.received.Clear()
 	p.streamMap.Clear()
 	p.mu.Unlock()
 	var errs []error
@@ -260,6 +310,46 @@ func (p *SessionPool) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (p *SessionPool) healthScore(id string, active int64) float64 {
+	now := time.Now()
+	health := p.health[id]
+	if health == nil {
+		health = &sessionHealth{}
+		p.health[id] = health
+	}
+	var total uint64
+	if value, ok := p.received.Load(id); ok {
+		total = value.(*atomic.Uint64).Load()
+	}
+	if !health.sampledAt.IsZero() {
+		elapsed := now.Sub(health.sampledAt).Seconds()
+		if elapsed > 0 {
+			instant := float64(total-health.bytes) / elapsed
+			const alpha = 0.35
+			if health.hasRate {
+				health.rate = alpha*instant + (1-alpha)*health.rate
+			} else {
+				health.rate = instant
+				health.hasRate = true
+			}
+		}
+	}
+	health.bytes = total
+	health.sampledAt = now
+
+	capacity := health.rate
+	if !health.hasRate {
+		// Unknown idle sessions are assumed to be fresh and useful.
+		capacity = 8 * 1024 * 1024
+	} else if capacity < 64*1024 {
+		capacity = 64 * 1024
+	}
+	// Capacity matters more than perfect stream balance: when one relay room is
+	// already slow, concentrating a new stream on a healthy room is better than
+	// spreading every stream across a known-bad allocation.
+	return capacity / (1 + float64(active)*0.10)
 }
 
 // AdaptiveSessionPool keeps a single session on a direct connection and, once

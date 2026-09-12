@@ -123,6 +123,7 @@ type Config struct {
 	Mappings        []PortMapping `json:"mappings,omitempty"`
 	AllowLAN        bool          `json:"allow_lan,omitempty"`
 	AllowedPorts    []int         `json:"allowed_ports,omitempty"`
+	SessionMode     string        `json:"session_mode,omitempty"`
 	Sessions        int           `json:"sessions,omitempty"`
 	VersionName     string        `json:"version_name,omitempty"`
 	VersionCode     string        `json:"version_code,omitempty"`

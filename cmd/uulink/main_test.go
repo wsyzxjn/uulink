@@ -263,25 +263,42 @@ func TestFormatAllowedPorts(t *testing.T) {
 	}
 }
 
-func TestDetermineTargetSessions(t *testing.T) {
-	// 1. Default when both are zero
-	if s := determineTargetSessions(0, 0); s != 1 {
-		t.Errorf("expected default 1, got %d", s)
+func TestResolveSessionPolicy(t *testing.T) {
+	tests := []struct {
+		name           string
+		flagValue      string
+		configMode     string
+		configSessions int
+		wantMode       string
+		wantTarget     int
+		wantAuto       bool
+		wantErr        bool
+	}{
+		{name: "default auto", wantMode: "auto", wantTarget: defaultAutoSessions, wantAuto: true},
+		{name: "config auto cap", configMode: "auto", configSessions: 2, wantMode: "auto", wantTarget: 2, wantAuto: true},
+		{name: "legacy config sessions ignored by default auto", configSessions: 2, wantMode: "auto", wantTarget: defaultAutoSessions, wantAuto: true},
+		{name: "manual mode defaults to one", configMode: "manual", wantMode: "manual", wantTarget: 1},
+		{name: "cli auto ignores config cap", flagValue: "auto", configMode: "manual", configSessions: 1, wantMode: "auto", wantTarget: defaultAutoSessions, wantAuto: true},
+		{name: "cli numeric overrides auto", flagValue: "8", configMode: "auto", configSessions: 2, wantMode: "manual", wantTarget: 8},
+		{name: "cli invalid", flagValue: "many", wantErr: true},
+		{name: "config invalid", configMode: "sometimes", wantErr: true},
 	}
-
-	// 2. Config overrides default when flag is zero
-	if s := determineTargetSessions(0, 2); s != 2 {
-		t.Errorf("expected config 2, got %d", s)
-	}
-
-	// 3. CLI flag overrides config
-	if s := determineTargetSessions(8, 2); s != 8 {
-		t.Errorf("expected CLI flag 8, got %d", s)
-	}
-
-	// 4. User explicitly disables with 1
-	if s := determineTargetSessions(1, 4); s != 1 {
-		t.Errorf("expected disabled 1, got %d", s)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveSessionPolicy(tt.flagValue, tt.configMode, tt.configSessions)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("resolveSessionPolicy() succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSessionPolicy(): %v", err)
+			}
+			if got.mode != tt.wantMode || got.target != tt.wantTarget || got.auto != tt.wantAuto {
+				t.Fatalf("resolveSessionPolicy() = %+v, want mode=%s target=%d auto=%v", got, tt.wantMode, tt.wantTarget, tt.wantAuto)
+			}
+		})
 	}
 }
 

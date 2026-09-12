@@ -98,6 +98,33 @@ func TestSessionPoolLeastLoadedDispatch(t *testing.T) {
 	}
 }
 
+func TestHealthAwarePrefersRecentThroughput(t *testing.T) {
+	pool := NewSessionPool(PolicyHealthAware)
+	fast := newMockSession("fast")
+	slow := newMockSession("slow")
+	pool.AddSession(fast)
+	pool.AddSession(slow)
+
+	// Establish sampling baselines for both sessions.
+	if _, err := pool.SelectSession("rule", "baseline-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.SelectSession("rule", "baseline-2"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	pool.ObserveReceived(fast.ID(), 2*1024*1024)
+	pool.ObserveReceived(slow.ID(), 128*1024)
+	chosen, err := pool.SelectSession("rule", "next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chosen.ID() != fast.ID() {
+		t.Fatalf("selected %s, want faster session %s", chosen.ID(), fast.ID())
+	}
+}
+
 func TestSessionPoolBindStream(t *testing.T) {
 	pool := NewSessionPool(PolicyStreamRoundRobin)
 	s1 := newMockSession("s1")

@@ -489,8 +489,8 @@ func (b *bufferedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transp
 
 func newWebRTCAPI() *webrtc.API {
 	s := webrtc.SettingEngine{}
-	s.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
-	s.SetSCTPMinCwnd(64 * 1024)
+	s.SetSCTPMaxReceiveBufferSize(32 * 1024 * 1024)
+	s.SetSCTPMinCwnd(128 * 1024)
 	s.SetSCTPRTOMax(1500 * time.Millisecond)
 	if stdNet, err := stdnet.NewNet(); err == nil {
 		s.SetNet(&bufferedNet{Net: stdNet})

@@ -167,15 +167,16 @@ Use this method when machines belong to different accounts or for temporary acce
 ```
 
 By default the terminal displays one `connect_id` and an 8-character
-`connect_code`:
+`connect_code`. Auto mode starts with that one stable session and expands the
+relay pool in band only when needed:
 
 ```text
 INFO guest share ready: connect_id=266444253 connect_code=6W44YBPL
 ```
 
-To opt into pooling, pass `-sessions` with a value greater than `1`. The pooled
-server opens one room per session and prints the whole set on a single line, for
-direct use as flag values:
+To force a fixed pool up front, pass `-sessions` with a value greater than `1`.
+The pooled server opens one room per session and prints the whole set on a
+single line, for direct use as flag values:
 
 ```text
 INFO multi-session guest shares ready (4 sessions): -share-id 266444253,266444254,... -share-code 6W44YBPL,7X55ZCQM,...
@@ -355,7 +356,8 @@ UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.1 docker 
   "hostname": "Optional device name exposed during registration",
   "allow_lan": false,
   "allowed_ports": [22, 8080],
-  "sessions": 1,
+  "session_mode": "auto",
+  "sessions": 4,
   "custom_code": "Optional fixed verification code for custom assistance",
   "share_id": "Optional default remote assistance connect ID",
   "share_code": "Optional default remote assistance verification code",
@@ -393,7 +395,8 @@ Field details:
 - `range`: Optional compact port range mapping specifier (e.g. `"7000-7002:6000-6002"`).
 - `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
-- `sessions`: Relay session target, from `1` to `16`. Defaults to `1`, which disables pooling. Set `4` or `8` on both ends for busier proxy workloads. The `-sessions` flag overrides it. With a single share and a logged-in controller, compatible servers create extra rooms automatically when a relay is detected.
+- `session_mode`: `auto` or `manual`. Defaults to `auto`. Auto starts with one primary session and creates a bounded number of additional relay sessions in band when a relay is detected.
+- `sessions`: Relay session target, from `1` to `16`. When `session_mode` is `auto`, it is the pool cap and defaults to `4`. When `session_mode` is `manual`, it is the fixed target. The `-sessions` flag overrides both fields; `-sessions auto` uses the default cap, while a numeric value requests a fixed manual target.
 - `share_id`, `share_code`, `custom_code`: Optional defaults for share joins (`-share`, `-custom-connect`). A custom-code server also records its connect ID and code here.
 - `unbound_client_id`, `unbound_device_id`: Written by `-unbound-guest-serve` and `-custom-serve` so the accountless device keeps the same connect ID across restarts. Only the single-session server persists them: with a pooled `-unbound-guest-serve` (`-sessions` greater than `1`) the identity is regenerated on every start, and both the connect IDs and codes change. Use `-custom-serve` for a stable entry point with automatic expansion.
 
@@ -421,7 +424,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 | `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
 | `-rule-id <id>` | Target registered rule ID on remote device | - |
 | `-transport <mode>` | WebRTC transport policy for controller sessions: `auto` or `relay` | `auto` |
-| `-sessions <n>` | Relay session target, `1`–`16` (`1` disables pooling) | `1` |
+| `-sessions <mode>` | Session mode: `auto` or a fixed target `1`-`16` | `auto` |
 | `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
@@ -447,7 +450,7 @@ Incoming `CONNECT` requests are authorized by the receiving process. Both endpoi
 
 `-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. Server modes reject `-transport relay`; a server-side relay requirement is represented by the signaling response, not by a local server flag.
 
-For automatic relay pooling, use `-custom-serve` on the server and join its single share with a logged-in controller. Set `-sessions 4` on both ends to enable pooling, or use `-sessions 8` for more concurrent downloads, up to 16. The primary share stays stable while additional rooms are created automatically. Older peers and unavailable expansion fall back to the primary session. Each TCP connection stays on one session, so more sessions benefit multiple concurrent connections, not a single download connection.
+For automatic relay pooling, use `-custom-serve` on the server and join its single share with a logged-in controller. Auto mode is the default and uses a default cap of `4` sessions; set `-sessions 8` on both ends for a larger cap, up to 16. The primary share stays stable while additional rooms are created automatically. Older peers and unavailable expansion fall back to the primary session. Each TCP connection stays on one session, so more sessions benefit multiple concurrent connections, not a single download connection.
 
 `-unbound-guest-serve` also supports preparing rooms up front and printing comma-separated share IDs and codes. Pass all pairs to `-share` on the controller. These temporary room identities change after a restart.
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,20 +27,76 @@ import (
 // the tunnel state is shared, so ordering within a stream is preserved.
 
 const (
-	defaultSessions  = 1
-	maxRelaySessions = 16
+	defaultAutoSessions = 4
+	maxRelaySessions    = 16
 )
 
-// determineTargetSessions resolves the pool size from the CLI flag, then the
-// config file, then the single-session default. A value of 1 disables pooling.
-func determineTargetSessions(flagValue, configValue int) int {
-	if flagValue > 0 {
-		return flagValue
+// sessionPolicy describes whether the relay pool should grow automatically or
+// stay at a caller-selected fixed size.
+type sessionPolicy struct {
+	mode   string
+	target int
+	auto   bool
+}
+
+// resolveSessionPolicy keeps the historical manual behavior while making the
+// default adaptive. An explicit -sessions value always wins. Otherwise
+// session_mode selects auto/manual; a legacy config with only sessions=N uses
+// that value as the auto-mode cap.
+func resolveSessionPolicy(flagValue, configMode string, configSessions int) (sessionPolicy, error) {
+	flagValue = strings.ToLower(strings.TrimSpace(flagValue))
+	configMode = strings.ToLower(strings.TrimSpace(configMode))
+
+	if flagValue != "" {
+		if flagValue == "auto" {
+			return autoSessionPolicy(0)
+		}
+		target, err := parseSessionTarget(flagValue)
+		if err != nil {
+			return sessionPolicy{}, err
+		}
+		return sessionPolicy{mode: "manual", target: target}, nil
 	}
-	if configValue > 0 {
-		return configValue
+
+	switch configMode {
+	case "":
+		return autoSessionPolicy(0)
+	case "auto":
+		return autoSessionPolicy(configSessions)
+	case "manual":
+		target := configSessions
+		if target == 0 {
+			target = 1
+		}
+		if target > maxRelaySessions {
+			return sessionPolicy{}, fmt.Errorf("sessions must not exceed %d", maxRelaySessions)
+		}
+		return sessionPolicy{mode: "manual", target: target}, nil
+	default:
+		return sessionPolicy{}, fmt.Errorf("invalid session_mode %q: use auto or manual", configMode)
 	}
-	return defaultSessions
+}
+
+func autoSessionPolicy(configSessions int) (sessionPolicy, error) {
+	target := configSessions
+	if target == 0 {
+		target = defaultAutoSessions
+	}
+	if target > maxRelaySessions {
+		return sessionPolicy{}, fmt.Errorf("sessions must not exceed %d", maxRelaySessions)
+	}
+	return sessionPolicy{mode: "auto", target: target, auto: true}, nil
+}
+
+func parseSessionTarget(value string) (int, error) {
+	target, err := strconv.Atoi(value)
+	if err != nil || target < 1 {
+		return 0, fmt.Errorf("invalid sessions value %q: use auto or an integer from 1 to %d", value, maxRelaySessions)
+	}
+	if target > maxRelaySessions {
+		return 0, fmt.Errorf("sessions must not exceed %d", maxRelaySessions)
+	}
+	return target, nil
 }
 
 type shareEntry struct {
@@ -315,7 +372,7 @@ func connectSignaling(room *api.RoomConnectionInfo, controlling bool) (*signalin
 // configured rules across all of them.
 func doMultiSessionController(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, shares []shareEntry, options multiSessionControllerOptions, secPolicy tunnel.SecurityPolicy) error {
 	logging.Infof("starting multi-session controller with %d sessions", len(shares))
-	pool := tunnel.NewAdaptiveSessionPool(len(shares), tunnel.PolicyStreamLeastLoaded, nil)
+	pool := tunnel.NewAdaptiveSessionPool(len(shares), tunnel.PolicyHealthAware, nil)
 	defer pool.Close()
 	tun := tunnel.NewTunnelWithRules(rules, pool)
 	tun.SetSecurityPolicy(secPolicy)
@@ -381,7 +438,10 @@ func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tun
 		Signal:        sig,
 		DeviceID:      peerDeviceID,
 		TransportMode: transportMode,
-		OnSignalData:  tun.HandleMessage,
+		OnSignalData: func(data []byte) {
+			pool.Pool().ObserveReceived(sessionID, len(data))
+			tun.HandleMessage(data)
+		},
 	})
 	if err != nil {
 		rt.close()
@@ -469,7 +529,7 @@ func doMultiSessionUnboundGuestServe(cfg *auth.Config, rules []tunnel.Rule, room
 	}
 	logging.Infof("initializing %d unbound guest sessions for the relay pool", targetSessions)
 
-	pool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	pool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyHealthAware, nil)
 	defer pool.Close()
 	tun := tunnel.NewTunnelWithRules(rules, pool)
 	tun.SetSecurityPolicy(policy)

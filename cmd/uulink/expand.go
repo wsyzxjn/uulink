@@ -253,20 +253,31 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 			return nil, err
 		}
 		extra = min(extra, len(slots))
+		indices := make([]int, 0, extra)
+		for i := range slots {
+			if len(indices) == extra {
+				break
+			}
+			if slots[i].rt == nil {
+				indices = append(indices, i)
+				continue
+			}
+			select {
+			case <-slots[i].rt.done:
+				indices = append(indices, i)
+			default:
+			}
+		}
+		if len(indices) < extra {
+			return nil, fmt.Errorf("no additional room slot available")
+		}
 		var wg sync.WaitGroup
-		for i := range extra {
+		for _, i := range indices {
 			wg.Add(1)
-			go func() {
+			go func(i int) {
 				defer wg.Done()
 				slot := &slots[i]
-				if slot.rt != nil {
-					select {
-					case <-slot.rt.done:
-						slot.rt = nil
-					default:
-						return
-					}
-				}
+				slot.rt = nil
 				copyConfig := slot.config
 				rt, share, err := startPooledGuestServer(api.NewClient(&copyConfig), tun, pool, set, nextSessionID(fmt.Sprintf("expand-%d", i+1)), fmt.Sprintf("uulink-expand-%d", i+1), options, nil, policy)
 				slot.config = copyConfig
@@ -277,14 +288,14 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 				set.add(rt)
 				slot.rt = rt
 				slot.share = expandShare{ID: share.ConnectID, Code: share.ConnectCode}
-			}()
+			}(i)
 		}
 		wg.Wait()
 		if err := set.ctx.Err(); err != nil {
 			return nil, err
 		}
 		var shares []expandShare
-		for i := range extra {
+		for _, i := range indices {
 			if slots[i].rt != nil {
 				select {
 				case <-slots[i].rt.done:
@@ -302,7 +313,7 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 
 // maintainControllerPool is the sole repair coordinator. It retries partial
 // expansion with capped backoff and never rejoins an already healthy room.
-func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegotiator, p *peer.Peer, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, target int, mode peer.TransportMode, policy tunnel.SecurityPolicy) error {
+func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegotiator, p *peer.Peer, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, target, batch int, mode peer.TransportMode, policy tunnel.SecurityPolicy) error {
 	if !set.begin() {
 		return nil
 	}
@@ -319,8 +330,12 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 			default:
 			}
 		}
-		if pool.Pool().SessionCount() >= target {
+		before := pool.Pool().SessionCount()
+		if before >= target {
 			return nil
+		}
+		if batch <= 0 || batch > target-before {
+			batch = target - before
 		}
 		select {
 		case <-ctx.Done():
@@ -329,7 +344,7 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 		case <-time.After(expandChannelTimeout):
 			return fmt.Errorf("control channel readiness timeout")
 		}
-		shares, err := n.requestContext(ctx, p, target-1)
+		shares, err := n.requestContext(ctx, p, batch)
 		if err != nil {
 			return err
 		}
@@ -371,6 +386,9 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 		count := pool.Pool().SessionCount()
 		logging.Infof("[expand] pool ready: %d/%d session(s)", count, target)
 		if count < target {
+			if count > before {
+				return nil
+			}
 			return fmt.Errorf("pool below target: %d/%d", count, target)
 		}
 		return nil

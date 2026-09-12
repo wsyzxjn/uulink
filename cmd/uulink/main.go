@@ -81,7 +81,7 @@ func run() error {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	allowLAN := flag.Bool("allow-lan", false, "allow incoming mappings to target non-loopback LAN/WAN addresses (default: loopback only)")
 	allowedPortsFlag := flag.String("allowed-ports", "", "comma-separated list or ranges of allowed target ports (e.g. 22,8080,9000-9010)")
-	sessionsFlag := flag.Int("sessions", 0, "relay session pool size (default: 1; set >1 to enable pooling)")
+	sessionsFlag := flag.String("sessions", "", "session mode: auto or 1-16 (default: auto)")
 	customServe := flag.Bool("custom-serve", false, "run an accountless assistance server that accepts a fixed custom verification code")
 	customConnect := flag.String("custom-connect", "", "connect ID of a custom-code assistance server to connect to")
 	customCodeFlag := flag.String("custom-code", "", "custom verification code (8-16 letters and digits) for -custom-serve or -custom-connect")
@@ -171,10 +171,12 @@ func run() error {
 	}
 
 	client := api.NewClient(cfg)
-	targetSessions := determineTargetSessions(*sessionsFlag, cfg.Sessions)
-	if targetSessions > maxRelaySessions {
-		return fmt.Errorf("sessions must not exceed %d", maxRelaySessions)
+	sessionPolicy, err := resolveSessionPolicy(*sessionsFlag, cfg.SessionMode, cfg.Sessions)
+	if err != nil {
+		return fmt.Errorf("resolve session policy: %w", err)
 	}
+	targetSessions := sessionPolicy.target
+	logging.Infof("session policy: mode=%s target=%d", sessionPolicy.mode, targetSessions)
 
 	if *refreshLogin {
 		return doRefreshLogin(client, cfg, *configPath, *loginQRCodeTimeout)
@@ -259,7 +261,7 @@ func run() error {
 		// starts as a single session and grows in band once a controller
 		// reports a relay. Plain pooled mode still mints every room up front,
 		// which keeps -room-file usable for controllers that join by hand.
-		if targetSessions > 1 && !*customServe {
+		if targetSessions > 1 && !*customServe && !sessionPolicy.auto {
 			// Each pooled session needs its own guest identity and room; the
 			// unbound guest server is the only mode that can create them.
 			return recoverTunnel(*configPath, cfg, func() error {
@@ -350,6 +352,7 @@ func run() error {
 			pckSweep:          *pckSweep,
 			mixKCP:            *mixkcpMode,
 			targetSessions:    targetSessions,
+			autoSessions:      sessionPolicy.auto,
 			lanDiscovery:      *lanDiscovery,
 			lanMotd:           *lanMotd,
 			configPath:        *configPath,
@@ -396,6 +399,7 @@ type controllerOptions struct {
 	pckSweep          bool
 	mixKCP            bool
 	targetSessions    int
+	autoSessions      bool
 	// rules, when non-nil, replaces the config/flag derived mappings (remote
 	// configuration mode).
 	rules []tunnel.Rule
@@ -609,6 +613,9 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 		OnSignalData: func(data []byte) {
 			<-wired
 			if tun != nil {
+				if expandPool != nil {
+					expandPool.Pool().ObserveReceived("primary", len(data))
+				}
 				if frame := tunnel.DecodeFrameForTunnel(data); frame != nil && primarySession != nil {
 					if expandPool != nil {
 						expandPool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
@@ -630,9 +637,13 @@ func runController(client *api.Client, cfg *auth.Config, secPolicy tunnel.Securi
 	expandSet := newSessionSet()
 	defer expandSet.closeAll()
 	recoveryConfig := *cfg
-	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyStreamLeastLoaded,
+	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyHealthAware,
 		func(target int) error {
-			return maintainControllerPool(client, &recoveryConfig, negotiator, p, tun, expandPool, expandSet, target, options.transportMode, secPolicy)
+			batch := target - 1
+			if options.autoSessions {
+				batch = 1
+			}
+			return maintainControllerPool(client, &recoveryConfig, negotiator, p, tun, expandPool, expandSet, target, batch, options.transportMode, secPolicy)
 		})
 	expandPool = adaptivePool
 	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
@@ -1026,6 +1037,9 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 		OnSignalData: func(data []byte) {
 			<-wired
 			if tun != nil {
+				if adaptivePool != nil {
+					adaptivePool.Pool().ObserveReceived("primary", len(data))
+				}
 				if frame := tunnel.DecodeFrameForTunnel(data); frame != nil && primarySession != nil {
 					adaptivePool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
 				}
@@ -1050,7 +1064,7 @@ func serveRoom(client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *
 	// The controller drives pool growth: it is the side that can tell whether
 	// the connection landed on a relay. Each extra session needs a room of its
 	// own, which this side mints on request.
-	adaptivePool = tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
+	adaptivePool = tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyHealthAware, nil)
 	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
 	adaptivePool.Pool().AddSession(primarySession)
 	p.OnModeChange(adaptivePool.OnModeDetected)
