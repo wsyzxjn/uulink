@@ -70,9 +70,21 @@ func platformParams(goos string, cfgPlatform int) (platform, versionName, versio
 	return "4", "4.38.0", "616"
 }
 
+// UserAgent returns the official User-Agent matching the platform.
+func UserAgent(goos string, cfgPlatform int) string {
+	if cfgPlatform == 1 || goos == "windows" {
+		return "UURemote/4.38.3 (com.netease.uuremote; build:9325; Windows 10)"
+	}
+	return "UURemote/4.38.0 (com.netease.uuremote; build:616; macOS 27.0.0) Alamofire/5.7.1"
+}
+
 // BuildHeaders returns the full set of authentication headers for an API request.
 func BuildHeaders(cfg *Config, ts string) map[string]string {
-	platform, versionName, versionCode := platformParams(runtime.GOOS, cfg.Platform)
+	cfgPlatform := 0
+	if cfg != nil {
+		cfgPlatform = cfg.Platform
+	}
+	platform, versionName, versionCode := platformParams(runtime.GOOS, cfgPlatform)
 	if cfg != nil {
 		if cfg.VersionName != "" {
 			versionName = cfg.VersionName
@@ -88,6 +100,7 @@ func BuildHeaders(cfg *Config, ts string) map[string]string {
 		versionCode = envVC
 	}
 	headers := map[string]string{
+		"User-Agent":        UserAgent(runtime.GOOS, cfgPlatform),
 		"X-Param-PLAT":      platform,
 		"X-Param-VN":        versionName,
 		"X-Param-VC":        versionCode,

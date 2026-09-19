@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -94,7 +95,7 @@ func FetchWithClient(client *http.Client, rawURL string) (*RemoteShareConfig, er
 		if err != nil {
 			return nil, fmt.Errorf("build request: %w", err)
 		}
-		req.Header.Set("User-Agent", "uulink")
+		req.Header.Set("User-Agent", auth.UserAgent(runtime.GOOS, 0))
 		req.Header.Set("Accept", "application/json, */*")
 
 		resp, err := client.Do(req)
@@ -149,7 +150,7 @@ func PublishWithClient(client *http.Client, publishURL, secret string, cfg *Remo
 		return fmt.Errorf("build publish request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "uulink")
+	req.Header.Set("User-Agent", auth.UserAgent(runtime.GOOS, 0))
 	if secret != "" {
 		req.Header.Set("Authorization", "Bearer "+secret)
 	}
