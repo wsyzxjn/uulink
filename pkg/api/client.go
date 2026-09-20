@@ -55,7 +55,9 @@ const (
 	// CodeTokenExpired is returned when the JWT is invalid or has expired.
 	CodeTokenExpired = 1120
 	// CodeDeviceOrCodeMismatch is returned when a share join carries a wrong
-	// device ID or verification code.
+	// device ID or verification code. It is also returned, with the message
+	// "please retry", while the served side is re-registering its share after
+	// a restart, so it is not treated as permanent.
 	CodeDeviceOrCodeMismatch = 1131
 	// CodeQRCodeExpired is returned once a login QR code can no longer be used.
 	CodeQRCodeExpired = 1190
@@ -64,9 +66,14 @@ const (
 // Permanent reports whether the error describes the request itself rather
 // than a transient service condition. Callers that retry on failure should
 // give up on permanent errors: they need new input or fresh credentials.
+//
+// A wrong share code (1131) is deliberately not permanent: the same code is
+// returned for a few seconds whenever the served side restarts and has not
+// re-uploaded its share sign yet, and a genuinely wrong code is reported on
+// every retry anyway.
 func (e *ResponseError) Permanent() bool {
 	switch e.Code {
-	case CodeInvalidParams, CodeInvalidSign, CodeTokenExpired, CodeDeviceOrCodeMismatch, CodeQRCodeExpired:
+	case CodeInvalidParams, CodeInvalidSign, CodeTokenExpired, CodeQRCodeExpired:
 		return true
 	}
 	return false

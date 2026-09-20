@@ -1441,6 +1441,12 @@ func (p *Peer) logConnectionStats(pc *webrtc.PeerConnection, role string) {
 
 	rtt := "unavailable"
 	var bytesSent, bytesReceived uint64
+	// Stats on a closed connection only make pion log "agent is closed".
+	state := pc.ConnectionState()
+	if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+		logging.Infof("[%s peer] connection status: state=%s mode=%s", role, state.String(), candidatePairMode(pair))
+		return
+	}
 	if stats, ok := pc.GetStats().GetICECandidatePairStats(pair); ok {
 		if stats.CurrentRoundTripTime > 0 {
 			rtt = strconv.FormatFloat(stats.CurrentRoundTripTime*1000, 'f', 1, 64) + "ms"

@@ -28,7 +28,7 @@ func TestIsPermanentError(t *testing.T) {
 		{"api params", fmt.Errorf("join: %w", &api.ResponseError{Code: api.CodeInvalidParams}), true},
 		{"api token expired", &api.ResponseError{Code: api.CodeTokenExpired}, true},
 		{"api bad sign", &api.ResponseError{Code: api.CodeInvalidSign}, true},
-		{"api wrong code", &api.ResponseError{Code: api.CodeDeviceOrCodeMismatch}, true},
+		{"api wrong code is transient while the peer re-registers", &api.ResponseError{Code: api.CodeDeviceOrCodeMismatch}, false},
 		{"api not found is transient", &api.ResponseError{Code: api.CodeObjectNotFound}, false},
 	}
 	for _, tc := range cases {
