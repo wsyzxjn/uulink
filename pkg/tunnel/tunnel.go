@@ -249,6 +249,33 @@ func GenerateRuleID() string {
 
 const defaultMaxInFlight = 128
 
+// inboundQueueDepth bounds the DATA frames a stream holds for its local
+// writer. A peer that honors the DATA_ACK window never has more than
+// defaultMaxInFlight frames outstanding, so enqueueing never blocks for a
+// well-behaved peer. A peer that ignores the window is throttled on its own
+// stream instead of stalling every other stream on the transport.
+const inboundQueueDepth = defaultMaxInFlight
+
+// halfCloseTimeout bounds how long a stream stays half-open after one side
+// has sent its FIN.
+const halfCloseTimeout = 60 * time.Second
+
+// RoutedFrameSender is an optional FrameSender extension. A sender that
+// implements it receives the routing keys of every outgoing frame, so a
+// multiplexing sender such as SessionPool does not have to decode the wire
+// bytes a second time.
+type RoutedFrameSender interface {
+	FrameSender
+	SendRoutedFrame(ruleID, streamID string, frameType gvpb.FrameType, msg []byte) error
+}
+
+// StreamReleaser is an optional FrameSender extension. The tunnel calls
+// ReleaseStream once a stream is fully torn down and no further frame will be
+// sent for it, so a multiplexing sender can drop its per-stream state.
+type StreamReleaser interface {
+	ReleaseStream(ruleID, streamID string)
+}
+
 // Tunnel manages one or more local mapping rules and all PM streams.
 type Tunnel struct {
 	sender         FrameSender
@@ -264,20 +291,39 @@ type Tunnel struct {
 	maxInFlight    int
 }
 
+// stream is one forwarded TCP connection.
+//
+// Two goroutines serve a stream: readLoop moves bytes from the local
+// connection to the peer, and writeLoop drains inbox, which carries the DATA
+// and FIN frames received from the peer plus the local EOF notification. The
+// transport's receive goroutine only enqueues, so a slow local application or
+// target never stalls the other streams sharing the transport. All FIN state
+// transitions run on writeLoop, which keeps them ordered behind the data they
+// follow.
 type stream struct {
-	ruleID         string
-	id             string
-	conn           net.Conn
-	tunnel         *Tunnel
-	ready          chan struct{}
-	ackSem         chan struct{}
-	closed         chan struct{}
-	closeOnce      sync.Once
-	once           sync.Once
+	ruleID string
+	id     string
+	tunnel *Tunnel
+	ready  chan struct{}
+	ackSem chan struct{}
+	inbox  chan inboundItem
+	closed chan struct{}
+
+	closeOnce sync.Once
+	readyOnce sync.Once
+
 	mu             sync.Mutex
+	conn           net.Conn
 	localFinSent   bool
 	remoteFinRecv  bool
 	halfCloseTimer *time.Timer
+}
+
+// inboundItem is one unit of work for a stream's writeLoop.
+type inboundItem struct {
+	payload  []byte
+	fin      bool
+	localEOF bool
 }
 
 // NewTunnel creates a tunnel for one rule.
@@ -403,6 +449,8 @@ func (t *Tunnel) effectiveMaxInFlight() int {
 	return t.maxInFlight
 }
 
+// newStream creates a stream and starts its writer. conn may be nil while the
+// target is still being dialed; attachConn supplies it later.
 func (t *Tunnel) newStream(ruleID, streamID string, conn net.Conn) *stream {
 	s := &stream{
 		ruleID: ruleID,
@@ -411,10 +459,12 @@ func (t *Tunnel) newStream(ruleID, streamID string, conn net.Conn) *stream {
 		tunnel: t,
 		ready:  make(chan struct{}),
 		closed: make(chan struct{}),
+		inbox:  make(chan inboundItem, inboundQueueDepth),
 	}
 	if limit := t.effectiveMaxInFlight(); limit > 0 {
 		s.ackSem = make(chan struct{}, limit)
 	}
+	go s.writeLoop()
 	return s
 }
 
@@ -452,7 +502,7 @@ func (t *Tunnel) Stop() {
 		ln.Close()
 	}
 	t.streams.Range(func(_, v any) bool {
-		v.(*stream).close()
+		t.removeStream(v.(*stream), "")
 		return true
 	})
 }
@@ -477,47 +527,32 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 		msg, err := newConnectMsg(rule.ID, streamID, rule.TargetHost, rule.TargetPort)
 		if err != nil {
 			logging.Errorf("[tunnel] build connect error: %v", err)
-			t.closeStream(rule.ID, streamID, false)
+			t.removeStream(s, "")
 			continue
 		}
-		if err := t.sender.SendFrame(msg); err != nil {
+		if err := t.send(rule.ID, streamID, gvpb.TypeConnect, msg); err != nil {
 			logging.Errorf("[tunnel] send connect error: %v", err)
-			t.closeStream(rule.ID, streamID, false)
+			t.removeStream(s, "")
 			continue
 		}
-		// Hedged dual-send: send duplicate CONNECT after 10ms to eliminate handshake loss penalty on WAN
-		go func(connectMsg []byte, st *stream) {
-			select {
-			case <-time.After(10 * time.Millisecond):
-			case <-st.ready:
-				return
-			case <-st.closed:
-				return
-			case <-t.done:
-				return
-			}
-			select {
-			case <-st.ready:
-				return
-			case <-st.closed:
-				return
-			case <-t.done:
-				return
-			default:
-				_ = t.sender.SendFrame(connectMsg)
-			}
-		}(msg, s)
 		go s.readLoop()
 	}
 }
 
 // HandleMessage processes a protobuf wire-format Message from the remote peer.
 func (t *Tunnel) HandleMessage(data []byte) {
-	frame := decodeFrameForTunnel(data)
-	if frame == nil {
-		return
+	if frame := decodeFrameForTunnel(data); frame != nil {
+		t.HandleFrame(frame)
 	}
-	if !isValidFrameID(frame.RuleID) || !isValidFrameID(frame.StreamID) {
+}
+
+// HandleFrame processes an already decoded port mapping frame. Callers that
+// inspect the frame before dispatching it use this to avoid decoding twice.
+//
+// HandleFrame never blocks on local I/O: DATA and FIN are queued to the
+// stream's writer, and CONNECT dials its target asynchronously.
+func (t *Tunnel) HandleFrame(frame *gvpb.PortMappingFrame) {
+	if frame == nil || !isValidFrameID(frame.RuleID) || !isValidFrameID(frame.StreamID) {
 		return
 	}
 
@@ -541,8 +576,7 @@ func (t *Tunnel) HandleMessage(data []byte) {
 			Version int  `json:"version"`
 		}
 		if err := json.Unmarshal(frame.Payload, &ack); err == nil && !ack.OK {
-			t.closeStream(frame.RuleID, frame.StreamID, false)
-			s.markReady()
+			t.removeStream(s, "")
 			return
 		}
 		s.markReady()
@@ -551,26 +585,18 @@ func (t *Tunnel) HandleMessage(data []byte) {
 		if !streamExists {
 			return
 		}
-		s := v.(*stream)
-		if _, err := s.conn.Write(frame.Payload); err != nil {
-			logging.Errorf("[tunnel] local write error: %v", err)
-			t.closeStream(frame.RuleID, frame.StreamID, true)
-			return
-		}
-		t.sendBuiltMsg(newACKMsg(frame.RuleID, frame.StreamID))
+		v.(*stream).enqueue(inboundItem{payload: frame.Payload})
 
 	case gvpb.TypeDataAck:
 		if streamExists {
-			s := v.(*stream)
-			s.onACK()
+			v.(*stream).onACK()
 		}
 
 	case gvpb.TypeFin:
 		if !streamExists {
 			return
 		}
-		s := v.(*stream)
-		s.handleRemoteFIN()
+		v.(*stream).enqueue(inboundItem{fin: true})
 
 	default:
 		logging.Debugf("[tunnel] unknown frame type ignored")
@@ -587,14 +613,14 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 		if t.allowRemoteLog() {
 			logging.Warnf("[tunnel] connect payload parse error: %v", err)
 		}
-		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
+		t.rejectConnect(frame.RuleID, frame.StreamID)
 		return
 	}
 	if target.TargetHost == "" || target.TargetPort <= 0 {
 		if t.allowRemoteLog() {
 			logging.Warnf("[tunnel] connect payload missing target for rule %s", frame.RuleID)
 		}
-		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
+		t.rejectConnect(frame.RuleID, frame.StreamID)
 		return
 	}
 
@@ -607,47 +633,46 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 			logging.Warnf("[tunnel] rule %s stream %s: connect target=%q port=%d rejected by security policy: %v",
 				frame.RuleID, frame.StreamID, target.TargetHost, target.TargetPort, err)
 		}
-		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
+		t.rejectConnect(frame.RuleID, frame.StreamID)
 		return
 	}
 
-	addr := net.JoinHostPort(target.TargetHost, strconv.Itoa(target.TargetPort))
+	// Register the stream before dialing so a retransmitted CONNECT is
+	// ignored, then dial off the transport's receive goroutine: an unreachable
+	// target must not hold up every other stream for the connect timeout.
+	s := t.newStream(frame.RuleID, frame.StreamID, nil)
+	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
+	go t.dialStream(s, target.TargetHost, target.TargetPort)
+}
+
+// rejectConnect answers a CONNECT that never became a stream. The sender may
+// have bound the stream to a session when the CONNECT arrived, so release it.
+func (t *Tunnel) rejectConnect(ruleID, streamID string) {
+	msg, err := newSynAckMsg(ruleID, streamID, false)
+	t.sendBuilt(ruleID, streamID, gvpb.TypeSynAck, msg, err)
+	t.releaseBinding(ruleID, streamID)
+}
+
+func (t *Tunnel) dialStream(s *stream, host string, port int) {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
 	if err != nil {
 		if t.allowRemoteLog() {
-			logging.Warnf("[tunnel] connect target=%q error: %v", target.TargetHost, err)
+			logging.Warnf("[tunnel] connect target=%q error: %v", host, err)
 		}
-		t.sendBuiltMsg(newSynAckMsg(frame.RuleID, frame.StreamID, false))
+		t.removeStream(s, gvpb.TypeSynAck)
 		return
 	}
-
-	configureTCPConn(conn)
-	s := t.newStream(frame.RuleID, frame.StreamID, conn)
-	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
-	synAckMsg, synAckErr := newSynAckMsg(frame.RuleID, frame.StreamID, true)
-	t.sendBuiltMsg(synAckMsg, synAckErr)
-	s.markReady()
-	logging.Debugf("[tunnel] stream connected: rule=%s stream=%s target=%q", frame.RuleID, frame.StreamID, target.TargetHost)
-	if synAckErr == nil {
-		// Hedged dual-send: send duplicate SYN_ACK after 10ms
-		go func(msg []byte, st *stream) {
-			select {
-			case <-time.After(10 * time.Millisecond):
-			case <-st.closed:
-				return
-			case <-t.done:
-				return
-			}
-			select {
-			case <-st.closed:
-				return
-			case <-t.done:
-				return
-			default:
-				t.sendBuiltMsg(msg, nil)
-			}
-		}(synAckMsg, s)
+	if !s.attachConn(conn) {
+		// The stream was torn down while the dial was in flight.
+		conn.Close()
+		return
 	}
+	configureTCPConn(conn)
+	msg, err := newSynAckMsg(s.ruleID, s.id, true)
+	t.sendBuilt(s.ruleID, s.id, gvpb.TypeSynAck, msg, err)
+	s.markReady()
+	logging.Debugf("[tunnel] stream connected: rule=%s stream=%s target=%q", s.ruleID, s.id, host)
 	go s.readLoop()
 }
 
@@ -673,36 +698,68 @@ func (t *Tunnel) nextStreamID(ruleID string) string {
 	return strconv.FormatUint(uint64(t.nextIDs[ruleID]), 10)
 }
 
-func (t *Tunnel) sendFIN(ruleID, streamID string) {
-	msg, err := newFINMsg(ruleID, streamID)
-	t.sendBuiltMsg(msg, err)
-	if err == nil {
-		go func(finMsg []byte) {
-			time.Sleep(10 * time.Millisecond)
-			t.sendBuiltMsg(finMsg, nil)
-		}(msg)
+// send routes one built frame to the peer.
+func (t *Tunnel) send(ruleID, streamID string, frameType gvpb.FrameType, msg []byte) error {
+	if routed, ok := t.sender.(RoutedFrameSender); ok {
+		return routed.SendRoutedFrame(ruleID, streamID, frameType, msg)
 	}
+	return t.sender.SendFrame(msg)
 }
 
-func (t *Tunnel) sendBuiltMsg(msg []byte, err error) {
+func (t *Tunnel) sendBuilt(ruleID, streamID string, frameType gvpb.FrameType, msg []byte, err error) {
 	if err != nil {
-		logging.Errorf("[tunnel] build message error: %v", err)
+		logging.Errorf("[tunnel] build %s error: %v", frameType, err)
 		return
 	}
-	if err := t.sender.SendFrame(msg); err != nil {
-		logging.Errorf("[tunnel] send message error: %v", err)
+	if err := t.send(ruleID, streamID, frameType, msg); err != nil {
+		logging.Warnf("[tunnel] send %s error (rule %s stream %s): %v", frameType, ruleID, streamID, err)
 	}
 }
 
-func (t *Tunnel) closeStream(ruleID, streamID string, sendFin bool) {
-	key := streamKey(ruleID, streamID)
-	if v, ok := t.streams.Load(key); ok {
-		s := v.(*stream)
-		s.close()
-		t.streams.Delete(key)
-		if sendFin {
-			t.sendFIN(ruleID, streamID)
-		}
+func (t *Tunnel) sendFIN(ruleID, streamID string) {
+	msg, err := newFINMsg(ruleID, streamID)
+	t.sendBuilt(ruleID, streamID, gvpb.TypeFin, msg, err)
+}
+
+// releaseBinding tells a multiplexing sender that no frame will follow for
+// the stream.
+func (t *Tunnel) releaseBinding(ruleID, streamID string) {
+	if releaser, ok := t.sender.(StreamReleaser); ok {
+		releaser.ReleaseStream(ruleID, streamID)
+	}
+}
+
+// removeStream tears a stream down exactly once: it leaves the stream table,
+// its local connection is closed, the optional final frame (a FIN, or a
+// negative SYN_ACK for a failed dial) is sent, and only then is the sender
+// told that the stream is gone. Nothing is ever sent for a stream after its
+// transport binding has been released.
+func (t *Tunnel) removeStream(s *stream, final gvpb.FrameType) {
+	if !t.streams.CompareAndDelete(streamKey(s.ruleID, s.id), s) {
+		return
+	}
+	s.close()
+	switch final {
+	case gvpb.TypeFin:
+		t.sendFIN(s.ruleID, s.id)
+	case gvpb.TypeSynAck:
+		msg, err := newSynAckMsg(s.ruleID, s.id, false)
+		t.sendBuilt(s.ruleID, s.id, gvpb.TypeSynAck, msg, err)
+	}
+	t.releaseBinding(s.ruleID, s.id)
+}
+
+func (t *Tunnel) closeStream(ruleID, streamID string) {
+	if v, ok := t.streams.Load(streamKey(ruleID, streamID)); ok {
+		t.removeStream(v.(*stream), "")
+	}
+}
+
+// CloseStreams aborts only streams whose session has failed. Data from an old
+// TCP stream must never be moved to a replacement transport without replay.
+func (t *Tunnel) CloseStreams(refs []StreamRef) {
+	for _, ref := range refs {
+		t.closeStream(ref.RuleID, ref.StreamID)
 	}
 }
 
@@ -715,19 +772,54 @@ func (s *stream) onACK() {
 	}
 }
 
+// attachConn installs the dialed target connection. It reports false when the
+// stream was closed in the meantime.
+func (s *stream) attachConn(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.closed:
+		return false
+	default:
+	}
+	s.conn = conn
+	return true
+}
+
+func (s *stream) connection() net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn
+}
+
+// close releases the local resources of a stream. Frames are still sent by
+// the caller (removeStream) after this returns, so it must not touch the
+// sender.
 func (s *stream) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.markReady()
 		s.mu.Lock()
+		s.localFinSent = true
+		s.remoteFinRecv = true
 		if s.halfCloseTimer != nil {
 			s.halfCloseTimer.Stop()
 		}
+		conn := s.conn
 		s.mu.Unlock()
-		if s.conn != nil {
-			_ = s.conn.Close()
+		if conn != nil {
+			_ = conn.Close()
 		}
 	})
+}
+
+// enqueue hands a DATA frame, a remote FIN, or the local EOF to writeLoop.
+func (s *stream) enqueue(item inboundItem) {
+	select {
+	case s.inbox <- item:
+	case <-s.closed:
+	case <-s.tunnel.done:
+	}
 }
 
 func (s *stream) armHalfCloseTimeout() {
@@ -736,72 +828,138 @@ func (s *stream) armHalfCloseTimeout() {
 	if s.halfCloseTimer != nil {
 		s.halfCloseTimer.Stop()
 	}
-	s.halfCloseTimer = time.AfterFunc(60*time.Second, func() {
-		s.close()
-		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
+	s.halfCloseTimer = time.AfterFunc(halfCloseTimeout, func() {
+		s.mu.Lock()
+		final := gvpb.FrameType("")
+		if !s.localFinSent {
+			// The peer finished but the local side never did: tell the peer
+			// the stream is over so it does not wait for its own timeout.
+			s.localFinSent = true
+			final = gvpb.TypeFin
+		}
+		s.mu.Unlock()
+		s.tunnel.removeStream(s, final)
 	})
 }
 
-func (s *stream) handleLocalEOF() {
+// handleLocalEOF runs on writeLoop once the local connection stopped
+// delivering data.
+func (s *stream) handleLocalEOF() (done bool) {
 	s.mu.Lock()
 	if s.localFinSent {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.localFinSent = true
 	bothClosed := s.remoteFinRecv
 	s.mu.Unlock()
 
-	s.tunnel.sendFIN(s.ruleID, s.id)
-
 	if bothClosed {
-		s.close()
-		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
-	} else {
-		s.armHalfCloseTimeout()
+		s.tunnel.removeStream(s, gvpb.TypeFin)
+		return true
 	}
+	s.tunnel.sendFIN(s.ruleID, s.id)
+	s.armHalfCloseTimeout()
+	return false
 }
 
-func (s *stream) handleRemoteFIN() {
+// handleRemoteFIN runs on writeLoop after every DATA frame that preceded the
+// FIN has been written locally.
+func (s *stream) handleRemoteFIN() (done bool) {
 	s.mu.Lock()
 	if s.remoteFinRecv {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.remoteFinRecv = true
 	bothClosed := s.localFinSent
+	conn := s.conn
 	s.mu.Unlock()
 
 	logging.Debugf("[tunnel] stream remote fin: rule=%s stream=%s (bothClosed=%v)", s.ruleID, s.id, bothClosed)
 
 	if bothClosed {
-		s.close()
-		s.tunnel.streams.Delete(streamKey(s.ruleID, s.id))
-	} else {
-		if tcpConn, ok := s.conn.(interface{ CloseWrite() error }); ok {
-			_ = tcpConn.CloseWrite()
+		s.tunnel.removeStream(s, "")
+		return true
+	}
+	if tcpConn, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = tcpConn.CloseWrite()
+	}
+	s.armHalfCloseTimeout()
+	return false
+}
+
+// writeLoop is the single writer of the local connection. It acknowledges
+// each DATA frame after the local write succeeded, which is what keeps the
+// peer's in-flight window honest.
+func (s *stream) writeLoop() {
+	select {
+	case <-s.ready:
+	case <-s.closed:
+		return
+	}
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-s.tunnel.done:
+			return
+		case item := <-s.inbox:
+			switch {
+			case item.localEOF:
+				if s.handleLocalEOF() {
+					return
+				}
+			case item.fin:
+				if s.handleRemoteFIN() {
+					return
+				}
+			default:
+				conn := s.connection()
+				if conn == nil {
+					return
+				}
+				if _, err := conn.Write(item.payload); err != nil {
+					select {
+					case <-s.closed:
+					default:
+						logging.Errorf("[tunnel] local write error: %v", err)
+					}
+					s.tunnel.removeStream(s, gvpb.TypeFin)
+					return
+				}
+				msg, err := newACKMsg(s.ruleID, s.id)
+				s.tunnel.sendBuilt(s.ruleID, s.id, gvpb.TypeDataAck, msg, err)
+			}
 		}
-		s.armHalfCloseTimeout()
 	}
 }
 
 func (s *stream) readLoop() {
-	<-s.ready
+	select {
+	case <-s.ready:
+	case <-s.closed:
+		return
+	}
 	select {
 	case <-s.closed:
 		return
 	default:
+	}
+	conn := s.connection()
+	if conn == nil {
+		return
 	}
 
 	pBuf := readBufPool.Get().(*[]byte)
 	buf := *pBuf
 	defer func() {
 		readBufPool.Put(pBuf)
-		s.handleLocalEOF()
+		s.enqueue(inboundItem{localEOF: true})
 	}()
 
 	for {
-		n, err := s.conn.Read(buf)
+		n, err := conn.Read(buf)
 		if n > 0 {
 			if s.ackSem != nil {
 				select {
@@ -813,15 +971,18 @@ func (s *stream) readLoop() {
 				}
 			}
 
-			payload := make([]byte, n)
-			copy(payload, buf[:n])
-			msg, msgErr := newDataMsg(s.ruleID, s.id, payload)
+			// Encode copies the payload, so the pooled buffer is reused as is.
+			msg, msgErr := newDataMsg(s.ruleID, s.id, buf[:n])
 			if msgErr != nil {
 				logging.Errorf("[tunnel] build data error: %v", msgErr)
 				return
 			}
-			if err := s.tunnel.sender.SendFrame(msg); err != nil {
-				logging.Errorf("[tunnel] send data error: %v", err)
+			if err := s.tunnel.send(s.ruleID, s.id, gvpb.TypeData, msg); err != nil {
+				select {
+				case <-s.closed:
+				default:
+					logging.Errorf("[tunnel] send data error: %v", err)
+				}
 				return
 			}
 		}
@@ -835,7 +996,7 @@ func (s *stream) readLoop() {
 }
 
 func (s *stream) markReady() {
-	s.once.Do(func() {
+	s.readyOnce.Do(func() {
 		close(s.ready)
 	})
 }
@@ -877,12 +1038,4 @@ func decodeFrameForTunnel(data []byte) *gvpb.PortMappingFrame {
 
 func streamKey(ruleID, streamID string) string {
 	return ruleID + "\x00" + streamID
-}
-
-// CloseStreams aborts only streams whose session has failed. Data from an old
-// TCP stream must never be moved to a replacement transport without replay.
-func (t *Tunnel) CloseStreams(refs []StreamRef) {
-	for _, ref := range refs {
-		t.closeStream(ref.RuleID, ref.StreamID, false)
-	}
 }

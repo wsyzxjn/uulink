@@ -152,3 +152,72 @@ func TestLoadOrInitConfigFile(t *testing.T) {
 		t.Fatal("LoadOrInitConfigFile() succeeded with an unwritable config directory")
 	}
 }
+
+func TestConfigRoundTripKeepsUnknownKeysAndRangeForm(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := `{
+  "jwt": "token",
+  "client_id": "client",
+  "device_id": "device",
+  "user_id": "user",
+  "my_note": "keep me",
+  "future_setting": {"nested": [1, 2, 3]},
+  "mappings": [
+    {"local_port": "9000-9005", "remote_port": "8000-8005"},
+    {"local_port": 18080, "remote_port": 8080, "local_host": "0.0.0.0"}
+  ]
+}
+`
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfigFile(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	cfg.JWT = "new-token"
+	if err := SaveConfigFile(path, cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("rewritten config is not JSON: %v", err)
+	}
+	if string(raw["jwt"]) != `"new-token"` {
+		t.Errorf("jwt = %s, want the updated value", raw["jwt"])
+	}
+	if string(raw["my_note"]) != `"keep me"` {
+		t.Errorf("unknown key my_note was dropped or changed: %s", raw["my_note"])
+	}
+	var future map[string][]int
+	if err := json.Unmarshal(raw["future_setting"], &future); err != nil || len(future["nested"]) != 3 {
+		t.Errorf("unknown nested key was dropped or changed: %s", raw["future_setting"])
+	}
+	var mappings []map[string]any
+	if err := json.Unmarshal(raw["mappings"], &mappings); err != nil {
+		t.Fatal(err)
+	}
+	if got := mappings[0]["local_port"]; got != "9000-9005" {
+		t.Errorf("range mapping was rewritten as %v, want the original string form", got)
+	}
+	if _, present := mappings[0]["local_range"]; present {
+		t.Error("rewritten mapping uses the internal local_range key")
+	}
+	if got := mappings[1]["local_port"]; got != float64(18080) {
+		t.Errorf("single-port mapping local_port = %v", got)
+	}
+
+	// Loading the rewritten file yields the same configuration.
+	again, err := LoadConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if again.JWT != "new-token" || len(again.Mappings) != 2 || again.Mappings[0].LocalRange != "9000-9005" || again.Mappings[1].LocalPort != 18080 {
+		t.Fatalf("reloaded config mismatch: %+v", again)
+	}
+}

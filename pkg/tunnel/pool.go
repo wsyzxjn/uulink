@@ -251,7 +251,9 @@ func (p *SessionPool) SelectSession(ruleID, streamID string) (Session, error) {
 	return chosen, nil
 }
 
-// ReleaseStream drops the stream binding once the stream has finished.
+// ReleaseStream drops the stream binding once the stream has finished. It
+// implements StreamReleaser, so Tunnel calls it after the last frame of a
+// stream (including a rejected CONNECT) has been sent.
 func (p *SessionPool) ReleaseStream(ruleID, streamID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -264,32 +266,36 @@ func (p *SessionPool) ReleaseStream(ruleID, streamID string) {
 	}
 }
 
-// SendFrame implements FrameSender: the frame is routed to the session bound
-// to its stream, and a FIN releases the binding after it is sent.
+// SendFrame implements FrameSender by decoding the routing keys from the wire
+// bytes. Tunnel uses SendRoutedFrame instead, which skips the decode.
 func (p *SessionPool) SendFrame(msg []byte) error {
 	frame := decodeFrameForTunnel(msg)
 	if frame == nil {
 		return errors.New("pool: frame is not a port mapping message")
 	}
+	return p.SendRoutedFrame(frame.RuleID, frame.StreamID, frame.Type, msg)
+}
+
+// SendRoutedFrame implements RoutedFrameSender: a CONNECT picks and binds the
+// session for its stream, every later frame follows that binding. The binding
+// lives until the tunnel calls ReleaseStream, because DATA_ACK frames for the
+// peer's data still have to be sent after this side's FIN.
+func (p *SessionPool) SendRoutedFrame(ruleID, streamID string, frameType gvpb.FrameType, msg []byte) error {
 	var session Session
-	var err error
-	if frame.Type == gvpb.TypeConnect {
-		session, err = p.SelectSession(frame.RuleID, frame.StreamID)
+	if frameType == gvpb.TypeConnect {
+		var err error
+		session, err = p.SelectSession(ruleID, streamID)
+		if err != nil {
+			return err
+		}
 	} else {
-		bound, ok := p.streamMap.Load(streamKey(frame.RuleID, frame.StreamID))
+		bound, ok := p.streamMap.Load(streamKey(ruleID, streamID))
 		if !ok {
 			return errors.New("stream transport no longer exists")
 		}
 		session = bound.(Session)
 	}
-	if err != nil {
-		return err
-	}
-	err = session.SendFrame(msg)
-	if frame.Type == gvpb.TypeFin {
-		p.ReleaseStream(frame.RuleID, frame.StreamID)
-	}
-	return err
+	return session.SendFrame(msg)
 }
 
 // Close terminates all sessions and empties the pool.
@@ -421,3 +427,13 @@ func (a *AdaptiveSessionPool) Close() error { return a.pool.Close() }
 
 // SendFrame implements FrameSender by routing through the underlying pool.
 func (a *AdaptiveSessionPool) SendFrame(msg []byte) error { return a.pool.SendFrame(msg) }
+
+// SendRoutedFrame implements RoutedFrameSender through the underlying pool.
+func (a *AdaptiveSessionPool) SendRoutedFrame(ruleID, streamID string, frameType gvpb.FrameType, msg []byte) error {
+	return a.pool.SendRoutedFrame(ruleID, streamID, frameType, msg)
+}
+
+// ReleaseStream implements StreamReleaser through the underlying pool.
+func (a *AdaptiveSessionPool) ReleaseStream(ruleID, streamID string) {
+	a.pool.ReleaseStream(ruleID, streamID)
+}

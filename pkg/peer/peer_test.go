@@ -58,8 +58,8 @@ func TestReplacePBBytesFieldUpdatesControlDeviceAndCapability(t *testing.T) {
 	if !bytes.Contains(updated, []byte("test-device-123456")) {
 		t.Fatal("control device ID was not replaced")
 	}
-	if bytes.Contains(updated, []byte("aeawqa5txeafoxl4")) {
-		t.Fatal("captured control device ID remained in ConnectOptions")
+	if bytes.Contains(updated, []byte("0000000000000000")) {
+		t.Fatal("device ID placeholder remained in ConnectOptions")
 	}
 
 	capability := mustHex("08061003180320022801300238024003480150015801")

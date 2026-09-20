@@ -186,7 +186,8 @@ func TestSessionPoolSendFrameRoutesByStream(t *testing.T) {
 		t.Fatalf("data frame routing: s1=%d s2=%d", s1.FrameCount(), s2.FrameCount())
 	}
 
-	// FIN is delivered on the same session and then releases the binding.
+	// FIN is delivered on the same session. The binding stays until the
+	// tunnel releases it: DATA_ACKs for the peer's data still follow the FIN.
 	fin1, err := newFINMsg("1001", "1")
 	if err != nil {
 		t.Fatal(err)
@@ -197,8 +198,22 @@ func TestSessionPoolSendFrameRoutesByStream(t *testing.T) {
 	if s1.FrameCount() != 3 {
 		t.Fatalf("fin frame routing: s1=%d, want 3", s1.FrameCount())
 	}
+	ack1, err := newACKMsg("1001", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SendFrame(ack1); err != nil {
+		t.Fatalf("send ack after fin: %v", err)
+	}
+	if s1.FrameCount() != 4 {
+		t.Fatalf("ack after fin routing: s1=%d, want 4", s1.FrameCount())
+	}
+	pool.ReleaseStream("1001", "1")
 	if _, loaded := pool.streamMap.Load(streamKey("1001", "1")); loaded {
-		t.Fatal("stream 1 was not released after fin")
+		t.Fatal("stream 1 was not released")
+	}
+	if err := pool.SendFrame(ack1); err == nil {
+		t.Fatal("SendFrame() routed a frame for a released stream")
 	}
 
 	if err := pool.SendFrame([]byte{0xff, 0x00}); err == nil {

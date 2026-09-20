@@ -13,19 +13,17 @@ package peer
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
-	"net"
-
+	"github.com/google/uuid"
 	"github.com/pion/transport/v4"
 	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/webrtc/v4"
@@ -43,9 +41,14 @@ const (
 )
 
 // connectOptionsHex is the GvPb_ConnectOptions protobuf captured from the
-// official 4.38.0 macOS client (contains device_id aeawqa5txeafoxl4 = this
-// machine and version 4.38.0). Replayed verbatim.
-const connectOptionsHex = "080110ffffffffffffffffff011a190802100620012a0608802810c01632003801408087a70e583c220c0878100218801e20f0102801220c0878100218801e20f0102803220c0878100118801e20f0102801220c0878100118801e20f0102803320808802810c01618783a0608802810c01640044a106165617771613574786561666f786c3450015a10080610021801200230023802400248016206342e33382e30"
+// official 4.38.0 macOS client. Field 9 (the controller's device_id) holds a
+// 16-byte placeholder that sendControl replaces with this machine's ID; the
+// remaining fields (capabilities, version 4.38.0) are replayed verbatim.
+const connectOptionsHex = "080110ffffffffffffffffff011a190802100620012a0608802810c01632003801408087a70e583c220c0878100218801e20f0102801220c0878100218801e20f0102803220c0878100118801e20f0102801220c0878100118801e20f0102803320808802810c01618783a0608802810c01640044a10" + connectOptionsDevicePlaceholderHex + "50015a10080610021801200230023802400248016206342e33382e30"
+
+// connectOptionsDevicePlaceholderHex is sixteen '0' characters, the length of
+// a real device ID, so the captured length prefixes stay valid.
+const connectOptionsDevicePlaceholderHex = "30303030303030303030303030303030"
 
 // ConnectOptionsHex exposes the captured protobuf for external use.
 const ConnectOptionsHex = connectOptionsHex
@@ -241,8 +244,15 @@ func NewController(cfg *Config) (*Peer, error) {
 		return p, nil
 	case <-cfg.Signal.Done():
 		return nil, fmt.Errorf("signaling closed while waiting for control ack")
+	case <-time.After(controlAckTimeout):
+		return nil, fmt.Errorf("timeout waiting for control ack after %s", controlAckTimeout)
 	}
 }
+
+// controlAckTimeout bounds the wait for the gateway's answer to the control
+// event. The gateway answers within a second or two; a missing ack means the
+// room is unusable and the caller should start over.
+const controlAckTimeout = 15 * time.Second
 
 // NewControlled creates a peer that answers a controller's soac offer. It is
 // the UULink-side replacement for running the official controlled client.
@@ -392,11 +402,14 @@ func (p *Peer) sendControl(deviceID string) error {
 	if err != nil {
 		return err
 	}
-	if deviceID != "" {
-		pb, err = replacePBBytesField(pb, 9, []byte(deviceID))
-		if err != nil {
-			return fmt.Errorf("replace control device id: %w", err)
-		}
+	if deviceID == "" {
+		// Never send the placeholder: the gateway would attribute this
+		// controller to a device that does not exist.
+		return fmt.Errorf("this machine has no device_id; run \"uulink -login\" to register it")
+	}
+	pb, err = replacePBBytesField(pb, 9, []byte(deviceID))
+	if err != nil {
+		return fmt.Errorf("replace control device id: %w", err)
 	}
 	vn := p.versionName
 	if vn == "" {
@@ -444,7 +457,13 @@ func (p *Peer) sendControl(deviceID string) error {
 			logging.Debugf("[peer] control ack parse: %v (%s)", err, string(arr[1])[:min(len(string(arr[1])), 100)])
 			return
 		}
-		p.ackCh <- &data
+		// Only the first ack matters; a duplicate must not block the
+		// signaling read loop.
+		select {
+		case p.ackCh <- &data:
+		default:
+			logging.Debugf("[peer] duplicate control ack ignored")
+		}
 	})
 }
 
@@ -988,8 +1007,9 @@ func (p *Peer) setupControlledDataChannel(dc *webrtc.DataChannel) {
 		p.mu.Lock()
 		p.fileDC = dc
 		p.mu.Unlock()
-		dc.OnOpen(func() { logging.Infof("[peer] file data channel open") })
+		// OnOpen replaces any earlier handler, so log and notify in one.
 		dc.OnOpen(func() {
+			logging.Infof("[peer] file data channel open")
 			p.mu.Lock()
 			fn := p.onFileOpen
 			p.mu.Unlock()
@@ -1274,10 +1294,7 @@ func (p *Peer) SendSignalPB(msg []byte) error {
 	if dc == nil {
 		return fmt.Errorf("file data channel not ready")
 	}
-	if len(msg) == 0 {
-		return dc.SendText("")
-	}
-	return dc.SendText(unsafe.String(unsafe.SliceData(msg), len(msg)))
+	return dc.SendText(string(msg))
 }
 
 // OnBinaryChannelOpen registers a callback fired when the binary channel opens.
@@ -1493,13 +1510,11 @@ func gzipCompress(data []byte) ([]byte, error) {
 }
 
 func randomUUID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	id, err := uuid.NewRandom()
+	if err != nil {
 		return "", err
 	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+	return id.String(), nil
 }
 
 // RestartRequested closes when this room receives a new controller incarnation.

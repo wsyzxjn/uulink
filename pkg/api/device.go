@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,9 +25,21 @@ type UnboundDeviceIdentity struct {
 	DeviceID string
 }
 
+// pseudoMAC derives a stable, locally administered MAC address from the
+// client ID. The device registration endpoints expect a MAC, but the real
+// hardware address of this machine is nobody's business, and one fixed value
+// shared by every installation would make all of them look like one device.
+func pseudoMAC(clientID string) string {
+	digest := sha256.Sum256([]byte("uulink-mac:" + clientID))
+	b := digest[:6]
+	b[0] = (b[0] | 0x02) &^ 0x01 // locally administered, unicast
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+}
+
 // InitMacDevice registers this Mac as a controlled device. The body mirrors
-// the official macOS client's /device/macos/init request; values that identify
-// this installation are taken from the auth config.
+// the official macOS client's /device/macos/init request with generic
+// hardware details; values that identify this installation are derived from
+// the auth config.
 func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 	body := map[string]any{
 		"client_id":        c.cfg.ClientID,
@@ -39,7 +52,7 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 		"name":             name,
 		"model":            "Mac",
 		"cpu":              "Apple M4",
-		"mac":              "d0:11:e5:d5:b9:95",
+		"mac":              pseudoMAC(c.cfg.ClientID),
 		"video":            []string{"Apple M4"},
 		"system_id":        c.cfg.ClientID,
 		"model_identifier": "Mac16,10",
@@ -79,7 +92,7 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 		"base_board":   "Virtual",
 		"cpu":          "Virtual CPU",
 		"video":        []string{"Virtual GPU"},
-		"mac":          "00:11:22:33:44:55",
+		"mac":          pseudoMAC(clientID),
 		"memory":       "16384",
 		"screen":       "1920x1080",
 		"controllable": true,

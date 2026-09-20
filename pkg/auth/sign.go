@@ -150,6 +150,73 @@ type Config struct {
 	// server, reused across restarts so the assistance ID stays stable.
 	UnboundClientID string `json:"unbound_client_id,omitempty"`
 	UnboundDeviceID string `json:"unbound_device_id,omitempty"`
+
+	// extra keeps the keys this version does not know about, so rewriting
+	// the file after a login does not silently drop a user's own entries
+	// or fields added by a newer release.
+	extra map[string]json.RawMessage
+}
+
+// configAlias has the same fields as Config without its methods, so the
+// custom (un)marshalers can delegate to the default encoding.
+type configAlias Config
+
+// UnmarshalJSON decodes the known fields and retains every other key.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	var known configAlias
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = Config(known)
+	for _, key := range knownConfigKeys() {
+		delete(raw, key)
+	}
+	if len(raw) > 0 {
+		c.extra = raw
+	}
+	return nil
+}
+
+// MarshalJSON encodes the known fields followed by the retained extra keys.
+func (c Config) MarshalJSON() ([]byte, error) {
+	data, err := json.Marshal(configAlias(c))
+	if err != nil {
+		return nil, err
+	}
+	if len(c.extra) == 0 {
+		return data, nil
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(data, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range c.extra {
+		if _, known := merged[key]; !known {
+			merged[key] = value
+		}
+	}
+	return json.Marshal(merged)
+}
+
+// knownConfigKeys lists the JSON keys that Config decodes itself.
+func knownConfigKeys() []string {
+	data, _ := json.Marshal(configAlias{})
+	var probe map[string]json.RawMessage
+	_ = json.Unmarshal(data, &probe)
+	keys := make([]string, 0, len(probe)+16)
+	for key := range probe {
+		keys = append(keys, key)
+	}
+	// omitempty fields are absent from the probe; list them explicitly.
+	return append(keys,
+		"hostname", "guest_id", "platform", "mappings", "allow_lan", "allowed_ports",
+		"session_mode", "sessions", "version_name", "version_code", "streamer_version",
+		"custom_code", "share_id", "share_code", "unbound_client_id", "unbound_device_id",
+	)
 }
 
 // PortMapping declares one UULink listener and its peer-side target.
@@ -163,6 +230,37 @@ type PortMapping struct {
 	RemotePort  int    `json:"remote_port,omitempty"`
 	RemoteRange string `json:"remote_range,omitempty"`
 	Range       string `json:"range,omitempty"`
+}
+
+// MarshalJSON writes a range back in the form it was read: a string
+// local_port/remote_port, so a rewritten config still looks like the user's.
+func (m PortMapping) MarshalJSON() ([]byte, error) {
+	out := map[string]any{}
+	if m.RuleID != "" {
+		out["rule_id"] = m.RuleID
+	}
+	if m.LocalHost != "" {
+		out["local_host"] = m.LocalHost
+	}
+	if m.RemoteHost != "" {
+		out["remote_host"] = m.RemoteHost
+	}
+	switch {
+	case m.LocalRange != "":
+		out["local_port"] = m.LocalRange
+	case m.LocalPort != 0:
+		out["local_port"] = m.LocalPort
+	}
+	switch {
+	case m.RemoteRange != "":
+		out["remote_port"] = m.RemoteRange
+	case m.RemotePort != 0:
+		out["remote_port"] = m.RemotePort
+	}
+	if m.Range != "" {
+		out["range"] = m.Range
+	}
+	return json.Marshal(out)
 }
 
 // UnmarshalJSON supports local_port and remote_port as either int or string range.

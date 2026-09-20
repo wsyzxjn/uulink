@@ -43,6 +43,35 @@ func (e *ResponseError) Error() string {
 	return fmt.Sprintf("code %d: %s", e.Code, e.Message)
 }
 
+// Business codes observed from the API. The ones listed here describe a
+// request that is wrong as sent (missing login, bad signature, expired token,
+// wrong verification code), so repeating it unchanged cannot succeed.
+const (
+	// CodeInvalidParams is returned for malformed parameters and for
+	// user-scoped calls made without a valid login.
+	CodeInvalidParams = 1001
+	// CodeInvalidSign is returned when X-Param-SIGN does not verify.
+	CodeInvalidSign = 1003
+	// CodeTokenExpired is returned when the JWT is invalid or has expired.
+	CodeTokenExpired = 1120
+	// CodeDeviceOrCodeMismatch is returned when a share join carries a wrong
+	// device ID or verification code.
+	CodeDeviceOrCodeMismatch = 1131
+	// CodeQRCodeExpired is returned once a login QR code can no longer be used.
+	CodeQRCodeExpired = 1190
+)
+
+// Permanent reports whether the error describes the request itself rather
+// than a transient service condition. Callers that retry on failure should
+// give up on permanent errors: they need new input or fresh credentials.
+func (e *ResponseError) Permanent() bool {
+	switch e.Code {
+	case CodeInvalidParams, CodeInvalidSign, CodeTokenExpired, CodeDeviceOrCodeMismatch, CodeQRCodeExpired:
+		return true
+	}
+	return false
+}
+
 // NewClient creates an API client with the given auth config.
 func NewClient(cfg *auth.Config) *Client {
 	return NewClientWithOptions(cfg, ClientOptions{})

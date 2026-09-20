@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -170,8 +169,7 @@ func PublishWithClient(client *http.Client, publishURL, secret string, cfg *Remo
 
 // Rules converts remote mappings and optional CLI overrides into tunnel.Rule items.
 func (c *RemoteShareConfig) Rules(ruleIDFlag, mappingFlag, localHost, cliLocalPort, remoteHost, cliRemotePort string) ([]tunnel.Rule, error) {
-	var mappings []auth.PortMapping
-	mappings = append(mappings, c.Mappings...)
+	mappings := append([]auth.PortMapping(nil), c.Mappings...)
 	if c.LocalPort > 0 && c.RemotePort > 0 {
 		mappings = append(mappings, auth.PortMapping{
 			LocalPort:  c.LocalPort,
@@ -181,124 +179,12 @@ func (c *RemoteShareConfig) Rules(ruleIDFlag, mappingFlag, localHost, cliLocalPo
 	if c.Mapping != "" && mappingFlag == "" {
 		mappingFlag = c.Mapping
 	}
-
-	var rules []tunnel.Rule
-	seen := make(map[string]bool)
-
-	appendRule := func(rule tunnel.Rule) error {
-		if rule.ID == "" {
-			rule.ID = tunnel.GenerateRuleID()
-		}
-		if _, err := strconv.ParseUint(rule.ID, 10, 64); err != nil {
-			return fmt.Errorf("rule %s: rule-id must be numeric: %w", rule.ID, err)
-		}
-		if rule.LocalPort <= 0 || rule.TargetPort <= 0 {
-			return fmt.Errorf("rule %s: local_port and remote_port must be positive", rule.ID)
-		}
-		if seen[rule.ID] {
-			return fmt.Errorf("duplicate rule ID %s", rule.ID)
-		}
-		seen[rule.ID] = true
-		rules = append(rules, rule)
-		return nil
-	}
-
-	for _, mapping := range mappings {
-		lHost := mapping.LocalHost
-		if lHost == "" {
-			lHost = "127.0.0.1"
-		}
-		rHost := mapping.RemoteHost
-		if rHost == "" {
-			rHost = "127.0.0.1"
-		}
-
-		var pairs []tunnel.PortPair
-		var err error
-		switch {
-		case mapping.Range != "":
-			pairs, err = tunnel.ParsePortMappingSpec(mapping.Range)
-		case mapping.LocalRange != "" || mapping.RemoteRange != "":
-			lSpec := mapping.LocalRange
-			if lSpec == "" && mapping.LocalPort != 0 {
-				lSpec = strconv.Itoa(mapping.LocalPort)
-			}
-			rSpec := mapping.RemoteRange
-			if rSpec == "" && mapping.RemotePort != 0 {
-				rSpec = strconv.Itoa(mapping.RemotePort)
-			}
-			pairs, err = tunnel.ExpandPortRange(lSpec, rSpec)
-		case mapping.LocalPort != 0 && mapping.RemotePort != 0:
-			pairs = []tunnel.PortPair{{LocalPort: mapping.LocalPort, RemotePort: mapping.RemotePort}}
-		default:
-			return nil, fmt.Errorf("mapping must specify local and remote ports or ranges")
-		}
-		if err != nil {
-			return nil, fmt.Errorf("remote mapping rule: %w", err)
-		}
-
-		for _, pair := range pairs {
-			rID := mapping.RuleID
-			if len(pairs) > 1 {
-				rID = ""
-			}
-			if err := appendRule(tunnel.Rule{
-				ID:         rID,
-				LocalHost:  lHost,
-				LocalPort:  pair.LocalPort,
-				TargetHost: rHost,
-				TargetPort: pair.RemotePort,
-			}); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if mappingFlag != "" {
-		pairs, err := tunnel.ParsePortMappingSpec(mappingFlag)
-		if err != nil {
-			return nil, fmt.Errorf("mapping flag: %w", err)
-		}
-		for _, pair := range pairs {
-			rID := ruleIDFlag
-			if len(pairs) > 1 {
-				rID = ""
-			}
-			if err := appendRule(tunnel.Rule{
-				ID:         rID,
-				LocalHost:  localHost,
-				LocalPort:  pair.LocalPort,
-				TargetHost: remoteHost,
-				TargetPort: pair.RemotePort,
-			}); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if cliLocalPort != "" || cliRemotePort != "" {
-		if cliLocalPort == "" || cliRemotePort == "" {
-			return nil, fmt.Errorf("both -local and -remote-port are required for CLI mapping")
-		}
-		pairs, err := tunnel.ExpandPortRange(cliLocalPort, cliRemotePort)
-		if err != nil {
-			return nil, fmt.Errorf("cli port mapping: %w", err)
-		}
-		for _, pair := range pairs {
-			rID := ruleIDFlag
-			if len(pairs) > 1 {
-				rID = ""
-			}
-			if err := appendRule(tunnel.Rule{
-				ID:         rID,
-				LocalHost:  localHost,
-				LocalPort:  pair.LocalPort,
-				TargetHost: remoteHost,
-				TargetPort: pair.RemotePort,
-			}); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return rules, nil
+	return tunnel.BuildRules(mappings, tunnel.CLIMapping{
+		RuleID:     ruleIDFlag,
+		Mapping:    mappingFlag,
+		LocalHost:  localHost,
+		LocalPort:  cliLocalPort,
+		RemoteHost: remoteHost,
+		RemotePort: cliRemotePort,
+	})
 }

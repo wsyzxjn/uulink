@@ -61,7 +61,17 @@ type RoomInfo struct {
 	DeviceID string
 }
 
+// Defaults used when the gateway's open packet does not advertise timings.
+const (
+	defaultPingInterval = 25 * time.Second
+	defaultPingTimeout  = 20 * time.Second
+)
+
 // Client is a socket.io EIO=4 client over WebSocket with binary attachment support.
+//
+// Event handlers run synchronously on the read loop, which preserves the
+// order of signaling events. A handler must therefore return quickly and move
+// any blocking work (HTTP calls, waits) to its own goroutine.
 type Client struct {
 	conn         *websocket.Conn
 	mu           sync.Mutex
@@ -144,7 +154,9 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 		ackHandlers: make(map[int]func([]json.RawMessage)),
 	}
 
-	// Read the EIO open packet
+	// Read the EIO open packet. The gateway sends it right after the
+	// upgrade, so a silent connection is a failure, not something to wait on.
+	_ = conn.SetReadDeadline(time.Now().Add(dialer.HandshakeTimeout))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
@@ -168,6 +180,13 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 
 	c.pingInterval = time.Duration(openData.PingInterval) * time.Millisecond
 	c.pingTimeout = time.Duration(openData.PingTimeout) * time.Millisecond
+	if c.pingInterval <= 0 {
+		c.pingInterval = defaultPingInterval
+	}
+	if c.pingTimeout <= 0 {
+		c.pingTimeout = defaultPingTimeout
+	}
+	c.extendReadDeadline()
 
 	logging.Infof("[signaling] connected")
 
@@ -371,13 +390,17 @@ func (c *Client) EmitBinaryWithAcks(event string, args any, attachment []byte, a
 	if len(ackIDs) == 0 {
 		return fmt.Errorf("at least one ack id is required")
 	}
-	if onAck != nil {
-		c.amu.Lock()
-		for _, ackID := range ackIDs {
+	c.amu.Lock()
+	for _, ackID := range ackIDs {
+		if onAck != nil {
 			c.ackHandlers[ackID] = onAck
 		}
-		c.amu.Unlock()
+		// Callers pass the captured, fixed ack IDs of the control handshake.
+		// Keep the counter ahead of them so a later EmitWithAck cannot be
+		// assigned one of these IDs and steal the pending reply.
+		c.ackCounter = max(c.ackCounter, ackID)
 	}
+	c.amu.Unlock()
 
 	ackID := ackIDs[0]
 
@@ -433,6 +456,14 @@ func (c *Client) send(msg string) error {
 	return c.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
+// extendReadDeadline arms the liveness deadline: our ping every pingInterval
+// draws a pong, so a healthy connection always delivers something well
+// within pingInterval+pingTimeout. Without this a half-open TCP connection
+// would only be noticed by OS keepalives, long after the room is gone.
+func (c *Client) extendReadDeadline() {
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.pingInterval + c.pingTimeout))
+}
+
 func (c *Client) readLoop() {
 	defer c.Close()
 
@@ -440,14 +471,18 @@ func (c *Client) readLoop() {
 		msgType, msg, err := c.conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				if errors.Is(err, net.ErrClosed) {
+				switch {
+				case errors.Is(err, net.ErrClosed):
 					logging.Debugf("[signaling] read loop ended: %v", err)
-				} else {
+				case errors.Is(err, os.ErrDeadlineExceeded):
+					logging.Errorf("[signaling] no traffic for %s; connection considered dead", c.pingInterval+c.pingTimeout)
+				default:
 					logging.Errorf("[signaling] read error: %v", err)
 				}
 			}
 			return
 		}
+		c.extendReadDeadline()
 
 		if msgType == websocket.BinaryMessage {
 			c.handleBinaryFrame(msg)
