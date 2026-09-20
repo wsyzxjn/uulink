@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/api"
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/peer"
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
@@ -46,16 +46,57 @@ func recoveryDelay(attempt int) time.Duration {
 	return min(base+time.Duration(rand.Int64N(int64(base/5)+1)), 30*time.Second)
 }
 
+// permanentError marks a failure that a retry cannot fix: bad flags or
+// configuration, or an API answer that says the request itself is wrong.
+// recoverTunnel returns such errors instead of looping on them.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// permanent wraps err so recoverTunnel does not retry it.
+func permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentError{err: err}
+}
+
+// isPermanentError reports whether err was marked permanent or carries an API
+// business code that only new input or fresh credentials can clear.
+func isPermanentError(err error) bool {
+	var perm *permanentError
+	if errors.As(err, &perm) {
+		return true
+	}
+	var response *api.ResponseError
+	return errors.As(err, &response) && response.Permanent()
+}
+
 // recoverTunnel keeps transient API/signaling/transport errors from exiting a
 // standalone process. Each attempt owns and closes its previous resources.
-func recoverTunnel(configPath string, cfg *auth.Config, run func() error) error {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+//
+// ctx is cancelled by SIGINT/SIGTERM; run must return promptly once it is
+// done. Permanent errors (see isPermanentError) end the loop and are returned
+// so the process exits non-zero instead of retrying forever.
+func recoverTunnel(run func(ctx context.Context) error) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// The first signal cancels ctx, which ends every wait inside run. A second
+	// signal must be able to kill a process stuck in a call that cannot be
+	// cancelled, so restore the default handling once ctx is done.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
-		err := run()
+		err := run(ctx)
 		if err == nil || ctx.Err() != nil {
 			return nil
+		}
+		if isPermanentError(err) {
+			return err
 		}
 		if time.Since(start) > time.Minute {
 			attempt = 0
@@ -65,8 +106,21 @@ func recoverTunnel(configPath string, cfg *auth.Config, run func() error) error 
 		if !waitRecovery(ctx, delay) {
 			return nil
 		}
-
 	}
+}
+
+// runWithRelayFallback runs a controller under recoverTunnel. When a P2P
+// attempt times out in auto mode, the next attempt requires a TURN relay.
+func runWithRelayFallback(initial peer.TransportMode, p2pTimeout time.Duration, run func(ctx context.Context, mode peer.TransportMode) error) error {
+	mode := initial
+	return recoverTunnel(func(ctx context.Context) error {
+		err := run(ctx, mode)
+		if errors.Is(err, errP2PTimeout) && mode == peer.TransportAuto {
+			logging.Warnf("[peer] P2P punch-through timed out after %s; falling back to relay transport for subsequent attempts", p2pTimeout)
+			mode = peer.TransportRelay
+		}
+		return err
+	})
 }
 
 // lostTransport tolerates a short disconnected interval but not a failed or

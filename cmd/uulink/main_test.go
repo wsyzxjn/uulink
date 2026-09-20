@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,15 +47,28 @@ func unsignedTestJWT(subject string) string {
 	return "header." + payload + ".signature"
 }
 
-func TestValidateTransportForServer(t *testing.T) {
-	if err := validateTransportForServer(peer.TransportAuto, true); err != nil {
-		t.Fatalf("server mode rejected auto transport: %v", err)
+// The relay requirement is a controller-only option: the served side has no
+// -transport flag at all, so the restriction is structural.
+func TestServerCommandsHaveNoTransportFlag(t *testing.T) {
+	hasFlag := func(cmd *command, name string) bool {
+		fs := flag.NewFlagSet(cmd.name, flag.ContinueOnError)
+		cmd.bind(fs)
+		return fs.Lookup(name) != nil
 	}
-	if err := validateTransportForServer(peer.TransportRelay, false); err != nil {
-		t.Fatalf("controller mode rejected relay transport: %v", err)
+	if hasFlag(serveCommand(), "transport") {
+		t.Fatal("serve accepts -transport")
 	}
-	if err := validateTransportForServer(peer.TransportRelay, true); err == nil {
-		t.Fatal("server mode accepted relay transport")
+	if hasFlag(shareServeCommand(), "transport") {
+		t.Fatal("share serve accepts -transport")
+	}
+	if !hasFlag(connectCommand(), "transport") || !hasFlag(shareJoinCommand(), "transport") {
+		t.Fatal("controller commands lost -transport")
+	}
+	if mode, err := (&controllerFlags{transport: "relay"}).transportMode(); err != nil || mode != peer.TransportRelay {
+		t.Fatalf("controllerFlags.transportMode() = %v, %v", mode, err)
+	}
+	if _, err := (&controllerFlags{transport: "auto", p2pTimeout: -1}).transportMode(); err == nil {
+		t.Fatal("negative -p2p-timeout was accepted")
 	}
 }
 

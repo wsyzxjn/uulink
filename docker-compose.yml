@@ -29,6 +29,7 @@ services:
     # WORKDIR is /data, so the default -config path already resolves to
     # /data/config.json. Replace the arguments below with your own mapping.
     command:
+      - connect
       - -config
       - /data/config.json
       - -device

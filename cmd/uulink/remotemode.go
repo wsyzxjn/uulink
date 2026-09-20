@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -31,9 +32,12 @@ type remoteConfigOptions struct {
 	remotePort    string
 	capability    string
 	p2pTimeout    time.Duration
+	// Relay pool policy, as resolved from -sessions and the config.
+	targetSessions int
+	autoSessions   bool
 }
 
-func runRemoteConfigController(client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options remoteConfigOptions) error {
+func runRemoteConfigController(ctx context.Context, client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options remoteConfigOptions) error {
 	logging.Infof("fetching remote share configuration from %s", options.url)
 	remoteCfg, err := remoteconfig.Fetch(options.url, remoteConfigFetchTimeout)
 	if err != nil {
@@ -46,7 +50,7 @@ func runRemoteConfigController(client *api.Client, cfg *auth.Config, secPolicy t
 	if remoteCfg.Transport != "" {
 		remoteMode, err := peer.ParseTransportMode(remoteCfg.Transport)
 		if err != nil {
-			return fmt.Errorf("remote configuration: %w", err)
+			return permanent(fmt.Errorf("remote configuration: %w", err))
 		}
 		if remoteMode == peer.TransportRelay {
 			transportMode = peer.TransportRelay
@@ -55,25 +59,31 @@ func runRemoteConfigController(client *api.Client, cfg *auth.Config, secPolicy t
 
 	rules, err := remoteCfg.Rules(options.ruleID, options.mapping, options.localHost, options.localPort, options.remoteHost, options.remotePort)
 	if err != nil {
-		return fmt.Errorf("configure mappings from remote configuration: %w", err)
+		// The document or the local flags are wrong; a retry fetches the same thing.
+		return permanent(fmt.Errorf("configure mappings from remote configuration: %w", err))
 	}
 	if rules == nil {
 		rules = []tunnel.Rule{}
 	}
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	lanMotd := firstNonEmpty(options.lanMotd, remoteCfg.LANMOTD)
-	return runController(client, cfg, secPolicy, controllerOptions{
+	return runController(ctx, client, cfg, secPolicy, controllerOptions{
 		// A logged-in config joins as the user; anything else joins as a guest.
-		shareJoin:     cfg.JWT != "",
-		shareGuest:    cfg.JWT == "",
-		shareID:       remoteCfg.EffectiveShareID(),
-		shareCode:     remoteCfg.EffectiveShareCode(),
-		capability:    options.capability,
-		transportMode: transportMode,
-		rules:         rules,
-		lanDiscovery:  options.lanDiscovery || remoteCfg.LANMOTD != "",
-		lanMotd:       lanMotd,
-		p2pTimeout:    options.p2pTimeout,
+		shareJoin:      cfg.JWT != "",
+		shareGuest:     cfg.JWT == "",
+		shareID:        remoteCfg.EffectiveShareID(),
+		shareCode:      remoteCfg.EffectiveShareCode(),
+		capability:     options.capability,
+		transportMode:  transportMode,
+		rules:          rules,
+		lanDiscovery:   options.lanDiscovery || remoteCfg.LANMOTD != "",
+		lanMotd:        lanMotd,
+		p2pTimeout:     options.p2pTimeout,
+		targetSessions: options.targetSessions,
+		autoSessions:   options.autoSessions,
 	})
 }
 

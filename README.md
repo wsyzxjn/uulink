@@ -11,7 +11,7 @@ uulink is a lightweight TCP port forwarding tool built on the NetEase UU Remote 
 
 ## Key Features
 
-- Headless CLI: Single self-contained binary, no desktop environment or graphical interface required.
+- Headless CLI: Single self-contained binary with `git`-style subcommands (`uulink serve`, `uulink connect`, `uulink share join`, ...), no desktop environment or graphical interface required.
 - P2P direct connection with NAT traversal: Automatically prioritizes direct peer-to-peer tunnels, falling back to official relay nodes when direct traversal is restricted.
 - Bidirectional multi-port forwarding: Forward ports in both directions over a single session (controller to server and server to controller).
 - Batch mapping rules: Define multiple local-to-remote port mappings in a configuration file for instant batch activation.
@@ -50,8 +50,11 @@ with `code 1001: 无效的请求参数` until the login step below overwrites th
 Request the login QR code:
 
 ```bash
-./uulink -login-qrcode
+./uulink login
 ```
+
+(`./uulink login -mobile <number>` logs in with an SMS code instead, and
+`./uulink login -interactive` asks which method to use.)
 
 On a config that has never been used, uulink registers a device identity with UU
 Remote first and stores it, because the login handshake has to identify this
@@ -62,7 +65,7 @@ The terminal will display a login QR code URL. Open or scan this link on your mo
 If credentials expire later, refresh them with:
 
 ```bash
-./uulink -refresh-login
+./uulink refresh-login
 ```
 
 ### 4. List Registered Devices
@@ -70,7 +73,7 @@ If credentials expire later, refresh them with:
 List all devices registered under your account:
 
 ```bash
-./uulink -list
+./uulink list
 ```
 
 Example output:
@@ -78,8 +81,8 @@ Example output:
 ```text
 DEVICE_ID                NAME             STATUS         PLAT     CLIENT_ID    VERSION
 --------                 ----             ------         ----     ---------    -------
-aeawqa5txeafoxl4         MyMac            CONNECTED      4                     4.38.0
-aeawn7l56uabjgfc         HomePC           CONNECTED      1                     2.2.2.2400
+aeaexampleaaaa01         MyMac            CONNECTED      4                     4.38.0
+aeaexampleaaaa02         HomePC           CONNECTED      1                     2.2.2.2400
 ```
 
 Note the `DEVICE_ID` of the target machine you want to connect to. The
@@ -91,13 +94,13 @@ return that field.
 ### Method 1: Same-Account Device Pairing (Recommended)
 
 Use this method when both machines are registered under the same UU Remote
-account. Both endpoints must be logged in; `-serve` on a config without
+account. Both endpoints must be logged in; `serve` on a config without
 credentials fails with `code 1001: 无效的请求参数`.
 
 1. Start the server on the target (controlled) machine:
 
 ```bash
-./uulink -serve
+./uulink serve
 ```
 
 2. Connect from the client (controller) machine and map a port:
@@ -105,7 +108,7 @@ credentials fails with `code 1001: 无效的请求参数`.
 For example, to map remote Windows Remote Desktop (port 3389) to local port 13389:
 
 ```bash
-./uulink -device <TARGET_DEVICE_ID> -local 13389 -remote-port 3389
+./uulink connect -device <TARGET_DEVICE_ID> -local 13389 -remote-port 3389
 ```
 
 Once connected, point your RDP client to `127.0.0.1:13389` to reach the remote desktop.
@@ -113,17 +116,17 @@ Once connected, point your RDP client to `127.0.0.1:13389` to reach the remote d
 Similarly, to forward an SSH service:
 
 ```bash
-./uulink -device <TARGET_DEVICE_ID> -local 2222 -remote-port 22
+./uulink connect -device <TARGET_DEVICE_ID> -local 2222 -remote-port 22
 ```
 
 You can also forward consecutive port ranges or use the compact `-mapping` syntax:
 
 ```bash
 # Map a port range 1-to-1 (e.g. 6 ports: 9000->8000, 9001->8001, ..., 9005->8005):
-./uulink -device <TARGET_DEVICE_ID> -local 9000-9005 -remote-port 8000-8005
+./uulink connect -device <TARGET_DEVICE_ID> -local 9000-9005 -remote-port 8000-8005
 
 # Or with compact mapping flag:
-./uulink -device <TARGET_DEVICE_ID> -mapping 9000-9005:8000-8005
+./uulink connect -device <TARGET_DEVICE_ID> -mapping 9000-9005:8000-8005
 ```
 
 ### Method 2: Batch Mapping via Configuration File
@@ -150,8 +153,8 @@ When managing multiple forwarded ports, specify them in the `mappings` section o
 
 Start the endpoints without passing port flags:
 
-- Target machine: `./uulink -serve`
-- Client machine: `./uulink -device <TARGET_DEVICE_ID>`
+- Target machine: `./uulink serve`
+- Client machine: `./uulink connect -device <TARGET_DEVICE_ID>`
 
 All configured ports will be mapped simultaneously.
 
@@ -162,8 +165,8 @@ Use this method when machines belong to different accounts or for temporary acce
 1. Start the assistance service on the target machine:
 
 ```bash
-# Start an unbound guest server (no login required on this machine)
-./uulink -unbound-guest-serve -local 19081 -remote-port 18090
+# Start an accountless share server (no login required on this machine)
+./uulink share serve -local 19081 -remote-port 18090
 ```
 
 By default the terminal displays one `connect_id` and an 8-character
@@ -179,49 +182,49 @@ The pooled server opens one room per session and prints the whole set on a
 single line, for direct use as flag values:
 
 ```text
-INFO multi-session guest shares ready (4 sessions): -share-id 266444253,266444254,... -share-code 6W44YBPL,7X55ZCQM,...
+INFO multi-session guest shares ready (4 sessions): uulink share join -id 266444253,266444254,... -code 6W44YBPL,7X55ZCQM,...
 ```
 
 2. Connect from the controlling machine using your credentials and the share code:
 
 ```bash
-./uulink -share -share-id 266444253 -share-code 6W44YBPL -local 19090 -remote-port 18091
+./uulink share join -id 266444253 -code 6W44YBPL -local 19090 -remote-port 18091
 ```
 
 Once connected, bidirectional port forwarding between the two endpoints is active immediately.
 
-The controller must be logged in. `-share-guest`, which joins with an ephemeral
-guest identity so that neither side needs an account, is rejected by the API —
-see [Known Issues](#known-issues).
+The controller must be logged in. `share join -guest`, which joins with an
+ephemeral guest identity so that neither side needs an account, is rejected by
+the API — see [Known Issues](#known-issues).
 
 ### Method 4: Fixed Custom Verification Code Mode
 
 Use this method when you want to establish access using a static, memorable
 password rather than temporary random codes. The server side needs no account: a
 missing `config.json` is created automatically with a stable client identity.
-The connecting side, however, must be logged in: `-custom-connect` falls back to
-an ephemeral guest identity when the config has no `jwt`, and the API rejects
+The connecting side, however, must be logged in: `share join` falls back to an
+ephemeral guest identity when the config has no `jwt`, and the API rejects
 guest identities on share joins (see [Known Issues](#known-issues)).
 
 1. Start the server with a custom code (8-16 alphanumeric characters containing both letters and digits):
 
 ```bash
-./uulink -custom-serve -custom-code MyPass123 -local 19081 -remote-port 18090
+./uulink share serve -custom-code MyPass123 -local 19081 -remote-port 18090
 ```
 
 The terminal will display the assistance connect ID:
 
 ```text
 INFO custom assistance ready: connect_id=266444253 custom_code=MyPass123
-INFO client command: uulink -custom-connect 266444253 -custom-code MyPass123
+INFO client command: uulink share join -id 266444253 -code MyPass123
 ```
 
-If `-custom-code` is omitted, `uulink` generates a compliant code and prints it. The server saves its device identity, connect ID, and custom code to `config.json`, so restarting it keeps the same connect ID and code. The primary identity stays persistent even when extra relay sessions are created automatically. A pooled `-unbound-guest-serve` uses temporary identities instead.
+With `share serve -custom` and no `-custom-code`, `uulink` generates a compliant code and prints it. The server saves its device identity, connect ID, and custom code to `config.json`, so restarting it keeps the same connect ID and code. The primary identity stays persistent even when extra relay sessions are created automatically. A pooled `share serve -sessions N` uses temporary identities instead.
 
 2. Connect from the client using the connect ID and custom code:
 
 ```bash
-./uulink -custom-connect 266444253 -custom-code MyPass123 -local 19090 -remote-port 18091
+./uulink share join -id 266444253 -code MyPass123 -local 19090 -remote-port 18091
 ```
 
 You can also specify `share_id` and `custom_code` in `config.json` for one-command startup:
@@ -266,13 +269,13 @@ Use `custom_code` instead of `share_code` when the server runs in custom-code mo
 The server can push the current share details to a webhook each time it starts using `-publish-url`; the webhook receives the same JSON document shown above:
 
 ```bash
-./uulink -unbound-guest-serve -publish-url "https://example.com/sync" -publish-secret "mysecret" -mapping 25565:25565
+./uulink share serve -publish-url "https://example.com/sync" -publish-secret "mysecret" -mapping 25565:25565
 ```
 
 2. Connect from the client using the configuration URL:
 
 ```bash
-./uulink -config-url https://example.com/room.json
+./uulink connect -config-url https://example.com/room.json
 ```
 
 Or build a dedicated zero-argument client binary with the URL embedded via ldflags:
@@ -281,23 +284,17 @@ Or build a dedicated zero-argument client binary with the URL embedded via ldfla
 go build -ldflags="-X main.DefaultConfigURL=https://example.com/room.json" -o mc-link ./cmd/uulink
 ```
 
-Users can simply run `./mc-link` without passing any arguments; a `config.json` with a random client identity is created next to the binary on first start.
+Users can simply run `./mc-link` without passing any arguments (it behaves like `mc-link connect -config-url <URL>`); a `config.json` with a random client identity is created next to the binary on first start.
 
 ## Docker
 
-Multi-architecture images (`linux/amd64`, `linux/arm64`) are built and published by CI to this repository's GitHub Container Registry:
+Multi-architecture images (`linux/amd64`, `linux/arm64`) are built and published by CI to this repository's GitHub Container Registry for every `v*` release:
 
 ```bash
-# Currently the only published moving tag (see the note below):
-docker pull ghcr.io/wsyzxjn/uulink:edge
+docker pull ghcr.io/wsyzxjn/uulink:latest
 ```
 
-Available tags: `latest` and semantic versions (`1.2.3`, `1.2`, `1`) from `v*` releases, `edge` from the `main` branch, and `sha-<commit>` for every build.
-
-> **No release has been published yet.** Until a `v*` tag runs the release
-> workflow, only `edge` and `sha-<commit>` exist, and pulling `latest` fails.
-> Use `ghcr.io/wsyzxjn/uulink:edge` (or set `UULINK_IMAGE` for Compose) in the
-> meantime.
+Available tags: `latest`, the semantic versions of each release (`0.1.7`, `0.1`, `0`), and `sha-<commit>` for the commit a release was built from. Images are not published for ordinary pushes to `main`; build from source (`docker compose up --build`, or `docker build .`) to run unreleased changes.
 
 ### Run
 
@@ -307,16 +304,16 @@ The image sets `WORKDIR /data`, so the default `-config` path resolves to `/data
 docker volume create uulink-data
 
 # Log in once (interactive terminal required for the QR code)
-docker run --rm -it --network host -v uulink-data:/data ghcr.io/wsyzxjn/uulink:edge -login
+docker run --rm -it --network host -v uulink-data:/data ghcr.io/wsyzxjn/uulink:latest login
 
 # Then run the forwarder
 docker run -d --name uulink --restart unless-stopped \
   --network host --hostname uulink-docker \
   -v uulink-data:/data \
-  ghcr.io/wsyzxjn/uulink:edge -device TARGET_DEVICE_ID -local-host 0.0.0.0 -mapping 25565:25565
+  ghcr.io/wsyzxjn/uulink:latest connect -device TARGET_DEVICE_ID -local-host 0.0.0.0 -mapping 25565:25565
 ```
 
-Replace `TARGET_DEVICE_ID` with the ID of a remote device running `uulink -serve`. Use `-list` to find device IDs.
+Replace `TARGET_DEVICE_ID` with the ID of a remote device running `uulink serve`. Use `uulink list` to find device IDs.
 
 Or use the bundled `docker-compose.yml`, which defaults to the published image:
 
@@ -335,7 +332,7 @@ UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.1 docker 
 
 - **Networking:** `--network host` (Linux) lets WebRTC ICE see the real interface addresses, which keeps far more sessions on a direct P2P path instead of falling back to a TURN relay. It is also required for `-lan-discovery` broadcasts. Under bridge networking, traversal still works through STUN/TURN, but publish each forwarded port explicitly with `-p`.
 - **Bind address:** always pass `-local-host 0.0.0.0` (or set `local_host` in the mappings). The default `127.0.0.1` is the container's own loopback and is unreachable from the host or the LAN.
-- **Device name:** uulink registers the system hostname as the device name. Set `--hostname` (or the `hostname` config field), otherwise the random container ID appears in `-list` and changes on every recreate.
+- **Device name:** uulink registers the system hostname as the device name. Set `--hostname` (or the `hostname` config field), otherwise the random container ID appears in `uulink list` and changes on every recreate.
 - **Non-root user:** the container runs as UID `10001`. Named volumes inherit the correct ownership automatically; for a bind mount, run `chown 10001:10001 ./data` on the host first, or add `--user "$(id -u):$(id -g)"`. Binding local ports below 1024 additionally needs `--user 0` or `--sysctl net.ipv4.ip_unprivileged_port_start=0`.
 - **Zero-argument images:** bake a remote share configuration URL into a custom build for the distribution mode described above:
 
@@ -349,7 +346,7 @@ UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.1 docker 
 
 ```json
 {
-  "jwt": "User authentication token (auto-populated by -login-qrcode)",
+  "jwt": "User authentication token (auto-populated by uulink login)",
   "client_id": "Unique machine hardware identifier",
   "device_id": "Device identifier on the UU Remote platform",
   "user_id": "User account identifier",
@@ -381,9 +378,9 @@ UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.1 docker 
 
 Field details:
 
-- `jwt`: Authentication token. Recommended to generate automatically via `./uulink -login-qrcode`.
+- `jwt`: Authentication token. Recommended to generate automatically via `./uulink login`.
 - `client_id`: Unique client identifier (such as system hardware UUID).
-- `device_id`: Device identifier registered on UU Remote, visible via `./uulink -list`.
+- `device_id`: Device identifier registered on UU Remote, visible via `./uulink list`.
 - `user_id`: Registered account user identifier.
 - `hostname`: Optional device name exposed to UU Remote. If omitted, the system hostname is used.
 - `mappings`: Array of port forwarding rules.
@@ -397,70 +394,104 @@ Field details:
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
 - `session_mode`: `auto` or `manual`. Defaults to `auto`. Auto starts with one primary session and creates a bounded number of additional relay sessions in band when a relay is detected.
 - `sessions`: Relay session target, from `1` to `16`. When `session_mode` is `auto`, it is the pool cap and defaults to `4`. When `session_mode` is `manual`, it is the fixed target. The `-sessions` flag overrides both fields; `-sessions auto` uses the default cap, while a numeric value requests a fixed manual target.
-- `share_id`, `share_code`, `custom_code`: Optional defaults for share joins (`-share`, `-custom-connect`). A custom-code server also records its connect ID and code here.
-- `unbound_client_id`, `unbound_device_id`: Written by `-unbound-guest-serve` and `-custom-serve` so the accountless device keeps the same connect ID across restarts. Only the single-session server persists them: with a pooled `-unbound-guest-serve` (`-sessions` greater than `1`) the identity is regenerated on every start, and both the connect IDs and codes change. Use `-custom-serve` for a stable entry point with automatic expansion.
+- `share_id`, `share_code`, `custom_code`: Optional defaults for `share join`. A custom-code server also records its connect ID and code here.
+- `unbound_client_id`, `unbound_device_id`: Written by `share serve` so the accountless device keeps the same connect ID across restarts. Only the single-session server persists them: with a pooled `share serve -sessions N` (N greater than `1`) the identity is regenerated on every start, and both the connect IDs and codes change. Use `share serve -custom` for a stable entry point with automatic expansion.
+
+uulink rewrites `config.json` after a login or device registration. Keys it does not recognize are preserved, and port ranges are written back in the same `"local_port": "9000-9005"` form they were read in.
 
 Incoming `CONNECT` requests are authorized by the receiving process. Both endpoints use the same mapping schema, and either endpoint may expose local listeners that reach services on the other endpoint, subject to the receiving endpoint's `allow_lan` and `allowed_ports` policy.
 
-## Command-Line Options
+## Command Reference
+
+```text
+uulink <command> [flags]
+```
+
+| Command | Purpose | Needs login |
+| --- | --- | --- |
+| `login` | Log in (QR-code link by default; `-mobile <number>` for SMS; `-interactive` to choose) and save the credentials | creates it |
+| `refresh-login` | Validate the saved login and re-run the QR-code login only if it expired | - |
+| `list` | List the account's devices and their online status | yes |
+| `whoami` | Show the logged-in user | yes |
+| `serve` | Expose this account's device to `connect` controllers | yes |
+| `connect` | Connect to a device of the same account (`-device`) or via a remote share configuration (`-config-url`) | yes |
+| `share serve` | Serve this machine through a connect ID and code (`-custom` / `-custom-code` for a fixed code; `-account` to reuse the config's device identity) | no |
+| `share join` | Join a served share by `-id` and `-code` | yes |
+| `share info` | Query the control mode of a share | yes |
+| `version` | Print the version, commit, build date, and platform | - |
+
+`uulink help <command>` prints the flags of a command; `uulink <command> -help-debug` also lists the same-host debugging flags (`-room-file`, `-allow-self`, `-control-device-id`, `-control-id`, `-cap`). Flags may be written with one or two dashes.
+
+Global flags, accepted before the command and by every command:
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `-config <path>` | Path to configuration file | `config.json` |
-| `-login` | Interactively select login method (QR code or SMS code) | - |
-| `-login-qrcode` | Generate a login QR code and update credentials | - |
-| `-login-qrcode-timeout <dur>` | Maximum time to wait for QR-code login confirmation | `5m0s` |
-| `-login-mobile <number>` | Mobile phone number for SMS verification code login | - |
-| `-login-country-code <code>` | Country code for mobile login (default `+86`) | `+86` |
-| `-refresh-login` | Validate current session and refresh if expired | - |
-| `-list` | List registered devices and their online status | - |
-| `-user-info` | Display current account user info | - |
-| `-serve` | Run in server mode waiting for controller connection | - |
-| `-device <id>` | Target remote device ID to connect to | config device_id |
+| `-config <path>` | Path to the configuration file | `config.json` |
+| `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
+
+Mapping flags, shared by `serve`, `connect`, `share serve`, and `share join`:
+
+| Flag | Description | Default |
+| --- | --- | --- |
 | `-local <port/range>` | Local port or port range to listen on (e.g. `8080` or `9000-9010`) | - |
 | `-local-host <ip>` | Local address to bind to | `127.0.0.1` |
 | `-remote-port <port/range>` | Target port or port range (e.g. `8080` or `9000-9010`) | - |
 | `-remote-host <ip>` | Target host on remote end | `127.0.0.1` |
 | `-mapping <spec>` | Forwarding rule or range (e.g. `8080:8080` or `9000-9010:8000-8010`) | - |
 | `-rule-id <id>` | Target registered rule ID on remote device | - |
-| `-transport <mode>` | WebRTC transport policy for controller sessions: `auto` or `relay` | `auto` |
-| `-sessions <mode>` | Session mode: `auto` or a fixed target `1`-`16` | `auto` |
-| `-log-level <level>` | Log level: `debug`, `info`, `warn`, or `error` | `info` |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
-| `-unbound-guest-serve` | Register an accountless guest device and print share code | - |
-| `-guest-serve` | Run assistance server on current device and print share code | - |
-| `-share-auth-mode <mode>` | Guest share authorization mode: `temporary`, `custom`, or `both` | `temporary` |
-| `-guest-custom-code <code>` | Custom guest share code for `custom` or `both` modes | - |
-| `-share` | Connect to an assistance server by share ID and code | - |
-| `-share-guest` | Join remote assistance using an accountless guest identity | - |
-| `-share-confirmation` | Join remote assistance by server-side confirmation | - |
-| `-share-control-mode` | Query remote assistance control mode and exit | - |
-| `-share-id <id>` | Remote assistance connect ID | - |
-| `-share-code <code>` | Remote assistance verification code | - |
-| `-share-control-id <id>` | Controller control ID for `-share-confirmation` | generated |
-| `-custom-serve` | Run assistance server with custom verification code mode | - |
-| `-custom-code <code>` | Custom verification code (8-16 alphanumeric characters) | - |
-| `-custom-connect <id>` | Connect ID of the assistance server to connect to | - |
-| `-config-url <url>` | Fetch remote share configuration and run in client mode | - |
-| `-publish-url <url>` | Webhook URL to publish share info on room start | - |
-| `-publish-secret <token>` | Optional bearer token for publish webhook | - |
-| `-lan-discovery` | Enable Minecraft LAN discovery broadcast for forwarded ports | off |
+| `-sessions <mode>` | Relay session mode: `auto` or a fixed target `1`-`16` | `auto` |
+
+Controller flags, shared by `connect` and `share join`:
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `-transport <mode>` | WebRTC transport policy: `auto` or `relay` | `auto` |
+| `-p2p-timeout <dur>` | How long to wait for a direct P2P connection before retrying with a TURN relay; `0` disables the fallback | `12s` |
+| `-lan-discovery` | Enable Minecraft LAN discovery broadcast for the first forwarded port | off |
 | `-lan-motd <text>` | Override MOTD text for LAN discovery broadcast | - |
 
-`-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. Server modes reject `-transport relay`; a server-side relay requirement is represented by the signaling response, not by a local server flag.
+Command-specific flags:
 
-For automatic relay pooling, use `-custom-serve` on the server and join its single share with a logged-in controller. Auto mode is the default and uses a default cap of `4` sessions; set `-sessions 8` on both ends for a larger cap, up to 16. The primary share stays stable while additional rooms are created automatically. Older peers and unavailable expansion fall back to the primary session. Each TCP connection stays on one session, so more sessions benefit multiple concurrent connections, not a single download connection.
+| Command | Flag | Description | Default |
+| --- | --- | --- | --- |
+| `login` | `-mobile <number>` | Log in with an SMS verification code sent to this number | - |
+| `login` | `-country-code <code>` | Country code for the mobile number | `+86` |
+| `login` | `-interactive` | Choose the login method at a prompt | - |
+| `login`, `refresh-login` | `-timeout <dur>` | Maximum time to wait for QR-code login confirmation | `5m0s` |
+| `connect` | `-device <id>` | Device ID of a same-account device running `uulink serve` | - |
+| `connect` | `-config-url <url>` | URL or file path of a remote share configuration | build default |
+| `share serve` | `-custom` | Use a fixed custom verification code (generated when `-custom-code` is empty) | - |
+| `share serve` | `-custom-code <code>` | Custom verification code (8-16 letters and digits); implies `-custom` | - |
+| `share serve` | `-auth-mode <mode>` | Share authorization mode: `temporary`, `custom`, or `both` | `temporary` |
+| `share serve` | `-account` | Reuse the device identity already in the config (from `login` or an earlier `share serve`) instead of registering a new accountless device | - |
+| `share serve` | `-publish-url <url>` | Webhook URL that receives the share configuration on room start | - |
+| `share serve` | `-publish-secret <token>` | Bearer token sent with `-publish-url` requests | - |
+| `share join` | `-id <id>` | Connect ID (comma-separated IDs join one pooled session per share) | config `share_id` |
+| `share join` | `-code <code>` | Verification code, temporary or custom (comma-separated for pooled joins) | config `share_code` / `custom_code` |
+| `share join` | `-guest` | Join with an ephemeral guest identity (rejected by the API, see Known Issues) | - |
+| `share join` | `-confirm` | Join by server-side confirmation instead of a code | - |
+| `share join` | `-control-id <id>` | Controller control ID for `-confirm` | generated |
+| `share info` | `-id <id>` | Connect ID to query | - |
 
-`-unbound-guest-serve` also supports preparing rooms up front and printing comma-separated share IDs and codes. Pass all pairs to `-share` on the controller. These temporary room identities change after a restart.
+The protocol experiments from the reverse-engineering phase (`-pck-sweep`, `-mixkcp`) are not part of a normal build; compile with `go build -tags experiments ./cmd/uulink` to get them on the controller commands.
 
-The tunnel now retries transient signaling and transport failures with bounded backoff. Pooled relay sessions are monitored independently: a failed session is removed, its affected TCP streams are closed, and the pool requests a replacement while healthy sessions continue serving new streams. An interrupted TCP stream cannot be moved transparently to another transport, so the application must retry that transfer.
+`-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. The serving commands have no `-transport` flag; a server-side relay requirement is represented by the signaling response, not by a local server flag.
+
+For automatic relay pooling, use `share serve -custom` on the server and join its single share with a logged-in controller. Auto mode is the default and uses a default cap of `4` sessions; set `-sessions 8` on both ends for a larger cap, up to 16. The primary share stays stable while additional rooms are created automatically. Older peers and unavailable expansion fall back to the primary session. Each TCP connection stays on one session, so more sessions benefit multiple concurrent connections, not a single download connection.
+
+`share serve -sessions N` also supports preparing rooms up front and printing comma-separated share IDs and codes. Pass all pairs to `share join` on the controller. These temporary room identities change after a restart.
+
+Every long-running command (`serve`, `share serve`, `connect`, `share join`, including pooled joins) retries transient signaling and transport failures with bounded backoff. Errors that a retry cannot fix end the process instead, so a supervisor such as systemd or Docker's restart policy sees the failure: invalid flags or mappings exit with status `2`, and runtime failures such as an expired login (`1120`), bad parameters (`1001`), or a wrong share code exit with status `1`. Press Ctrl-C once to shut down cleanly; a second Ctrl-C terminates immediately if a pending network call is still blocking.
+
+Pooled relay sessions are monitored independently: a failed session is removed, its affected TCP streams are closed, and the pool requests a replacement while healthy sessions continue serving new streams. An interrupted TCP stream cannot be moved transparently to another transport, so the application must retry that transfer.
 
 ## Known Issues
 
 - **The controlling side must be logged in.** A share join performed with an
-  ephemeral guest identity — `-share-guest`, or `-custom-connect` / `-config-url`
-  on a config without a `jwt` — always fails with
+  ephemeral guest identity — `share join -guest`, or `share join` / `connect
+  -config-url` on a config without a `jwt` — always fails with
   `code 1002: 查询对象不存在`. This is a server-side restriction rather than a
   missing step in uulink: the API scopes share lookups to logged-in users, and no
   guest-namespace join endpoint exists. Probing confirmed that the guest token
@@ -477,9 +508,9 @@ The tunnel now retries transient signaling and transport failures with bounded b
 
 **Q: The client reports that the target device is offline or cannot connect.**
 
-1. Ensure the target machine is actively running `./uulink -serve` (or running the official client).
-2. Verify that `-device` matches the target machine device ID exactly (check with `./uulink -list`).
-3. Check whether your login session has expired by running `./uulink -refresh-login`.
+1. Ensure the target machine is actively running `./uulink serve` (or running the official client).
+2. Verify that `-device` matches the target machine device ID exactly (check with `./uulink list`).
+3. Check whether your login session has expired by running `./uulink refresh-login`.
 
 **Q: What is the expected transfer speed and latency?**
 

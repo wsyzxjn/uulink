@@ -1,7 +1,14 @@
+//go:build experiments
+
+// Protocol experiments from the reverse-engineering phase. They are excluded
+// from normal builds; compile with -tags experiments to get the -pck-sweep and
+// -mixkcp flags back.
+
 package main
 
 import (
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"net"
 	"strings"
@@ -13,6 +20,12 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
 	"github.com/wsyzxjn/uulink/pkg/tunnel/mixsend"
 )
+
+// bindExperimentFlags adds the experiment switches to a controller command.
+func bindExperimentFlags(fs *flag.FlagSet) {
+	fs.BoolVar(experimentPCKSweep, "pck-sweep", false, debugUsagePrefix+"sweep PCK.V3 channels with CONNECT frames after setup")
+	fs.BoolVar(experimentMixKCP, "mixkcp", false, debugUsagePrefix+"send PM frames over mix-kcp UDP to the ICE peer (raw frame format, crypto layout preserved)")
+}
 
 // startPCKSweep replicates the observed channel setup and probes which PCK
 // logical channel accepts port-mapping frames. It is intentionally isolated
