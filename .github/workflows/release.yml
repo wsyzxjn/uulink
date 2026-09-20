@@ -27,13 +27,18 @@ jobs:
         run: go mod tidy -diff
 
       - name: Vet
-        run: go vet ./...
+        run: go vet ./... && go vet -tags experiments ./cmd/...
 
       - name: Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
+      # The tunnel, pool, and signaling code is heavily concurrent; run the
+      # suite under the race detector.
       - name: Test
-        run: go test -count=1 ./...
+        run: go test -race -count=1 ./...
+
+      - name: Build (experiments tag)
+        run: go build -tags experiments ./cmd/uulink
 
   build:
     needs: test
