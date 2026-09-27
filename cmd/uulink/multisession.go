@@ -389,10 +389,10 @@ func doMultiSessionController(ctx context.Context, client *api.Client, cfg *auth
 			return nil
 		}
 		sessionID := fmt.Sprintf("session-%d", index+1)
-		rt, err := startPooledController(client, cfg, tun, pool, set, sessionID, entry, useGuest, options.transportMode, options.p2pTimeout, rules, secPolicy)
+		rt, err := startPooledController(ctx, client, cfg, tun, pool, set, sessionID, entry, useGuest, options.transportMode, options.p2pTimeout, rules, secPolicy)
 		if errors.Is(err, errP2PTimeout) && options.transportMode == peer.TransportAuto {
 			logging.Infof("[multisession] %s: P2P timed out, retrying with relay transport", sessionID)
-			rt, err = startPooledController(client, cfg, tun, pool, set, sessionID, entry, useGuest, peer.TransportRelay, options.p2pTimeout, rules, secPolicy)
+			rt, err = startPooledController(ctx, client, cfg, tun, pool, set, sessionID, entry, useGuest, peer.TransportRelay, options.p2pTimeout, rules, secPolicy)
 		}
 		if err != nil {
 			return fmt.Errorf("%s: %w", sessionID, err)
@@ -405,23 +405,23 @@ func doMultiSessionController(ctx context.Context, client *api.Client, cfg *auth
 	return set.waitForShutdown(ctx, options.transportMode == peer.TransportRelay)
 }
 
-func startPooledController(client *api.Client, cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, sessionID string, entry shareEntry, useGuest bool, transportMode peer.TransportMode, p2pTimeout time.Duration, rules []tunnel.Rule, secPolicy tunnel.SecurityPolicy) (*sessionRuntime, error) {
+func startPooledController(ctx context.Context, client *api.Client, cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, sessionID string, entry shareEntry, useGuest bool, transportMode peer.TransportMode, p2pTimeout time.Duration, rules []tunnel.Rule, secPolicy tunnel.SecurityPolicy) (*sessionRuntime, error) {
 	var room *api.RoomConnectionInfo
 	peerDeviceID := cfg.DeviceID
 	if useGuest {
-		guestSession, _, err := client.CreateUnboundGuest(fmt.Sprintf("guest-ctrl-%s", sessionID))
+		guestSession, _, err := client.CreateUnboundGuestContext(ctx, fmt.Sprintf("guest-ctrl-%s", sessionID))
 		if err != nil {
 			return nil, fmt.Errorf("create guest: %w", err)
 		}
 		// A guest controller has its own ephemeral device identity.
 		peerDeviceID = guestSession.DeviceID
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, entry.ID, entry.Code)
+		room, err = client.JoinRoomByShareCodeWithGuestContext(ctx, guestSession, entry.ID, entry.Code)
 		if err != nil {
 			return nil, fmt.Errorf("join guest share room: %w", err)
 		}
 	} else {
 		var err error
-		room, err = client.JoinRoomByShareCode(entry.ID, entry.Code)
+		room, err = client.JoinRoomByShareCodeContext(ctx, entry.ID, entry.Code)
 		if err != nil {
 			return nil, fmt.Errorf("join share room: %w", err)
 		}
@@ -556,7 +556,7 @@ func doMultiSessionUnboundGuestServe(ctx context.Context, cfg *auth.Config, rule
 			sessionCfg.UnboundClientID = ""
 			sessionCfg.UnboundDeviceID = ""
 		}
-		rt, share, err := startPooledGuestServer(api.NewClient(&sessionCfg), tun, pool, set, sessionID, fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
+		rt, share, err := startPooledGuestServer(ctx, api.NewClient(&sessionCfg), tun, pool, set, sessionID, fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
 		if err != nil {
 			return fmt.Errorf("%s: %w", sessionID, err)
 		}
@@ -583,14 +583,14 @@ func doMultiSessionUnboundGuestServe(ctx context.Context, cfg *auth.Config, rule
 	return set.waitForShutdown(ctx, false)
 }
 
-func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, sessionID, hostname string, shareOptions guestShareOptions, rules []tunnel.Rule, policy tunnel.SecurityPolicy) (*sessionRuntime, *api.GuestShareInfo, error) {
-	guestSession, _, err := client.CreateUnboundGuest(hostname)
+func startPooledGuestServer(ctx context.Context, client *api.Client, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, sessionID, hostname string, shareOptions guestShareOptions, rules []tunnel.Rule, policy tunnel.SecurityPolicy) (*sessionRuntime, *api.GuestShareInfo, error) {
+	guestSession, _, err := client.CreateUnboundGuestContext(ctx, hostname)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create unbound guest: %w", err)
 	}
 	// The guest session carries its own client/device identity, so the shared
 	// client signs every request for this session with the right headers.
-	room, err := client.CreateGuestRoom(guestSession)
+	room, err := client.CreateGuestRoomContext(ctx, guestSession)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create guest room: %w", err)
 	}
@@ -602,7 +602,7 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 	rt := &sessionRuntime{id: sessionID, sig: sig, done: make(chan struct{})}
 	rt.cleanup = func() { tun.CloseStreams(pool.Pool().RemoveSession(sessionID)) }
 
-	if _, err := client.GuestSetDeviceControllable(guestSession, true); err != nil {
+	if _, err := client.GuestSetDeviceControllableContext(ctx, guestSession, true); err != nil {
 		rt.close()
 		return nil, nil, fmt.Errorf("set guest device controllable: %w", err)
 	}
@@ -650,9 +650,11 @@ func startPooledGuestServer(client *api.Client, tun *tunnel.Tunnel, pool *tunnel
 		}
 		// Several API round trips follow; the queue keeps them off the
 		// signaling read loop and in arrival order.
-		pushes.submit(func() {
+		if err := pushes.submit(pushQueueKey(push.Type, push.Data.ControlID), func() {
 			handlePooledPush(client, guestSession, sessionID, push.Type, push.Data.ControlID, push.Data.Salt, &currentShare, shareOptions)
-		})
+		}); err != nil {
+			logging.Warnf("[%s] bmsg_push queue rejected: type=%q control_id_len=%d err=%v", sessionID, push.Type, len(push.Data.ControlID), err)
+		}
 	})
 
 	var poolSession *tunnel.SimpleSession
@@ -749,11 +751,7 @@ func saveMultiGuestShareFile(path string, shares []*api.GuestShareInfo) error {
 			ControlID:     share.ControlID,
 		}
 	}
-	data, err := json.MarshalIndent(infos, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
+	return auth.SaveJSONFile(path, infos)
 }
 
 // loadGuestShareFile reads either the multi-share array written by the pooled

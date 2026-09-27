@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,12 +27,17 @@ type GuestSession struct {
 
 // CreateGuest requests a guest identity without using the configured JWT.
 func (c *Client) CreateGuest() (*GuestSession, error) {
+	return c.CreateGuestContext(context.Background())
+}
+
+// CreateGuestContext requests a guest identity using ctx.
+func (c *Client) CreateGuestContext(ctx context.Context) (*GuestSession, error) {
 	cfg := *c.cfg
 	cfg.JWT = ""
 	cfg.UserID = ""
 	cfg.GuestID = ""
 
-	resp, err := c.withConfig(&cfg).Do("POST", "/api/v1/guest/create", map[string]any{})
+	resp, err := c.withConfig(&cfg).DoContext(ctx, "POST", "/api/v1/guest/create", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("guest create: %w", err)
 	}
@@ -58,7 +64,12 @@ func (c *Client) CreateGuest() (*GuestSession, error) {
 // with any logged-in user, which avoids the server's same-account
 // self-assist restriction.
 func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceIdentity, error) {
-	identity, err := c.InitWindowsDeviceWithoutAuth(name)
+	return c.CreateUnboundGuestContext(context.Background(), name)
+}
+
+// CreateUnboundGuestContext creates an unbound device and guest session using ctx.
+func (c *Client) CreateUnboundGuestContext(ctx context.Context, name string) (*GuestSession, *UnboundDeviceIdentity, error) {
+	identity, err := c.InitWindowsDeviceWithoutAuthContext(ctx, name)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create unbound device: %w", err)
 	}
@@ -70,7 +81,7 @@ func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceI
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
 	cfg.Platform = 1
-	session, err := c.withConfig(&cfg).CreateGuest()
+	session, err := c.withConfig(&cfg).CreateGuestContext(ctx)
 	if err != nil {
 		return nil, identity, fmt.Errorf("create guest for unbound device: %w", err)
 	}
@@ -119,7 +130,12 @@ func (c *Client) guestClient(session *GuestSession) *Client {
 
 // CreateGuestRoom calls POST /api/v1/guest/room/create with a guest session.
 func (c *Client) CreateGuestRoom(session *GuestSession) (*RoomConnectionInfo, error) {
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/create", map[string]any{})
+	return c.CreateGuestRoomContext(context.Background(), session)
+}
+
+// CreateGuestRoomContext creates a guest room using ctx.
+func (c *Client) CreateGuestRoomContext(ctx context.Context, session *GuestSession) (*RoomConnectionInfo, error) {
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/guest/room/create", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("guest room create: %w", err)
 	}
@@ -143,7 +159,12 @@ type GuestShareInfo struct {
 
 // GetGuestShareInfo calls POST /api/v1/guest/share/info with a guest session.
 func (c *Client) GetGuestShareInfo(session *GuestSession) (*GuestShareInfo, error) {
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/share/info", map[string]any{})
+	return c.GetGuestShareInfoContext(context.Background(), session)
+}
+
+// GetGuestShareInfoContext fetches guest share info using ctx.
+func (c *Client) GetGuestShareInfoContext(ctx context.Context, session *GuestSession) (*GuestShareInfo, error) {
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/guest/share/info", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("guest share info: %w", err)
 	}
@@ -368,10 +389,17 @@ type GuestShareConfirmationRequest struct {
 // endpoint matches the controller's v2 join; the v1 endpoint remains as a
 // fallback for guest sessions the v2 endpoint rejects.
 func (c *Client) GuestShareUploadSign(session *GuestSession, request *GuestShareUploadSignRequest) (map[string]any, error) {
-	if resp, err := c.GuestShareUploadSignV2(session, request); err == nil {
+	return c.GuestShareUploadSignContext(context.Background(), session, request)
+}
+
+// GuestShareUploadSignContext publishes a verification-code signature using ctx.
+func (c *Client) GuestShareUploadSignContext(ctx context.Context, session *GuestSession, request *GuestShareUploadSignRequest) (map[string]any, error) {
+	if resp, err := c.GuestShareUploadSignV2Context(ctx, session, request); err == nil {
 		return resp, nil
+	} else if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/upload/sign", request)
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/guest/room/share/upload/sign", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload sign: %w", err)
 	}
@@ -382,7 +410,12 @@ func (c *Client) GuestShareUploadSign(session *GuestSession, request *GuestShare
 // official controller join also uses v2 endpoints, so the guest-side sign
 // upload must use the same API generation for the server to associate them.
 func (c *Client) GuestShareUploadSignV2(session *GuestSession, request *GuestShareUploadSignRequest) (map[string]any, error) {
-	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/share/upload_sign", request)
+	return c.GuestShareUploadSignV2Context(context.Background(), session, request)
+}
+
+// GuestShareUploadSignV2Context publishes a v2 verification-code signature using ctx.
+func (c *Client) GuestShareUploadSignV2Context(ctx context.Context, session *GuestSession, request *GuestShareUploadSignRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v2/room/share/upload_sign", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload sign v2: %w", err)
 	}
@@ -392,10 +425,17 @@ func (c *Client) GuestShareUploadSignV2(session *GuestSession, request *GuestSha
 // GuestShareUploadControlMode publishes the control mode, preferring the v2
 // endpoint and falling back to v1 like GuestShareUploadSign.
 func (c *Client) GuestShareUploadControlMode(session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
-	if resp, err := c.GuestShareUploadControlModeV2(session, request); err == nil {
+	return c.GuestShareUploadControlModeContext(context.Background(), session, request)
+}
+
+// GuestShareUploadControlModeContext publishes the control mode using ctx.
+func (c *Client) GuestShareUploadControlModeContext(ctx context.Context, session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
+	if resp, err := c.GuestShareUploadControlModeV2Context(ctx, session, request); err == nil {
 		return resp, nil
+	} else if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/upload_control_mode", request)
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/guest/room/share/upload_control_mode", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload control mode: %w", err)
 	}
@@ -404,7 +444,12 @@ func (c *Client) GuestShareUploadControlMode(session *GuestSession, request *Gue
 
 // GuestShareUploadControlModeV2 calls POST /api/v2/room/share/upload_control_mode.
 func (c *Client) GuestShareUploadControlModeV2(session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
-	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/share/upload_control_mode", request)
+	return c.GuestShareUploadControlModeV2Context(context.Background(), session, request)
+}
+
+// GuestShareUploadControlModeV2Context publishes the v2 control mode using ctx.
+func (c *Client) GuestShareUploadControlModeV2Context(ctx context.Context, session *GuestSession, request *GuestShareUploadControlModeRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v2/room/share/upload_control_mode", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share upload control mode v2: %w", err)
 	}
@@ -414,7 +459,12 @@ func (c *Client) GuestShareUploadControlModeV2(session *GuestSession, request *G
 // GuestSetDeviceControllable marks a guest-controlled device as available for
 // remote assistance.
 func (c *Client) GuestSetDeviceControllable(session *GuestSession, controllable bool) (map[string]any, error) {
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/device/controllable", map[string]bool{
+	return c.GuestSetDeviceControllableContext(context.Background(), session, controllable)
+}
+
+// GuestSetDeviceControllableContext marks a guest device as controllable using ctx.
+func (c *Client) GuestSetDeviceControllableContext(ctx context.Context, session *GuestSession, controllable bool) (map[string]any, error) {
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/device/controllable", map[string]bool{
 		"controllable": controllable,
 	})
 	if err != nil {
@@ -426,7 +476,12 @@ func (c *Client) GuestSetDeviceControllable(session *GuestSession, controllable 
 // GetShareControlMode queries the controller-side remote-assistance control
 // mode for a share.
 func (c *Client) GetShareControlMode(connectID string) (map[string]any, error) {
-	resp, err := c.Do("POST", "/api/v2/room/share/control_mode", map[string]string{
+	return c.GetShareControlModeContext(context.Background(), connectID)
+}
+
+// GetShareControlModeContext queries the share control mode using ctx.
+func (c *Client) GetShareControlModeContext(ctx context.Context, connectID string) (map[string]any, error) {
+	resp, err := c.DoContext(ctx, "POST", "/api/v2/room/share/control_mode", map[string]string{
 		"connect_id": connectID,
 	})
 	if err != nil {
@@ -438,7 +493,12 @@ func (c *Client) GetShareControlMode(connectID string) (map[string]any, error) {
 // GuestShareConfirmation calls the guest-side confirmation endpoint. It must
 // be sent after the controlling side triggers the remote_control push.
 func (c *Client) GuestShareConfirmation(session *GuestSession, request *GuestShareConfirmationRequest) (map[string]any, error) {
-	resp, err := c.guestClient(session).Do("POST", "/api/v1/guest/room/share/confirmation", request)
+	return c.GuestShareConfirmationContext(context.Background(), session, request)
+}
+
+// GuestShareConfirmationContext confirms a guest share using ctx.
+func (c *Client) GuestShareConfirmationContext(ctx context.Context, session *GuestSession, request *GuestShareConfirmationRequest) (map[string]any, error) {
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/guest/room/share/confirmation", request)
 	if err != nil {
 		return nil, fmt.Errorf("guest share confirmation: %w", err)
 	}
@@ -466,20 +526,34 @@ const joinConfirmationAttempts = 20
 // joinConfirmationInterval is a variable so tests can shorten the wait.
 var joinConfirmationInterval = time.Second
 
-// joinShareRoomByCode posts the v2 by_code join with the given client and
+// joinShareRoomByCodeContext posts the v2 by_code join with the given client and
 // keeps polling while the server reports that the controlled side still has
 // to confirm the controller.
-func joinShareRoomByCode(client *Client, connectID, deviceCode, operation string) (*RoomConnectionInfo, error) {
+func joinShareRoomByCodeContext(ctx context.Context, client *Client, connectID, deviceCode, operation string) (*RoomConnectionInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	body := &JoinRoomByShareCodeRequest{
 		ConnectID:   connectID,
 		ConnectCode: deviceCode,
 	}
 	for range joinConfirmationAttempts {
-		resp, err := client.Do("POST", "/api/v2/room/join/share/by_code", body)
+		resp, err := client.DoContext(ctx, "POST", "/api/v2/room/join/share/by_code", body)
 		if err != nil {
 			var responseErr *ResponseError
 			if errors.As(err, &responseErr) && responseErr.Code == codeAwaitingConfirmation {
-				time.Sleep(joinConfirmationInterval)
+				timer := time.NewTimer(joinConfirmationInterval)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return nil, ctx.Err()
+				case <-timer.C:
+				}
 				continue
 			}
 			return nil, fmt.Errorf("%s: %w", operation, err)
@@ -497,23 +571,38 @@ func joinShareRoomByCode(client *Client, connectID, deviceCode, operation string
 // logged-in controller identity, waiting for the controlled side's
 // confirmation when the share requires one.
 func (c *Client) JoinRoomByShareCode(connectID, deviceCode string) (*RoomConnectionInfo, error) {
-	return joinShareRoomByCode(c, connectID, deviceCode, "join share room")
+	return c.JoinRoomByShareCodeContext(context.Background(), connectID, deviceCode)
+}
+
+// JoinRoomByShareCodeContext joins a share using ctx.
+func (c *Client) JoinRoomByShareCodeContext(ctx context.Context, connectID, deviceCode string) (*RoomConnectionInfo, error) {
+	return joinShareRoomByCodeContext(ctx, c, connectID, deviceCode, "join share room")
 }
 
 // JoinRoomByShareCodeWithGuest joins a remote-assistance share using a guest
 // identity instead of the configured user JWT.
 func (c *Client) JoinRoomByShareCodeWithGuest(session *GuestSession, connectID, deviceCode string) (*RoomConnectionInfo, error) {
-	return joinShareRoomByCode(c.guestClient(session), connectID, deviceCode, "join share room with guest")
+	return c.JoinRoomByShareCodeWithGuestContext(context.Background(), session, connectID, deviceCode)
+}
+
+// JoinRoomByShareCodeWithGuestContext joins a share with a guest identity using ctx.
+func (c *Client) JoinRoomByShareCodeWithGuestContext(ctx context.Context, session *GuestSession, connectID, deviceCode string) (*RoomConnectionInfo, error) {
+	return joinShareRoomByCodeContext(ctx, c.guestClient(session), connectID, deviceCode, "join share room with guest")
 }
 
 // JoinRoomByConfirmation starts the v2 remote-assistance confirmation flow.
 // The controlling side must be logged in; controlId identifies the controller.
 func (c *Client) JoinRoomByConfirmation(connectID, controlID string) (*RoomConnectionInfo, error) {
+	return c.JoinRoomByConfirmationContext(context.Background(), connectID, controlID)
+}
+
+// JoinRoomByConfirmationContext starts the confirmation flow using ctx.
+func (c *Client) JoinRoomByConfirmationContext(ctx context.Context, connectID, controlID string) (*RoomConnectionInfo, error) {
 	body := map[string]any{
 		"connect_id": connectID,
 		"control_id": controlID,
 	}
-	resp, err := c.Do("POST", "/api/v2/room/join/share/by_confirmation", body)
+	resp, err := c.DoContext(ctx, "POST", "/api/v2/room/join/share/by_confirmation", body)
 	if err != nil {
 		return nil, fmt.Errorf("join room by confirmation: %w", err)
 	}
@@ -527,11 +616,16 @@ func (c *Client) JoinRoomByConfirmation(connectID, controlID string) (*RoomConne
 // JoinRoomByConfirmationWithGuest starts the v2 remote-assistance
 // confirmation flow using a guest controller identity.
 func (c *Client) JoinRoomByConfirmationWithGuest(session *GuestSession, connectID, controlID string) (*RoomConnectionInfo, error) {
+	return c.JoinRoomByConfirmationWithGuestContext(context.Background(), session, connectID, controlID)
+}
+
+// JoinRoomByConfirmationWithGuestContext starts the confirmation flow with a guest identity using ctx.
+func (c *Client) JoinRoomByConfirmationWithGuestContext(ctx context.Context, session *GuestSession, connectID, controlID string) (*RoomConnectionInfo, error) {
 	body := map[string]any{
 		"connect_id": connectID,
 		"control_id": controlID,
 	}
-	resp, err := c.guestClient(session).Do("POST", "/api/v2/room/join/share/by_confirmation", body)
+	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v2/room/join/share/by_confirmation", body)
 	if err != nil {
 		return nil, fmt.Errorf("join room by confirmation with guest: %w", err)
 	}

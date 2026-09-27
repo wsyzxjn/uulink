@@ -41,6 +41,11 @@ func pseudoMAC(clientID string) string {
 // hardware details; values that identify this installation are derived from
 // the auth config.
 func (c *Client) InitMacDevice(name string) (map[string]any, error) {
+	return c.InitMacDeviceContext(context.Background(), name)
+}
+
+// InitMacDeviceContext registers this Mac using ctx.
+func (c *Client) InitMacDeviceContext(ctx context.Context, name string) (map[string]any, error) {
 	body := map[string]any{
 		"client_id":        c.cfg.ClientID,
 		"os":               "版本27.0（版号26A5421a）",
@@ -59,7 +64,7 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 		"system_version":   "27.0.0",
 		"dpi":              144,
 	}
-	resp, err := c.Do("POST", "/api/v1/device/macos/init", body)
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/device/macos/init", body)
 	if err != nil {
 		return nil, fmt.Errorf("init mac device: %w", err)
 	}
@@ -72,6 +77,11 @@ func (c *Client) InitMacDevice(name string) (map[string]any, error) {
 // The generated client identity is stored in cfg.UnboundClientID so a later
 // run re-registers the same device instead of minting a new one.
 func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdentity, error) {
+	return c.InitWindowsDeviceWithoutAuthContext(context.Background(), name)
+}
+
+// InitWindowsDeviceWithoutAuthContext registers a Windows-shaped device using ctx.
+func (c *Client) InitWindowsDeviceWithoutAuthContext(ctx context.Context, name string) (*UnboundDeviceIdentity, error) {
 	guid := strings.ToLower(strings.TrimPrefix(c.cfg.UnboundClientID, "MG-"))
 	if guid == "" {
 		id, err := uuid.NewRandom()
@@ -106,7 +116,7 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 	cfg.ClientID = clientID
 	cfg.DeviceID = ""
 	cfg.Platform = 1
-	resp, err := c.withConfig(&cfg).Do("POST", "/api/v1/device/windows/init", body)
+	resp, err := c.withConfig(&cfg).DoContext(ctx, "POST", "/api/v1/device/windows/init", body)
 	if err != nil {
 		return nil, fmt.Errorf("init windows device without auth: %w", err)
 	}
@@ -126,7 +136,12 @@ func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdenti
 
 // SetMacControllable marks the registered Mac as available for control.
 func (c *Client) SetMacControllable(controllable bool) (map[string]any, error) {
-	resp, err := c.Do("POST", "/api/v1/device/mac_controllable", map[string]bool{
+	return c.SetMacControllableContext(context.Background(), controllable)
+}
+
+// SetMacControllableContext marks the registered Mac as available using ctx.
+func (c *Client) SetMacControllableContext(ctx context.Context, controllable bool) (map[string]any, error) {
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/device/mac_controllable", map[string]bool{
 		"controllable": controllable,
 	})
 	if err != nil {

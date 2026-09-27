@@ -221,3 +221,36 @@ func TestConfigRoundTripKeepsUnknownKeysAndRangeForm(t *testing.T) {
 		t.Fatalf("reloaded config mismatch: %+v", again)
 	}
 }
+
+func TestSaveJSONFileIsAtomicAndOwnerOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "room.json")
+	value := struct {
+		Token string `json:"token"`
+	}{Token: "secret"}
+
+	if err := SaveJSONFile(path, value); err != nil {
+		t.Fatalf("SaveJSONFile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read JSON file: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(data, &got); err != nil || got["token"] != "secret" {
+		t.Fatalf("saved JSON = %s, err=%v", data, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat JSON file: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("JSON file permissions = %o, want 600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("read JSON directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "room.json" {
+		t.Fatalf("temporary JSON files remain: %v", entries)
+	}
+}

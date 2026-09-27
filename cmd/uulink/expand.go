@@ -279,7 +279,7 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 				slot := &slots[i]
 				slot.rt = nil
 				copyConfig := slot.config
-				rt, share, err := startPooledGuestServer(api.NewClient(&copyConfig), tun, pool, set, nextSessionID(fmt.Sprintf("expand-%d", i+1)), fmt.Sprintf("uulink-expand-%d", i+1), options, nil, policy)
+				rt, share, err := startPooledGuestServer(set.ctx, api.NewClient(&copyConfig), tun, pool, set, nextSessionID(fmt.Sprintf("expand-%d", i+1)), fmt.Sprintf("uulink-expand-%d", i+1), options, nil, policy)
 				slot.config = copyConfig
 				if err != nil {
 					logging.Warnf("[expand] room %d repair failed: %v", i+1, err)
@@ -364,10 +364,10 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 				if ctx.Err() != nil {
 					return
 				}
-				rt, err := startPooledController(client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, mode, p2pTimeout, nil, policy)
+				rt, err := startPooledController(ctx, client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, mode, p2pTimeout, nil, policy)
 				if errors.Is(err, errP2PTimeout) && mode == peer.TransportAuto {
 					logging.Infof("[expand] P2P timed out, retrying session with relay transport")
-					rt, err = startPooledController(client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, peer.TransportRelay, p2pTimeout, nil, policy)
+					rt, err = startPooledController(ctx, client, cfg, tun, pool, set, nextSessionID("expand"), shareEntry(share), false, peer.TransportRelay, p2pTimeout, nil, policy)
 				}
 				if err != nil {
 					logging.Warnf("[recovery] join extra room failed: %v", err)

@@ -3,10 +3,12 @@ package main
 import (
 	crand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/auth"
@@ -136,37 +138,159 @@ func loadConfig(g *globalOptions, init bool) (*auth.Config, error) {
 }
 
 // pushQueue runs the API work triggered by bmsg_push events on one goroutine,
-// in arrival order, off the signaling read loop: the pushes for one room are
-// a short causal sequence (control mode query, then remote control), and the
-// read loop has to stay free for ping/pong.
+// in arrival order, off the signaling read loop: the pushes for one room are a
+// short causal sequence (control mode query, then remote control), and the read
+// loop has to stay free for ping/pong.
 type pushQueue struct {
-	jobs chan func()
+	done <-chan struct{}
+	wake chan struct{}
+	max  int
+
+	mu      sync.Mutex
+	jobs    []pushJob
+	stopped bool
+
+	accepted  uint64
+	coalesced uint64
+	rejected  uint64
 }
 
-// pushQueueDepth bounds pending pushes; a room only ever has a handful.
+type pushJob struct {
+	key string
+	run func()
+}
+
+// pushQueueDepth bounds pending pushes; a room only ever has a handful. Jobs
+// with the same key are coalesced while waiting, because signaling retries can
+// deliver the same control request more than once.
 const pushQueueDepth = 16
 
+var (
+	errPushQueueClosed = errors.New("push queue is closed")
+	errPushQueueFull   = errors.New("push queue is full")
+)
+
+type pushQueueStats struct {
+	Accepted  uint64
+	Coalesced uint64
+	Rejected  uint64
+}
+
 func newPushQueue(done <-chan struct{}) *pushQueue {
-	q := &pushQueue{jobs: make(chan func(), pushQueueDepth)}
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case job := <-q.jobs:
-				job()
-			}
-		}
-	}()
+	q := &pushQueue{
+		done: done,
+		wake: make(chan struct{}, 1),
+		max:  pushQueueDepth,
+	}
+	go q.run()
 	return q
 }
 
-func (q *pushQueue) submit(job func()) {
-	select {
-	case q.jobs <- job:
-	default:
-		logging.Warnf("[signaling] push queue is full; dropping a bmsg_push")
+func (q *pushQueue) run() {
+	for {
+		select {
+		case <-q.done:
+			q.stop()
+			return
+		default:
+		}
+
+		q.mu.Lock()
+		if q.stopped {
+			q.mu.Unlock()
+			return
+		}
+		if len(q.jobs) == 0 {
+			q.mu.Unlock()
+			select {
+			case <-q.done:
+				q.stop()
+				return
+			case <-q.wake:
+			}
+			continue
+		}
+		job := q.jobs[0]
+		copy(q.jobs, q.jobs[1:])
+		q.jobs = q.jobs[:len(q.jobs)-1]
+		q.mu.Unlock()
+
+		// The done channel is intentionally checked before dequeuing, so
+		// cancellation drops only work that has not started. The signaling
+		// callback remains non-blocking while in-flight API work finishes.
+		job.run()
 	}
+}
+
+func (q *pushQueue) stop() {
+	q.mu.Lock()
+	q.stopped = true
+	q.jobs = nil
+	q.mu.Unlock()
+}
+
+// submit never waits for the worker. A duplicate key replaces the queued job
+// in place; a full queue returns an observable error to the signaling handler.
+func (q *pushQueue) submit(key string, job func()) error {
+	if job == nil {
+		return errors.New("push queue job is nil")
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stopped {
+		return errPushQueueClosed
+	}
+	select {
+	case <-q.done:
+		q.stopped = true
+		q.jobs = nil
+		return errPushQueueClosed
+	default:
+	}
+
+	if key != "" {
+		for i := range q.jobs {
+			if q.jobs[i].key == key {
+				q.jobs[i].run = job
+				q.coalesced++
+				q.signal()
+				return nil
+			}
+		}
+	}
+	if len(q.jobs) >= q.max {
+		q.rejected++
+		return errPushQueueFull
+	}
+	q.jobs = append(q.jobs, pushJob{key: key, run: job})
+	q.accepted++
+	q.signal()
+	return nil
+}
+
+func (q *pushQueue) signal() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *pushQueue) stats() pushQueueStats {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return pushQueueStats{
+		Accepted:  q.accepted,
+		Coalesced: q.coalesced,
+		Rejected:  q.rejected,
+	}
+}
+
+func pushQueueKey(pushType, controlID string) string {
+	if controlID == "" {
+		return pushType
+	}
+	return pushType + "\x00" + controlID
 }
 
 // configuredRules expands the config mappings plus the command-line mapping

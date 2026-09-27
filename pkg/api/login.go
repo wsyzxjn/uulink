@@ -1,6 +1,9 @@
 package api
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // LoginState describes whether the configured user JWT can currently access
 // user-scoped APIs.
@@ -15,7 +18,12 @@ type LoginState struct {
 // with code 0 but no user_id is treated as an invalid login state, matching the
 // server's observed behavior for expired tokens.
 func (c *Client) GetLoginState() (*LoginState, error) {
-	user, err := c.GetUserInfo()
+	return c.GetLoginStateContext(context.Background())
+}
+
+// GetLoginStateContext validates the configured JWT using ctx.
+func (c *Client) GetLoginStateContext(ctx context.Context) (*LoginState, error) {
+	user, err := c.GetUserInfoContext(ctx)
 	if err != nil {
 		return nil, err
 	}

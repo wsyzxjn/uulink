@@ -2,10 +2,13 @@ package remoteconfig
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/wsyzxjn/uulink/pkg/auth"
@@ -194,5 +197,48 @@ func TestFetchLocalFile(t *testing.T) {
 	}
 	if cfg2.EffectiveShareID() != "888999" {
 		t.Fatalf("unexpected fetched config: %+v", cfg2)
+	}
+}
+
+func TestFetchWithClientContextPropagatesCancellation(t *testing.T) {
+	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := FetchWithClientContext(ctx, &http.Client{Transport: transport}, "https://example.com/config.json")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("FetchWithClientContext() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPublishWithClientContextPropagatesCancellation(t *testing.T) {
+	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := PublishWithClientContext(ctx, &http.Client{Transport: transport}, "https://example.com/sync", "", &RemoteShareConfig{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("PublishWithClientContext() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestFetchWithClientRejectsOversizedResponse(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(strings.Repeat("x", maxRemoteConfigBytes+1))),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	_, err := FetchWithClient(client, "https://example.com/config.json")
+	if err == nil || !strings.Contains(err.Error(), "remote config exceeds") {
+		t.Fatalf("FetchWithClient() error = %v, want size limit error", err)
 	}
 }

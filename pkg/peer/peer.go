@@ -146,7 +146,18 @@ type Peer struct {
 	statsRunning           bool
 	restartRequested       chan struct{}
 	restartOnce            sync.Once
+	fileSendMu             sync.Mutex
 }
+
+const (
+	// Keep the SCTP user-data queue bounded across all streams that share a
+	// peer. Per-stream DATA_ACK windows protect individual TCP streams, while
+	// this high-water mark prevents many concurrent streams from multiplying
+	// buffered bytes without limit.
+	fileChannelHighWater = 8 * 1024 * 1024
+	fileChannelPoll      = 10 * time.Millisecond
+	fileChannelWait      = 30 * time.Second
+)
 
 type soacEvent struct {
 	ClientID string `json:"client_id"`
@@ -1294,7 +1305,38 @@ func (p *Peer) SendSignalPB(msg []byte) error {
 	if dc == nil {
 		return fmt.Errorf("file data channel not ready")
 	}
+
+	// Pion's SendText queues application data synchronously, but the SCTP
+	// transport may still retain a large amount of user data after it returns.
+	// Serialize this path and wait below a bounded high-water mark so a burst
+	// across many tunnel streams applies backpressure to the tunnel instead of
+	// growing process memory without limit.
+	p.fileSendMu.Lock()
+	defer p.fileSendMu.Unlock()
+	if err := waitForFileChannelCapacity(dc, len(msg)); err != nil {
+		return err
+	}
 	return dc.SendText(string(msg))
+}
+
+func waitForFileChannelCapacity(dc *webrtc.DataChannel, messageSize int) error {
+	if messageSize < 0 {
+		return fmt.Errorf("invalid file channel message size %d", messageSize)
+	}
+	deadline := time.Now().Add(fileChannelWait)
+	for {
+		if dc.ReadyState() != webrtc.DataChannelStateOpen {
+			return fmt.Errorf("file data channel is not open")
+		}
+		buffered := dc.BufferedAmount()
+		if messageSize >= fileChannelHighWater || buffered+uint64(messageSize) <= fileChannelHighWater {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("file data channel remained above %d-byte buffer limit", fileChannelHighWater)
+		}
+		time.Sleep(fileChannelPoll)
+	}
 }
 
 // OnBinaryChannelOpen registers a callback fired when the binary channel opens.

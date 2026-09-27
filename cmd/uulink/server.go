@@ -23,15 +23,15 @@ func doServe(ctx context.Context, client *api.Client, cfg *auth.Config, rules []
 		return fmt.Errorf("resolve hostname: %w", err)
 	}
 	logging.Debugf("registering controlled device %q", hostname)
-	if _, err := client.InitMacDevice(hostname); err != nil {
+	if _, err := client.InitMacDeviceContext(ctx, hostname); err != nil {
 		return fmt.Errorf("register controlled device: %w", err)
 	}
-	if _, err := client.SetMacControllable(true); err != nil {
+	if _, err := client.SetMacControllableContext(ctx, true); err != nil {
 		return fmt.Errorf("enable controlled device: %w", err)
 	}
 
 	logging.Debugf("creating controlled room")
-	room, err := client.CreateRoom()
+	room, err := client.CreateRoomContext(ctx)
 	if err != nil {
 		return fmt.Errorf("create room: %w", err)
 	}
@@ -51,11 +51,11 @@ type guestShareOptions struct {
 }
 
 func doGuestServe(ctx context.Context, client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
-	session, err := client.CreateGuest()
+	session, err := client.CreateGuestContext(ctx)
 	if err != nil {
 		return fmt.Errorf("create guest: %w", err)
 	}
-	room, err := client.CreateGuestRoom(session)
+	room, err := client.CreateGuestRoomContext(ctx, session)
 	if err != nil {
 		return fmt.Errorf("create guest room: %w", err)
 	}
@@ -67,7 +67,7 @@ func doUnboundGuestServe(ctx context.Context, client *api.Client, cfg *auth.Conf
 	if err != nil {
 		return fmt.Errorf("resolve hostname: %w", err)
 	}
-	session, identity, err := client.CreateUnboundGuest(hostname)
+	session, identity, err := client.CreateUnboundGuestContext(ctx, hostname)
 	if err != nil {
 		return fmt.Errorf("create unbound guest: %w", err)
 	}
@@ -83,7 +83,7 @@ func doUnboundGuestServe(ctx context.Context, client *api.Client, cfg *auth.Conf
 	}
 	logging.Debugf("unbound guest identity ready")
 
-	room, err := client.CreateGuestRoom(session)
+	room, err := client.CreateGuestRoomContext(ctx, session)
 	if err != nil {
 		return fmt.Errorf("create guest room: %w", err)
 	}
@@ -117,7 +117,7 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	var share *api.GuestShareInfo
 	pushes := newPushQueue(sig.Done())
 	if guestSession != nil {
-		if _, err := client.GuestSetDeviceControllable(guestSession, true); err != nil {
+		if _, err := client.GuestSetDeviceControllableContext(ctx, guestSession, true); err != nil {
 			return fmt.Errorf("set guest device controllable: %w", err)
 		}
 		share, err = waitForGuestConnectID(client, guestSession)
@@ -165,7 +165,7 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 
 		// The push is answered with several API round trips; the queue keeps
 		// them off the signaling read loop and in arrival order.
-		pushes.submit(func() {
+		if err := pushes.submit(pushQueueKey(push.Type, push.Data.ControlID), func() {
 			shareMu.Lock()
 			defer shareMu.Unlock()
 			switch push.Type {
@@ -218,7 +218,9 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 			default:
 				logging.Debugf("[signaling] controlled bmsg_push type=%q", push.Type)
 			}
-		})
+		}); err != nil {
+			logging.Warnf("[signaling] bmsg_push queue rejected: type=%q control_id_len=%d err=%v", push.Type, len(push.Data.ControlID), err)
+		}
 	})
 
 	if guestSession != nil {
@@ -247,7 +249,7 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 			}
 		}
 		if shareOptions.PublishURL != "" {
-			if err := publishShareInfo(shareOptions.PublishURL, shareOptions.PublishSecret, &current, rules); err != nil {
+			if err := publishShareInfo(ctx, shareOptions.PublishURL, shareOptions.PublishSecret, &current, rules); err != nil {
 				return fmt.Errorf("publish share info: %w", err)
 			}
 		}
@@ -278,10 +280,10 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	defer p.Close()
 
 	if room.ReportURL != "" && room.ReportToken != "" {
-		if _, err := client.ReportIP(room); err != nil {
+		if _, err := client.ReportIPContext(ctx, room); err != nil {
 			logging.Debugf("report relay IP: %v", err)
 		}
-		if _, err := client.ReportEchoServers(room); err != nil {
+		if _, err := client.ReportEchoServersContext(ctx, room); err != nil {
 			logging.Debugf("report relay echo servers: %v", err)
 		}
 	}
@@ -462,29 +464,21 @@ type guestShareFileInfo struct {
 }
 
 func saveGuestShareFile(path string, share *api.GuestShareInfo) error {
-	data, err := json.Marshal(guestShareFileInfo{
+	return auth.SaveJSONFile(path, guestShareFileInfo{
 		ConnectID:     share.ConnectID,
 		ConnectCode:   share.ConnectCode,
 		TemporaryCode: share.TemporaryCode,
 		CustomCode:    share.CustomCode,
 		ControlID:     share.ControlID,
 	})
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
 }
 
 func saveRoomFile(path string, room *api.RoomConnectionInfo) error {
-	data, err := json.Marshal(roomFileInfo{
+	return auth.SaveJSONFile(path, roomFileInfo{
 		SignalingServer: room.SignalingServer,
 		SignalingList:   room.SignalingList,
 		Token:           room.Token,
 	})
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
 }
 
 func loadRoomFile(path string) (*api.RoomConnectionInfo, error) {

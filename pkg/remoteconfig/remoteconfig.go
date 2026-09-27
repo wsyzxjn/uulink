@@ -2,6 +2,7 @@ package remoteconfig
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/auth"
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
+
+const maxRemoteConfigBytes = 1 << 20
 
 // RemoteShareConfig holds the share information and mapping rules fetched from
 // a remote configuration URL.
@@ -72,25 +75,59 @@ func Fetch(rawURL string, timeout time.Duration) (*RemoteShareConfig, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return FetchWithClient(&http.Client{Timeout: timeout}, rawURL)
+	return FetchContext(context.Background(), rawURL, timeout)
+}
+
+// FetchContext loads a remote configuration and allows callers to cancel an
+// in-flight HTTP request. The timeout remains an upper bound for compatibility
+// with Fetch; ctx cancellation takes precedence.
+func FetchContext(ctx context.Context, rawURL string, timeout time.Duration) (*RemoteShareConfig, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return FetchWithClientContext(ctx, &http.Client{Timeout: timeout}, rawURL)
 }
 
 // FetchWithClient loads a RemoteShareConfig using the specified HTTP client.
 func FetchWithClient(client *http.Client, rawURL string) (*RemoteShareConfig, error) {
+	return FetchWithClientContext(context.Background(), client, rawURL)
+}
+
+// FetchWithClientContext loads a remote configuration using client and ctx.
+func FetchWithClientContext(ctx context.Context, client *http.Client, rawURL string) (*RemoteShareConfig, error) {
 	if rawURL == "" {
 		return nil, fmt.Errorf("remote config URL is empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
 
 	var data []byte
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		filePath := strings.TrimPrefix(rawURL, "file://")
-		var err error
-		data, err = os.ReadFile(filePath)
+		file, err := os.Open(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("read remote config file %s: %w", filePath, err)
 		}
+		data, err = io.ReadAll(io.LimitReader(file, maxRemoteConfigBytes+1))
+		closeErr := file.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read remote config file %s: %w", filePath, err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close remote config file %s: %w", filePath, closeErr)
+		}
+		if len(data) > maxRemoteConfigBytes {
+			return nil, fmt.Errorf("remote config exceeds %d bytes", maxRemoteConfigBytes)
+		}
 	} else {
-		req, err := http.NewRequest("GET", rawURL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("build request: %w", err)
 		}
@@ -109,9 +146,12 @@ func FetchWithClient(client *http.Client, rawURL string) (*RemoteShareConfig, er
 		}
 
 		var errRead error
-		data, errRead = io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+		data, errRead = io.ReadAll(io.LimitReader(resp.Body, maxRemoteConfigBytes+1))
 		if errRead != nil {
 			return nil, fmt.Errorf("read remote config body: %w", errRead)
+		}
+		if len(data) > maxRemoteConfigBytes {
+			return nil, fmt.Errorf("remote config exceeds %d bytes", maxRemoteConfigBytes)
 		}
 	}
 
@@ -130,13 +170,35 @@ func Publish(publishURL, secret string, cfg *RemoteShareConfig, timeout time.Dur
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return PublishWithClient(&http.Client{Timeout: timeout}, publishURL, secret, cfg)
+	return PublishContext(context.Background(), publishURL, secret, cfg, timeout)
+}
+
+// PublishContext sends share config to a webhook or endpoint using ctx.
+func PublishContext(ctx context.Context, publishURL, secret string, cfg *RemoteShareConfig, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return PublishWithClientContext(ctx, &http.Client{Timeout: timeout}, publishURL, secret, cfg)
 }
 
 // PublishWithClient sends share config using the specified HTTP client.
 func PublishWithClient(client *http.Client, publishURL, secret string, cfg *RemoteShareConfig) error {
+	return PublishWithClientContext(context.Background(), client, publishURL, secret, cfg)
+}
+
+// PublishWithClientContext sends share config using client and ctx.
+func PublishWithClientContext(ctx context.Context, client *http.Client, publishURL, secret string, cfg *RemoteShareConfig) error {
 	if publishURL == "" {
 		return fmt.Errorf("publish URL is empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -144,7 +206,7 @@ func PublishWithClient(client *http.Client, publishURL, secret string, cfg *Remo
 		return fmt.Errorf("marshal publish payload: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", publishURL, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", publishURL, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("build publish request: %w", err)
 	}

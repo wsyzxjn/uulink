@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -21,7 +22,12 @@ type RoomConnectionInfo struct {
 
 // CreateRoom calls POST /api/v1/room/create (server/controlled side).
 func (c *Client) CreateRoom() (*RoomConnectionInfo, error) {
-	resp, err := c.Do("POST", "/api/v1/room/create", map[string]any{})
+	return c.CreateRoomContext(context.Background())
+}
+
+// CreateRoomContext creates a room using ctx.
+func (c *Client) CreateRoomContext(ctx context.Context) (*RoomConnectionInfo, error) {
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/room/create", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("room create: %w", err)
 	}
@@ -37,7 +43,12 @@ func (c *Client) CreateRoom() (*RoomConnectionInfo, error) {
 // JoinRoomByDevice calls POST /api/v1/room/join/by_device/<id> (controller side).
 // Returns the room connection info if successful.
 func (c *Client) JoinRoomByDevice(deviceID string, forceJoin bool) (*RoomConnectionInfo, error) {
-	resp, err := c.Do("POST", "/api/v1/room/join/by_device/"+deviceID, map[string]bool{"force_join": forceJoin})
+	return c.JoinRoomByDeviceContext(context.Background(), deviceID, forceJoin)
+}
+
+// JoinRoomByDeviceContext joins a room by device ID using ctx.
+func (c *Client) JoinRoomByDeviceContext(ctx context.Context, deviceID string, forceJoin bool) (*RoomConnectionInfo, error) {
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/room/join/by_device/"+deviceID, map[string]bool{"force_join": forceJoin})
 	if err != nil {
 		return nil, fmt.Errorf("room join: %w", err)
 	}
@@ -52,7 +63,12 @@ func (c *Client) JoinRoomByDevice(deviceID string, forceJoin bool) (*RoomConnect
 
 // RefetchRoomJoin refreshes room join credentials using a signaling reconnect key.
 func (c *Client) RefetchRoomJoin(token string) (*RoomConnectionInfo, error) {
-	resp, err := c.Do("POST", "/api/v1/room/join/refetch", map[string]string{"token": token})
+	return c.RefetchRoomJoinContext(context.Background(), token)
+}
+
+// RefetchRoomJoinContext refreshes room join credentials using ctx.
+func (c *Client) RefetchRoomJoinContext(ctx context.Context, token string) (*RoomConnectionInfo, error) {
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/room/join/refetch", map[string]string{"token": token})
 	if err != nil {
 		return nil, fmt.Errorf("room join refetch: %w", err)
 	}

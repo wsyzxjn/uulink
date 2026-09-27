@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -11,6 +12,11 @@ type LoginResult struct {
 
 // RequestMobileCode sends an SMS verification code to the specified phone number.
 func (c *Client) RequestMobileCode(countryCode, mobile string) (map[string]any, error) {
+	return c.RequestMobileCodeContext(context.Background(), countryCode, mobile)
+}
+
+// RequestMobileCodeContext sends an SMS verification code request using ctx.
+func (c *Client) RequestMobileCodeContext(ctx context.Context, countryCode, mobile string) (map[string]any, error) {
 	if countryCode == "" {
 		countryCode = "+86"
 	}
@@ -19,7 +25,7 @@ func (c *Client) RequestMobileCode(countryCode, mobile string) (map[string]any, 
 		"mobile":       mobile,
 		"type":         "login",
 	}
-	resp, err := c.Do("POST", "/api/v1/security/mobile/code", body)
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/security/mobile/code", body)
 	if err != nil {
 		return nil, fmt.Errorf("request mobile code: %w", err)
 	}
@@ -28,6 +34,11 @@ func (c *Client) RequestMobileCode(countryCode, mobile string) (map[string]any, 
 
 // LoginByMobile exchanges a mobile number and SMS verification code for a user JWT.
 func (c *Client) LoginByMobile(countryCode, mobile, code string) (*LoginResult, error) {
+	return c.LoginByMobileContext(context.Background(), countryCode, mobile, code)
+}
+
+// LoginByMobileContext exchanges a mobile number and SMS code using ctx.
+func (c *Client) LoginByMobileContext(ctx context.Context, countryCode, mobile, code string) (*LoginResult, error) {
 	if countryCode == "" {
 		countryCode = "+86"
 	}
@@ -36,7 +47,7 @@ func (c *Client) LoginByMobile(countryCode, mobile, code string) (*LoginResult, 
 		"mobile":       mobile,
 		"code":         code,
 	}
-	resp, err := c.Do("POST", "/api/v1/login/by_mobile", body)
+	resp, err := c.DoContext(ctx, "POST", "/api/v1/login/by_mobile", body)
 	if err != nil {
 		return nil, fmt.Errorf("login by mobile: %w", err)
 	}

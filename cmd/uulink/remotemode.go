@@ -39,7 +39,7 @@ type remoteConfigOptions struct {
 
 func runRemoteConfigController(ctx context.Context, client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options remoteConfigOptions) error {
 	logging.Infof("fetching remote share configuration from %s", options.url)
-	remoteCfg, err := remoteconfig.Fetch(options.url, remoteConfigFetchTimeout)
+	remoteCfg, err := remoteconfig.FetchContext(ctx, options.url, remoteConfigFetchTimeout)
 	if err != nil {
 		return fmt.Errorf("fetch remote configuration: %w", err)
 	}
@@ -89,7 +89,7 @@ func runRemoteConfigController(ctx context.Context, client *api.Client, cfg *aut
 
 // publishShareInfo posts the share credentials and mappings as a remote
 // configuration document so clients can fetch them with -config-url.
-func publishShareInfo(publishURL, secret string, share *api.GuestShareInfo, rules []tunnel.Rule) error {
+func publishShareInfo(ctx context.Context, publishURL, secret string, share *api.GuestShareInfo, rules []tunnel.Rule) error {
 	payload := &remoteconfig.RemoteShareConfig{
 		ShareID:   share.ConnectID,
 		ShareCode: share.ConnectCode,
@@ -105,7 +105,7 @@ func publishShareInfo(publishURL, secret string, share *api.GuestShareInfo, rule
 			RemotePort: rule.TargetPort,
 		})
 	}
-	if err := remoteconfig.Publish(publishURL, secret, payload, 10*time.Second); err != nil {
+	if err := remoteconfig.PublishContext(ctx, publishURL, secret, payload, 10*time.Second); err != nil {
 		return err
 	}
 	logging.Infof("published share info to %s", publishURL)

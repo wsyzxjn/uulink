@@ -294,7 +294,7 @@ Multi-architecture images (`linux/amd64`, `linux/arm64`) are built and published
 docker pull ghcr.io/wsyzxjn/uulink:latest
 ```
 
-Available tags: `latest`, the semantic versions of each release (`0.1.7`, `0.1`, `0`), and `sha-<commit>` for the commit a release was built from. Images are not published for ordinary pushes to `main`; build from source (`docker compose up --build`, or `docker build .`) to run unreleased changes.
+Available tags: `latest`, full/minor/major semantic-version tags for each release, and `sha-<commit>` for the commit a release was built from. Images are not published for ordinary pushes to `main`; build from source (`docker compose up --build`, or `docker build .`) to run unreleased changes.
 
 ### Run
 
@@ -325,7 +325,7 @@ UULINK_DEVICE=TARGET_DEVICE_ID docker compose up -d
 UULINK_DEVICE=TARGET_DEVICE_ID docker compose up -d --build
 
 # Pin a specific tag
-UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:0.1.1 docker compose up -d
+UULINK_DEVICE=TARGET_DEVICE_ID UULINK_IMAGE=ghcr.io/wsyzxjn/uulink:VERSION_TAG docker compose up -d
 ```
 
 ### Deployment notes

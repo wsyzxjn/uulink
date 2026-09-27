@@ -18,6 +18,11 @@ import (
 
 const defaultBaseURL = "https://api.nrd.nie.163.com"
 
+// maxAPIResponseBytes bounds the amount of data decoded from one API response.
+// API envelopes are small; the limit prevents a faulty or hostile upstream from
+// forcing an unbounded allocation in io.ReadAll.
+const maxAPIResponseBytes = 4 << 20
+
 // Client wraps HTTP calls to the UU Remote REST API.
 type Client struct {
 	cfg     *auth.Config
@@ -114,6 +119,9 @@ func (c *Client) Do(method, path string, body any) (map[string]any, error) {
 // DoContext sends an authenticated request using ctx and returns the raw JSON
 // response for protocol inspection. Endpoint helpers should expose typed data.
 func (c *Client) DoContext(ctx context.Context, method, path string, body any) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var bodyBytes []byte
 	var bodyStr string
 	if body != nil {
@@ -158,9 +166,12 @@ func (c *Client) DoContext(ctx context.Context, method, path string, body any) (
 }
 
 func decodeJSONResponse(resp *http.Response, operation string) (map[string]any, error) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("%s: read response: %w", operation, err)
+	}
+	if len(responseBody) > maxAPIResponseBytes {
+		return nil, fmt.Errorf("%s: response body exceeds %d bytes", operation, maxAPIResponseBytes)
 	}
 	httpOK := resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 
@@ -201,7 +212,12 @@ type UserInfo struct {
 
 // GetUserInfo fetches current user info.
 func (c *Client) GetUserInfo() (*UserInfo, error) {
-	response, err := c.Do("GET", "/api/v1/user/info", nil)
+	return c.GetUserInfoContext(context.Background())
+}
+
+// GetUserInfoContext fetches current user info using ctx.
+func (c *Client) GetUserInfoContext(ctx context.Context) (*UserInfo, error) {
+	response, err := c.DoContext(ctx, "GET", "/api/v1/user/info", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +243,12 @@ type DeviceInfo struct {
 
 // GetDeviceList fetches and normalizes all device-list groups.
 func (c *Client) GetDeviceList() ([]DeviceInfo, error) {
-	response, err := c.Do("GET", "/api/v1/device/list", nil)
+	return c.GetDeviceListContext(context.Background())
+}
+
+// GetDeviceListContext fetches and normalizes all device-list groups using ctx.
+func (c *Client) GetDeviceListContext(ctx context.Context) ([]DeviceInfo, error) {
+	response, err := c.DoContext(ctx, "GET", "/api/v1/device/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +288,12 @@ func (c *Client) GetDeviceList() ([]DeviceInfo, error) {
 
 // JoinRoom joins a room by device ID.
 func (c *Client) JoinRoom(deviceID string, forceJoin bool) (map[string]any, error) {
-	return c.Do("POST", "/api/v1/room/join/by_device/"+deviceID, map[string]bool{"force_join": forceJoin})
+	return c.JoinRoomContext(context.Background(), deviceID, forceJoin)
+}
+
+// JoinRoomContext joins a room by device ID using ctx.
+func (c *Client) JoinRoomContext(ctx context.Context, deviceID string, forceJoin bool) (map[string]any, error) {
+	return c.DoContext(ctx, "POST", "/api/v1/room/join/by_device/"+deviceID, map[string]bool{"force_join": forceJoin})
 }
 
 // RoomJoinResponse holds parsed room join data.

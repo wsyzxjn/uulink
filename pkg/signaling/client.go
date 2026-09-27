@@ -65,6 +65,7 @@ type RoomInfo struct {
 const (
 	defaultPingInterval = 25 * time.Second
 	defaultPingTimeout  = 20 * time.Second
+	eventQueueDepth     = 128
 )
 
 // Client is a socket.io EIO=4 client over WebSocket with binary attachment support.
@@ -85,6 +86,7 @@ type Client struct {
 	ackCounter   int
 	amu          sync.Mutex
 	closeOnce    sync.Once
+	eventQueue   chan *Event
 
 	// Pending binary events waiting for attachments
 	pendingBinaryEvent *pendingBinaryEvent
@@ -152,6 +154,7 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 		readyCh:     make(chan struct{}),
 		handlers:    make(map[string]func(*Event)),
 		ackHandlers: make(map[int]func([]json.RawMessage)),
+		eventQueue:  make(chan *Event, eventQueueDepth),
 	}
 
 	// Read the EIO open packet. The gateway sends it right after the
@@ -192,6 +195,7 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 
 	go c.readLoop()
 	go c.pingLoop()
+	go c.dispatchLoop()
 
 	// Complete the socket.io namespace connection (server responds 40{"sid":...})
 	if err := c.send("40"); err != nil {
@@ -735,6 +739,24 @@ func (c *Client) handleBinaryEventPacket(data []byte) {
 }
 
 func (c *Client) dispatchEvent(ev *Event) {
+	select {
+	case c.eventQueue <- ev:
+	case <-c.done:
+	}
+}
+
+func (c *Client) dispatchLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case ev := <-c.eventQueue:
+			c.handleEvent(ev)
+		}
+	}
+}
+
+func (c *Client) handleEvent(ev *Event) {
 	c.hmu.RLock()
 	handler, ok := c.handlers[ev.Name]
 	c.hmu.RUnlock()

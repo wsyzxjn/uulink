@@ -71,7 +71,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	switch {
 	case options.shareConfirmation:
 		if options.shareControlID == "" {
-			_, controlModeErr := client.GetShareControlMode(options.shareID)
+			_, controlModeErr := client.GetShareControlModeContext(ctx, options.shareID)
 			if controlModeErr != nil {
 				logging.Debugf("share control mode query failed: %v", controlModeErr)
 			}
@@ -88,7 +88,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 			logging.Debugf("generated share control_id_length=%d", len(controlID))
 		}
 		controllerAppControlID = controlID
-		room, err = client.JoinRoomByConfirmation(options.shareID, controlID)
+		room, err = client.JoinRoomByConfirmationContext(ctx, options.shareID, controlID)
 		if err != nil {
 			var responseErr *api.ResponseError
 			if errors.As(err, &responseErr) {
@@ -98,7 +98,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 			return fmt.Errorf("join room by confirmation: %w", err)
 		}
 	case options.shareJoin:
-		room, err = client.JoinRoomByShareCode(options.shareID, options.shareCode)
+		room, err = client.JoinRoomByShareCodeContext(ctx, options.shareID, options.shareCode)
 		if err != nil {
 			var responseErr *api.ResponseError
 			if errors.As(err, &responseErr) {
@@ -111,11 +111,11 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		var guestSession *api.GuestSession
 		var guestErr error
 		if cfg.DeviceID != "" && cfg.ClientID != "" && (cfg.Platform == 1 || runtime.GOOS == "windows") {
-			guestSession, guestErr = client.CreateGuest()
+			guestSession, guestErr = client.CreateGuestContext(ctx)
 		}
 		if guestSession == nil {
 			var identity *api.UnboundDeviceIdentity
-			guestSession, identity, guestErr = client.CreateUnboundGuest("guest-controller")
+			guestSession, identity, guestErr = client.CreateUnboundGuestContext(ctx, "guest-controller")
 			if guestErr == nil && identity != nil {
 				cfg.ClientID = identity.ClientID
 				cfg.DeviceID = identity.DeviceID
@@ -129,7 +129,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 			return fmt.Errorf("create guest: %w", guestErr)
 		}
 		controllerGuestDeviceID = guestSession.DeviceID
-		room, err = client.JoinRoomByShareCodeWithGuest(guestSession, options.shareID, options.shareCode)
+		room, err = client.JoinRoomByShareCodeWithGuestContext(ctx, guestSession, options.shareID, options.shareCode)
 		if err != nil {
 			var responseErr *api.ResponseError
 			if errors.As(err, &responseErr) && responseErr.Code == api.CodeObjectNotFound {
@@ -154,7 +154,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		room.IsRoomFileController = true
 	default:
 		logging.Infof("joining remote device %s", targetDevID)
-		room, err = client.JoinRoomByDevice(targetDevID, false)
+		room, err = client.JoinRoomByDeviceContext(ctx, targetDevID, false)
 		if err != nil {
 			return fmt.Errorf("join room: %w", err)
 		}
