@@ -18,6 +18,7 @@ const sharePassCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 // GuestSession holds the temporary identity returned by /guest/create.
 type GuestSession struct {
+	Platform int
 	GuestID  string
 	Token    string
 	UserID   string
@@ -56,20 +57,20 @@ func (c *Client) CreateGuestContext(ctx context.Context) (*GuestSession, error) 
 		return nil, fmt.Errorf("decode guest token: %w", err)
 	}
 
-	return &GuestSession{GuestID: guestID, Token: token, UserID: userID, DeviceID: deviceID, ClientID: cfg.ClientID}, nil
+	return &GuestSession{GuestID: guestID, Token: token, UserID: userID, DeviceID: deviceID, ClientID: cfg.ClientID, Platform: cfg.Identity().Platform}, nil
 }
 
 // CreateUnboundGuest registers a new device without a user account and then
 // creates a guest session for it. The resulting session is not associated
 // with any logged-in user, which avoids the server's same-account
 // self-assist restriction.
-func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *UnboundDeviceIdentity, error) {
+func (c *Client) CreateUnboundGuest(name string) (*GuestSession, *DeviceIdentity, error) {
 	return c.CreateUnboundGuestContext(context.Background(), name)
 }
 
 // CreateUnboundGuestContext creates an unbound device and guest session using ctx.
-func (c *Client) CreateUnboundGuestContext(ctx context.Context, name string) (*GuestSession, *UnboundDeviceIdentity, error) {
-	identity, err := c.InitWindowsDeviceWithoutAuthContext(ctx, name)
+func (c *Client) CreateUnboundGuestContext(ctx context.Context, name string) (*GuestSession, *DeviceIdentity, error) {
+	identity, err := c.InitDeviceWithoutAuthContext(ctx, name)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create unbound device: %w", err)
 	}
@@ -80,7 +81,7 @@ func (c *Client) CreateUnboundGuestContext(ctx context.Context, name string) (*G
 	cfg.GuestID = ""
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
-	cfg.Platform = 1
+	cfg.Platform = identity.Platform
 	session, err := c.withConfig(&cfg).CreateGuestContext(ctx)
 	if err != nil {
 		return nil, identity, fmt.Errorf("create guest for unbound device: %w", err)
@@ -121,10 +122,11 @@ func (c *Client) guestClient(session *GuestSession) *Client {
 	}
 	if session.ClientID != "" {
 		cfg.ClientID = session.ClientID
-		if strings.HasPrefix(session.ClientID, "MG-") {
-			cfg.Platform = 1
-		}
 	}
+	if session.Platform != 0 {
+		cfg.Platform = session.Platform
+	}
+
 	return c.withConfig(&cfg)
 }
 
@@ -464,13 +466,7 @@ func (c *Client) GuestSetDeviceControllable(session *GuestSession, controllable 
 
 // GuestSetDeviceControllableContext marks a guest device as controllable using ctx.
 func (c *Client) GuestSetDeviceControllableContext(ctx context.Context, session *GuestSession, controllable bool) (map[string]any, error) {
-	resp, err := c.guestClient(session).DoContext(ctx, "POST", "/api/v1/device/controllable", map[string]bool{
-		"controllable": controllable,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("guest set device controllable: %w", err)
-	}
-	return resp, nil
+	return c.guestClient(session).SetDeviceControllableContext(ctx, controllable)
 }
 
 // GetShareControlMode queries the controller-side remote-assistance control

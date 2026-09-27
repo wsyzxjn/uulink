@@ -173,13 +173,15 @@ func TestExpansionOfferValidation(t *testing.T) {
 }
 
 func TestExpansionTotalSessionLimit(t *testing.T) {
-	var got int
-	handler := serveExpandRequests(&fakeSender{}, 100, func(extra int) ([]expandShare, error) {
-		got = extra
-		return []expandShare{{ID: "1", Code: "A"}}, nil
-	})
-	handler([]byte(`{"uulink":1,"type":"expand_request","sessions":100}`))
-	if got != 15 {
-		t.Fatalf("extra rooms = %d; want 15 plus one primary", got)
+	for _, tt := range []struct{ allowed, want int }{{15, 15}, {23, 23}, {100, maxExpandSessions}} {
+		var got int
+		handler := serveExpandRequests(&fakeSender{}, tt.allowed, func(extra int) ([]expandShare, error) {
+			got = extra
+			return []expandShare{{ID: "1", Code: "A"}}, nil
+		})
+		handler([]byte(`{"uulink":1,"type":"expand_request","sessions":100}`))
+		if got != tt.want {
+			t.Fatalf("limit %d: got %d extra rooms, want %d", tt.allowed, got, tt.want)
+		}
 	}
 }

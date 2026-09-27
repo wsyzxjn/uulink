@@ -21,6 +21,7 @@ import (
 
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 )
 
 // FrameSender sends a Message-wrapped PortMappingFrame to the remote peer.
@@ -38,9 +39,7 @@ type Rule struct {
 }
 
 // SessionID is the port mapping session used by the captured protocol.
-const SessionID = "1"
-
-const connectTimeout = 10 * time.Second
+const SessionID = gvpb.DefaultMappingSession
 
 const (
 	maxFrameIDLength = 20
@@ -247,19 +246,6 @@ func GenerateRuleID() string {
 	return strconv.FormatUint(v, 10)
 }
 
-const defaultMaxInFlight = 128
-
-// inboundQueueDepth bounds the DATA frames a stream holds for its local
-// writer. A peer that honors the DATA_ACK window never has more than
-// defaultMaxInFlight frames outstanding, so enqueueing never blocks for a
-// well-behaved peer. A peer that ignores the window is throttled on its own
-// stream instead of stalling every other stream on the transport.
-const inboundQueueDepth = defaultMaxInFlight
-
-// halfCloseTimeout bounds how long a stream stays half-open after one side
-// has sent its FIN.
-const halfCloseTimeout = 60 * time.Second
-
 // RoutedFrameSender is an optional FrameSender extension. A sender that
 // implements it receives the routing keys of every outgoing frame, so a
 // multiplexing sender such as SessionPool does not have to decode the wire
@@ -278,6 +264,7 @@ type StreamReleaser interface {
 
 // Tunnel manages one or more local mapping rules and all PM streams.
 type Tunnel struct {
+	network        settings.Network
 	sender         FrameSender
 	rules          map[string]Rule
 	listeners      map[string]net.Listener
@@ -334,7 +321,18 @@ func NewTunnel(rule Rule, sender FrameSender) *Tunnel {
 // NewTunnelWithRules creates a tunnel for multiple local listeners. Rule IDs
 // must be unique within one process.
 func NewTunnelWithRules(rules []Rule, sender FrameSender) *Tunnel {
+	t, _ := NewTunnelWithSettings(rules, sender, settings.Network{})
+	return t
+}
+
+// NewTunnelWithSettings validates tuning before creating listeners or streams.
+func NewTunnelWithSettings(rules []Rule, sender FrameSender, network settings.Network) (*Tunnel, error) {
+	network, err := network.Resolve()
+	if err != nil {
+		return nil, err
+	}
 	t := &Tunnel{
+		network:   network,
 		sender:    sender,
 		rules:     make(map[string]Rule, len(rules)),
 		listeners: make(map[string]net.Listener, len(rules)),
@@ -354,7 +352,7 @@ func NewTunnelWithRules(rules []Rule, sender FrameSender) *Tunnel {
 		}
 		t.rules[rule.ID] = rule
 	}
-	return t
+	return t, nil
 }
 
 // Start begins listening for every configured rule.
@@ -413,10 +411,10 @@ var readBufPool = sync.Pool{
 	},
 }
 
-func configureTCPConn(conn net.Conn) {
+func (t *Tunnel) configureTCPConn(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetKeepAlivePeriod(time.Duration(t.network.KeepAliveSeconds) * time.Second)
 		_ = tcpConn.SetNoDelay(true)
 	}
 }
@@ -432,9 +430,7 @@ func (t *Tunnel) SetMaxInFlight(n int) {
 
 // MaxInFlight returns the configured maximum in-flight DATA frames per stream.
 func (t *Tunnel) MaxInFlight() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.maxInFlight
+	return t.effectiveMaxInFlight()
 }
 
 func (t *Tunnel) effectiveMaxInFlight() int {
@@ -444,7 +440,7 @@ func (t *Tunnel) effectiveMaxInFlight() int {
 		return 0
 	}
 	if t.maxInFlight == 0 {
-		return defaultMaxInFlight
+		return t.network.MaxInFlight
 	}
 	return t.maxInFlight
 }
@@ -459,7 +455,7 @@ func (t *Tunnel) newStream(ruleID, streamID string, conn net.Conn) *stream {
 		tunnel: t,
 		ready:  make(chan struct{}),
 		closed: make(chan struct{}),
-		inbox:  make(chan inboundItem, inboundQueueDepth),
+		inbox:  make(chan inboundItem, t.network.MaxInFlight),
 	}
 	if limit := t.effectiveMaxInFlight(); limit > 0 {
 		s.ackSem = make(chan struct{}, limit)
@@ -520,7 +516,7 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 			}
 		}
 
-		configureTCPConn(conn)
+		t.configureTCPConn(conn)
 		streamID := t.nextStreamID(rule.ID)
 		s := t.newStream(rule.ID, streamID, conn)
 		t.streams.Store(streamKey(rule.ID, streamID), s)
@@ -655,7 +651,7 @@ func (t *Tunnel) rejectConnect(ruleID, streamID string) {
 
 func (t *Tunnel) dialStream(s *stream, host string, port int) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
+	conn, err := net.DialTimeout("tcp", addr, time.Duration(t.network.ConnectTimeoutSeconds)*time.Second)
 	if err != nil {
 		if t.allowRemoteLog() {
 			logging.Warnf("[tunnel] connect target=%q error: %v", host, err)
@@ -668,7 +664,7 @@ func (t *Tunnel) dialStream(s *stream, host string, port int) {
 		conn.Close()
 		return
 	}
-	configureTCPConn(conn)
+	t.configureTCPConn(conn)
 	msg, err := newSynAckMsg(s.ruleID, s.id, true)
 	t.sendBuilt(s.ruleID, s.id, gvpb.TypeSynAck, msg, err)
 	s.markReady()
@@ -828,7 +824,7 @@ func (s *stream) armHalfCloseTimeout() {
 	if s.halfCloseTimer != nil {
 		s.halfCloseTimer.Stop()
 	}
-	s.halfCloseTimer = time.AfterFunc(halfCloseTimeout, func() {
+	s.halfCloseTimer = time.AfterFunc(time.Duration(s.tunnel.network.HalfCloseTimeoutSeconds)*time.Second, func() {
 		s.mu.Lock()
 		final := gvpb.FrameType("")
 		if !s.localFinSent {

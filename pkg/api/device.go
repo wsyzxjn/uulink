@@ -17,12 +17,12 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/auth"
 )
 
-// UnboundDeviceIdentity holds a device identity that is registered on the
-// server without being associated with any user account. The guest share flow
-// accepts these identities, which avoids the same-account self-assist block.
-type UnboundDeviceIdentity struct {
+// DeviceIdentity is the registered identity and its upstream platform.
+// Guest sessions carry the platform explicitly instead of inferring it from IDs.
+type DeviceIdentity struct {
 	ClientID string
 	DeviceID string
+	Platform int
 }
 
 // pseudoMAC derives a stable, locally administered MAC address from the
@@ -36,116 +36,127 @@ func pseudoMAC(clientID string) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
-// InitMacDevice registers this Mac as a controlled device. The body mirrors
-// the official macOS client's /device/macos/init request with generic
-// hardware details; values that identify this installation are derived from
-// the auth config.
-func (c *Client) InitMacDevice(name string) (map[string]any, error) {
-	return c.InitMacDeviceContext(context.Background(), name)
-}
-
-// InitMacDeviceContext registers this Mac using ctx.
-func (c *Client) InitMacDeviceContext(ctx context.Context, name string) (map[string]any, error) {
-	body := map[string]any{
-		"client_id":        c.cfg.ClientID,
-		"os":               "版本27.0（版号26A5421a）",
-		"resolution":       "2560x1440",
-		"system_name":      "macOS",
-		"memory":           "16384",
-		"model_number":     "MU9D3CH/A",
-		"controllable":     true,
-		"name":             name,
-		"model":            "Mac",
-		"cpu":              "Apple M4",
-		"mac":              pseudoMAC(c.cfg.ClientID),
-		"video":            []string{"Apple M4"},
-		"system_id":        c.cfg.ClientID,
-		"model_identifier": "Mac16,10",
-		"system_version":   "27.0.0",
-		"dpi":              144,
-	}
-	resp, err := c.DoContext(ctx, "POST", "/api/v1/device/macos/init", body)
-	if err != nil {
-		return nil, fmt.Errorf("init mac device: %w", err)
-	}
-	return resp, nil
-}
-
-// InitWindowsDeviceWithoutAuth registers a Windows-shaped device on the
-// server without a user JWT. The returned device is not bound to any user
-// account, which makes it usable as an anonymous guest-controlled endpoint.
-// The generated client identity is stored in cfg.UnboundClientID so a later
-// run re-registers the same device instead of minting a new one.
-func (c *Client) InitWindowsDeviceWithoutAuth(name string) (*UnboundDeviceIdentity, error) {
-	return c.InitWindowsDeviceWithoutAuthContext(context.Background(), name)
-}
-
-// InitWindowsDeviceWithoutAuthContext registers a Windows-shaped device using ctx.
-func (c *Client) InitWindowsDeviceWithoutAuthContext(ctx context.Context, name string) (*UnboundDeviceIdentity, error) {
-	guid := strings.ToLower(strings.TrimPrefix(c.cfg.UnboundClientID, "MG-"))
-	if guid == "" {
-		id, err := uuid.NewRandom()
-		if err != nil {
-			return nil, fmt.Errorf("generate device uuid: %w", err)
-		}
-		guid = id.String()
-	}
-	clientID := "MG-" + guid
-
-	body := map[string]any{
-		"name":         name,
-		"client_id":    clientID,
-		"system_id":    clientID,
-		"machine_guid": guid,
-		"guid":         guid,
-		"os":           "Microsoft Windows NT 10.0.26200.0",
-		"base_board":   "Virtual",
-		"cpu":          "Virtual CPU",
-		"video":        []string{"Virtual GPU"},
-		"mac":          pseudoMAC(clientID),
-		"memory":       "16384",
-		"screen":       "1920x1080",
-		"controllable": true,
-		"platform":     1,
-	}
-
+// InitDeviceContext registers a device using the selected platform. Successful
+// registration updates the active identity; errors leave it unchanged.
+func (c *Client) InitDeviceContext(ctx context.Context, name string) (*DeviceIdentity, error) {
 	cfg := *c.cfg
-	cfg.JWT = ""
-	cfg.UserID = ""
-	cfg.GuestID = ""
-	cfg.ClientID = clientID
-	cfg.DeviceID = ""
-	cfg.Platform = 1
-	resp, err := c.withConfig(&cfg).DoContext(ctx, "POST", "/api/v1/device/windows/init", body)
+	platform := cfg.Identity().Platform
+	clientID, err := registrationClientID(cfg.ClientID, platform)
 	if err != nil {
-		return nil, fmt.Errorf("init windows device without auth: %w", err)
+		return nil, err
 	}
-	data, err := responseData(resp, "init windows device")
+	if clientID != cfg.ClientID {
+		cfg.DeviceID = ""
+	}
+	cfg.ClientID, cfg.Platform = clientID, platform
+	identity, err := c.withConfig(&cfg).registerDeviceContext(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	c.cfg.ClientID, c.cfg.DeviceID, c.cfg.Platform = identity.ClientID, identity.DeviceID, identity.Platform
+	return identity, nil
+}
+
+// InitDeviceWithoutAuthContext keeps unbound and logged-in identities separate.
+// An explicit platform change creates a new identity rather than registering a
+// Windows ID through the macOS endpoint (or the reverse).
+func (c *Client) InitDeviceWithoutAuthContext(ctx context.Context, name string) (*DeviceIdentity, error) {
+	cfg := *c.cfg
+	platform := cfg.Identity().Platform
+	clientID := cfg.UnboundClientID
+	previousPlatform := cfg.UnboundPlatform
+	if previousPlatform == 0 && clientID != "" {
+		previousPlatform = auth.MacPlatform
+		if strings.HasPrefix(clientID, "MG-") {
+			previousPlatform = auth.WindowsPlatform
+		}
+	}
+	if previousPlatform != 0 && previousPlatform != platform {
+		clientID = ""
+	}
+	clientID, err := registrationClientID(clientID, platform)
+	if err != nil {
+		return nil, err
+	}
+	cfg.JWT, cfg.UserID, cfg.GuestID, cfg.DeviceID = "", "", "", ""
+	cfg.ClientID, cfg.Platform = clientID, platform
+	identity, err := c.withConfig(&cfg).registerDeviceContext(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	c.cfg.UnboundClientID, c.cfg.UnboundDeviceID, c.cfg.UnboundPlatform = identity.ClientID, identity.DeviceID, identity.Platform
+	return identity, nil
+}
+
+func registrationClientID(previous string, platform int) (string, error) {
+	if platform != auth.WindowsPlatform && platform != auth.MacPlatform {
+		return "", fmt.Errorf("unsupported registration platform %d", platform)
+	}
+	windowsID := strings.HasPrefix(previous, "MG-")
+	if previous != "" && windowsID == (platform == auth.WindowsPlatform) {
+		if windowsID {
+			return "MG-" + strings.ToLower(strings.TrimPrefix(previous, "MG-")), nil
+		}
+		return previous, nil
+	}
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return "", fmt.Errorf("generate device uuid: %w", err)
+	}
+	if platform == auth.WindowsPlatform {
+		return "MG-" + id.String(), nil
+	}
+	return strings.ToUpper(id.String()), nil
+}
+
+func (c *Client) registerDeviceContext(ctx context.Context, name string) (*DeviceIdentity, error) {
+	platform := c.cfg.Identity().Platform
+	var path string
+	switch platform {
+	case auth.WindowsPlatform:
+		path = "/api/v1/device/windows/init"
+	case auth.MacPlatform:
+		path = "/api/v1/device/macos/init"
+	default:
+		return nil, fmt.Errorf("unsupported registration platform %d", platform)
+	}
+	body := c.cfg.Devices.RegistrationMetadata(platform)
+	body["client_id"], body["system_id"] = c.cfg.ClientID, c.cfg.ClientID
+	body["name"], body["mac"], body["controllable"] = name, pseudoMAC(c.cfg.ClientID), true
+	if platform == auth.WindowsPlatform {
+		guid := strings.TrimPrefix(c.cfg.ClientID, "MG-")
+		body["machine_guid"], body["guid"] = guid, guid
+	}
+	resp, err := c.DoContext(ctx, "POST", path, body)
+	if err != nil {
+		return nil, fmt.Errorf("register device (platform %d): %w", platform, err)
+	}
+	data, err := responseData(resp, "init device")
 	if err != nil {
 		return nil, err
 	}
 	deviceID, _ := data["device_id"].(string)
 	if deviceID == "" {
-		return nil, fmt.Errorf("init windows device response missing device_id")
+		return nil, fmt.Errorf("init device response missing device_id")
 	}
-
-	c.cfg.UnboundClientID = clientID
-	c.cfg.UnboundDeviceID = deviceID
-	return &UnboundDeviceIdentity{ClientID: clientID, DeviceID: deviceID}, nil
+	return &DeviceIdentity{ClientID: c.cfg.ClientID, DeviceID: deviceID, Platform: platform}, nil
 }
 
-// SetMacControllable marks the registered Mac as available for control.
-func (c *Client) SetMacControllable(controllable bool) (map[string]any, error) {
-	return c.SetMacControllableContext(context.Background(), controllable)
-}
-
-// SetMacControllableContext marks the registered Mac as available using ctx.
-func (c *Client) SetMacControllableContext(ctx context.Context, controllable bool) (map[string]any, error) {
-	resp, err := c.DoContext(ctx, "POST", "/api/v1/device/mac_controllable", map[string]bool{
-		"controllable": controllable,
-	})
+// SetDeviceControllableContext selects the same platform as registration and
+// authentication, including when called through a guest-scoped client.
+func (c *Client) SetDeviceControllableContext(ctx context.Context, controllable bool) (map[string]any, error) {
+	var path string
+	switch c.cfg.Identity().Platform {
+	case auth.WindowsPlatform:
+		path = "/api/v1/device/controllable"
+	case auth.MacPlatform:
+		path = "/api/v1/device/mac_controllable"
+	default:
+		return nil, fmt.Errorf("unsupported controllable platform")
+	}
+	resp, err := c.DoContext(ctx, "POST", path, map[string]bool{"controllable": controllable})
 	if err != nil {
-		return nil, fmt.Errorf("set mac controllable: %w", err)
+		return nil, fmt.Errorf("set device controllable: %w", err)
 	}
 	return resp, nil
 }
@@ -192,9 +203,9 @@ func (c *Client) reportRequest(ctx context.Context, method, baseURL, path, repor
 		"Connection":     "close",
 		"x-report-token": reportToken,
 		"x-param-nonce":  nonce,
-		"x-param-sv":     "V4.5.3",
+		"x-param-sv":     c.cfg.Identity().StreamerVersion,
 	}
-	headers["x-param-sign"] = auth.Sign(method, fullURL, headers, bodyStr)
+	headers["x-param-sign"] = auth.SignWithKey(c.cfg.Identity().SigningKey, method, fullURL, headers, bodyStr)
 
 	var bodyReader io.Reader
 	if bodyBytes != nil {

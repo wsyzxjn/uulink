@@ -392,10 +392,13 @@ Field details:
 - `range`: Optional compact port range mapping specifier (e.g. `"7000-7002:6000-6002"`).
 - `allow_lan`: Allow incoming port mappings to target non-loopback LAN/WAN addresses. Defaults to `false` (loopback only). Loopback services are treated as trusted; if a proxy port is exposed, it can still reach other networks, so restrict `allowed_ports` to the service ports you intend to expose.
 - `allowed_ports`: Optional array of allowed target ports (e.g. `[22, 8080]`). When the field is omitted, all ports are allowed on permitted hosts. An empty array denies every target port.
+- `platform`: Optional upstream identity: `1` for Windows or `4` for macOS. Registration and guest requests follow this choice on every host. Omitted/`0` selects Windows on Windows and macOS elsewhere. Changing it can create a new device/share identity.
 - `session_mode`: `auto` or `manual`. Defaults to `auto`. Auto starts with one primary session and creates a bounded number of additional relay sessions in band when a relay is detected.
-- `sessions`: Relay session target, from `1` to `16`. When `session_mode` is `auto`, it is the pool cap and defaults to `4`. When `session_mode` is `manual`, it is the fixed target. The `-sessions` flag overrides both fields; `-sessions auto` uses the default cap, while a numeric value requests a fixed manual target.
+- `sessions`: Relay session target, from `1` to `network.session_limit` (16 by default, configurable up to 64). When `session_mode` is `auto`, it is the pool cap and defaults to `4`. When `session_mode` is `manual`, it is the fixed target. The `-sessions` flag overrides both fields; `-sessions auto` uses the default cap, while a numeric value requests a fixed manual target.
 - `share_id`, `share_code`, `custom_code`: Optional defaults for `share join`. A custom-code server also records its connect ID and code here.
-- `unbound_client_id`, `unbound_device_id`: Written by `share serve` so the accountless device keeps the same connect ID across restarts. Only the single-session server persists them: with a pooled `share serve -sessions N` (N greater than `1`) the identity is regenerated on every start, and both the connect IDs and codes change. Use `share serve -custom` for a stable entry point with automatic expansion.
+- `unbound_client_id`, `unbound_device_id`, `unbound_platform`: Written by `share serve` so the accountless device keeps the same connect ID across restarts. Only the single-session server persists them: with a pooled `share serve -sessions N` (N greater than `1`) the identity is regenerated on every start, and both the connect IDs and codes change. Use `share serve -custom` for a stable entry point with automatic expansion.
+
+Optional client compatibility, device metadata, STUN and transport settings are documented in [Advanced configuration](docs/configuration.md), with an [example](config.advanced.example.json). STUN discovery is automatic when `network.stun_servers` is omitted or `null`; explicit lists override it, and `[]` disables STUN. Other omitted settings keep the bundled defaults.
 
 uulink rewrites `config.json` after a login or device registration. Keys it does not recognize are preserved, and port ranges are written back in the same `"local_port": "9000-9005"` form they were read in.
 
@@ -441,7 +444,7 @@ Mapping flags, shared by `serve`, `connect`, `share serve`, and `share join`:
 | `-rule-id <id>` | Target registered rule ID on remote device | - |
 | `-allow-lan` | Allow incoming connections to target LAN/WAN addresses | off (loopback only) |
 | `-allowed-ports <ports>` | Whitelist allowed target ports (e.g. `22,8080,9000-9010`) | all (on loopback) |
-| `-sessions <mode>` | Relay session mode: `auto` or a fixed target `1`-`16` | `auto` |
+| `-sessions <mode>` | Relay session mode: `auto` or a fixed target within `network.session_limit` | `auto` |
 
 Controller flags, shared by `connect` and `share join`:
 
@@ -475,11 +478,11 @@ Command-specific flags:
 | `share join` | `-control-id <id>` | Controller control ID for `-confirm` | generated |
 | `share info` | `-id <id>` | Connect ID to query | - |
 
-The protocol experiments from the reverse-engineering phase (`-pck-sweep`, `-mixkcp`) are not part of a normal build; compile with `go build -tags experiments ./cmd/uulink` to get them on the controller commands.
+Protocol experiments are excluded from normal builds. See the [developer notes](docs/configuration.md#developer-notes-protocol-constants-and-experiments) for their requirements and limitations.
 
 `-transport relay` is a controller-only hard requirement: the controller accepts only TURN relay candidates and fails if no TURN server or relay connection is available. The serving commands have no `-transport` flag; a server-side relay requirement is represented by the signaling response, not by a local server flag.
 
-For automatic relay pooling, use `share serve -custom` on the server and join its single share with a logged-in controller. Auto mode is the default and uses a default cap of `4` sessions; set `-sessions 8` on both ends for a larger cap, up to 16. The primary share stays stable while additional rooms are created automatically. Older peers and unavailable expansion fall back to the primary session. Each TCP connection stays on one session, so more sessions benefit multiple concurrent connections, not a single download connection.
+For automatic relay pooling, use `share serve -custom` on the server and join its single share with a logged-in controller. Auto mode is the default and uses a default cap of `4` sessions; set `-sessions 8` on both ends for a larger cap. The default limit is 16; `network.session_limit` can raise it to 64 on both ends. The primary share stays stable while additional rooms are created automatically. Older peers and unavailable expansion fall back to the primary session. Each TCP connection stays on one session, so more sessions benefit multiple concurrent connections, not a single download connection.
 
 `share serve -sessions N` also supports preparing rooms up front and printing comma-separated share IDs and codes. Pass all pairs to `share join` on the controller. These temporary room identities change after a restart.
 

@@ -16,4 +16,6 @@ func bindExperimentFlags(*flag.FlagSet) {}
 
 func startPCKSweep(*peer.Peer, tunnel.Rule, string) {}
 
-func startMixKCPProbe(*peer.Peer, tunnel.Rule, string) {}
+func startMixKCPProbe(*peer.Peer) {}
+
+func validateExperimentFlags() error { return nil }

@@ -5,11 +5,11 @@ import (
 	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/api"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 	"github.com/wsyzxjn/uulink/pkg/logging"
-	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
 
-func doGuestTest(client *api.Client) error {
+func doGuestTest(client *api.Client, cfg *auth.Config) error {
 	session, err := client.CreateGuest()
 	if err != nil {
 		return fmt.Errorf("create guest: %w", err)
@@ -25,11 +25,7 @@ func doGuestTest(client *api.Client) error {
 		room.SignalingServer, len(room.SignalingList), len(room.Token))
 	logging.Infof("guest room raw keys: %v", mapKeys(room.Raw))
 
-	sig, err := signaling.Connect(&signaling.ConnectConfig{
-		GatewayURL:  room.SignalingServer,
-		NRDAuth:     room.Token,
-		Controlling: false,
-	})
+	sig, err := connectSignaling(room, false, cfg)
 	if err != nil {
 		return fmt.Errorf("connect guest signaling: %w", err)
 	}

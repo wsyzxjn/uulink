@@ -41,7 +41,8 @@ RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -H -u 10001 uulink
 
 COPY --from=build /out/uulink /usr/local/bin/uulink
-COPY config.example.json /usr/local/share/uulink/config.example.json
+COPY config.example.json config.advanced.example.json /usr/local/share/uulink/
+COPY docs/configuration.md /usr/local/share/uulink/docs/configuration.md
 
 # uulink resolves the default -config path relative to the working directory and
 # rewrites that file after login or accountless device registration, so /data

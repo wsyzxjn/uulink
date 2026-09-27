@@ -14,9 +14,10 @@ import (
 	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/auth"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 )
 
-const defaultBaseURL = "https://api.nrd.nie.163.com"
+const defaultBaseURL = auth.DefaultAPIBaseURL
 
 // maxAPIResponseBytes bounds the amount of data decoded from one API response.
 // API envelopes are small; the limit prevents a faulty or hostile upstream from
@@ -91,14 +92,24 @@ func NewClient(cfg *auth.Config) *Client {
 
 // NewClientWithOptions creates an API client with injectable transport details.
 func NewClientWithOptions(cfg *auth.Config, options ClientOptions) *Client {
+	if cfg == nil {
+		cfg = &auth.Config{}
+	}
 	baseURL := strings.TrimRight(options.BaseURL, "/")
+	if baseURL == "" {
+		baseURL = strings.TrimRight(cfg.APIBaseURL, "/")
+	}
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
 	httpClient := options.HTTPClient
 	if httpClient == nil {
 		jar, _ := cookiejar.New(nil) // nil options cannot produce an error
-		httpClient = &http.Client{Timeout: 60 * time.Second, Jar: jar}
+		timeout := cfg.Network.APITimeoutSeconds
+		if timeout == 0 {
+			timeout = settings.Defaults().APITimeoutSeconds
+		}
+		httpClient = &http.Client{Timeout: time.Duration(timeout) * time.Second, Jar: jar}
 	}
 	return &Client{
 		cfg:     cfg,
@@ -136,7 +147,7 @@ func (c *Client) DoContext(ctx context.Context, method, path string, body any) (
 	fullURL := c.baseURL + path
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	headers := auth.BuildHeaders(c.cfg, ts)
-	sign := auth.Sign(method, fullURL, headers, bodyStr)
+	sign := auth.SignWithKey(c.cfg.Identity().SigningKey, method, fullURL, headers, bodyStr)
 	headers["X-Param-SIGN"] = sign
 
 	var bodyReader io.Reader

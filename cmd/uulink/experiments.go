@@ -7,10 +7,11 @@
 package main
 
 import (
-	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -18,13 +19,17 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/peer"
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
+	"github.com/wsyzxjn/uulink/pkg/tunnel/mixkcp"
 	"github.com/wsyzxjn/uulink/pkg/tunnel/mixsend"
 )
+
+var experimentMixKCPFrame string
 
 // bindExperimentFlags adds the experiment switches to a controller command.
 func bindExperimentFlags(fs *flag.FlagSet) {
 	fs.BoolVar(experimentPCKSweep, "pck-sweep", false, debugUsagePrefix+"sweep PCK.V3 channels with CONNECT frames after setup")
-	fs.BoolVar(experimentMixKCP, "mixkcp", false, debugUsagePrefix+"send PM frames over mix-kcp UDP to the ICE peer (raw frame format, crypto layout preserved)")
+	fs.BoolVar(experimentMixKCP, "mixkcp", false, debugUsagePrefix+"replay an explicitly supplied complete UDP datagram (requires -mixkcp-frame)")
+	fs.StringVar(&experimentMixKCPFrame, "mixkcp-frame", "", debugUsagePrefix+"file containing a complete encoded mix-kcp datagram")
 }
 
 // startPCKSweep replicates the observed channel setup and probes which PCK
@@ -70,13 +75,49 @@ func startPCKSweep(p *peer.Peer, rule tunnel.Rule, ruleID string) {
 	}()
 }
 
-// startMixKCPProbe sends the observed raw PM frame format over mix-kcp after
-// ICE connects. It does not participate in the normal tunnel data path.
-func startMixKCPProbe(p *peer.Peer, rule tunnel.Rule, ruleID string) {
+// validateExperimentFlags rejects incomplete probes before creating a room.
+func validateExperimentFlags() error {
+	if !*experimentMixKCP {
+		return nil
+	}
+	if experimentMixKCPFrame == "" {
+		return fmt.Errorf("-mixkcp requires -mixkcp-frame; encrypted datagrams cannot be synthesized from plaintext")
+	}
+	_, err := readMixKCPFrame(experimentMixKCPFrame)
+	return err
+}
+
+func readMixKCPFrame(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 65508))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 65507 {
+		return nil, fmt.Errorf("mix-kcp datagram exceeds UDP payload limit")
+	}
+	if _, err := mixkcp.ParseFrame(data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// startMixKCPProbe replays a caller-provided encoded frame. A structural reply
+// is logged without claiming an undocumented first-byte value means SYN_ACK.
+func startMixKCPProbe(p *peer.Peer) {
+	wire, err := readMixKCPFrame(experimentMixKCPFrame)
+	if err != nil {
+		logging.Errorf("[mixkcp] frame: %v", err)
+		return
+	}
 	p.OnICEConnected(func() {
 		peerAddr := firstHostCandidate(p.RemoteCandidates())
 		if peerAddr == nil {
-			logging.Errorf("[mixkcp] no host candidate from remote, cannot send")
+			logging.Errorf("[mixkcp] no UDP host candidate")
 			return
 		}
 		sender, err := mixsend.NewSender(peerAddr)
@@ -85,35 +126,17 @@ func startMixKCPProbe(p *peer.Peer, rule tunnel.Rule, ruleID string) {
 			return
 		}
 		defer sender.Close()
-		logging.Debugf("[mixkcp] sending CONNECT to %s (rule %s, target %s:%d)",
-			peerAddr, ruleID, rule.TargetHost, rule.TargetPort)
-
-		payload := base64.StdEncoding.EncodeToString(
-			fmt.Appendf(nil, `{"version":1,"target_port":%d,"target_host":"%s"}`, rule.TargetPort, rule.TargetHost),
-		)
-		connectJSON := fmt.Sprintf(
-			`{"seq":"6","timestamp":"%d","portMappingFrame":{"sessionId":"1","ruleId":"%s","streamId":"1","payload":"%s"}}`,
-			time.Now().Unix(), ruleID, payload,
-		)
-		if err := sender.SendPMFrame(0x43, []byte(connectJSON)); err != nil {
-			logging.Errorf("[mixkcp] send CONNECT: %v", err)
+		if err := sender.SendFrame(wire); err != nil {
+			logging.Errorf("[mixkcp] send: %v", err)
 			return
 		}
-		logging.Debugf("[mixkcp] CONNECT frame sent (%d bytes)", len(connectJSON))
-
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			sender.SetReadDeadline(deadline)
-			frame, err := sender.ReceivePMFrame()
-			if err != nil {
-				logging.Debugf("[mixkcp] no SYN_ACK received within deadline: %v", err)
-				return
-			}
-			logging.Debugf("[mixkcp] inbound frame cmd=%#x", frame.Cmd)
-			if frame.Cmd == 0x5d {
-				logging.Debugf("[mixkcp] SYN_ACK-like frame received")
-			}
+		sender.SetReadDeadline(time.Now().Add(10 * time.Second))
+		frame, err := sender.ReceivePMFrame()
+		if err != nil {
+			logging.Debugf("[mixkcp] receive: %v", err)
+			return
 		}
+		logging.Debugf("[mixkcp] received datagram: first_byte=%#x payload_bytes=%d", frame.Cmd, len(frame.Payload))
 	})
 }
 

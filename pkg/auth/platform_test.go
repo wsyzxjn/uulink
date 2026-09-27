@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestPlatformParams(t *testing.T) {
 	tests := []struct {
@@ -17,7 +20,8 @@ func TestPlatformParams(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		platform, versionName, versionCode := platformParams(test.goos, test.cfgPlatform)
+		identity := (&Config{Platform: test.cfgPlatform}).identityFor(test.goos)
+		platform, versionName, versionCode := strconv.Itoa(identity.Platform), identity.VersionName, identity.VersionCode
 		if platform != test.platform || versionName != test.versionName || versionCode != test.versionCode {
 			t.Fatalf("platformParams(%q, %d) = (%q, %q, %q), want (%q, %q, %q)",
 				test.goos, test.cfgPlatform, platform, versionName, versionCode,

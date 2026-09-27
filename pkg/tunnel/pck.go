@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"encoding/binary"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -16,9 +17,6 @@ import (
 var pckSeqCounter atomic.Uint32
 var pckAppSeqCounter atomic.Uint64
 
-// capabilityBlob mirrors ConnectOptions field 11 (16 bytes).
-var pckCapBlob = []byte{0x08, 0x06, 0x10, 0x02, 0x18, 0x01, 0x20, 0x02, 0x30, 0x02, 0x38, 0x02, 0x40, 0x02, 0x48, 0x01}
-
 var pckMetaSeq atomic.Uint64
 
 // buildPCKFrame wraps body in an AppData message inside a PCK.V3 data frame.
@@ -31,7 +29,7 @@ func buildPCKFrame(sourceChan, targetChan uint32, meta string, body []byte) []by
 	if meta != "" {
 		hdr = appendPBBytesField(hdr, 2, []byte(meta))
 	}
-	hdr = appendPBBytesField(hdr, 4, pckCapBlob)
+	hdr = appendPBBytesField(hdr, 4, gvpb.DefaultCapabilities())
 	ad = appendPBBytesField(ad, 3, hdr)
 	if len(body) > 0 {
 		ad = appendPBBytesField(ad, 4, body)

@@ -17,16 +17,24 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
-func doServe(ctx context.Context, client *api.Client, cfg *auth.Config, rules []tunnel.Rule, roomFile string, policy tunnel.SecurityPolicy, targetSessions int) error {
+func doServe(ctx context.Context, client *api.Client, cfg *auth.Config, rules []tunnel.Rule, configPath, roomFile string, policy tunnel.SecurityPolicy, targetSessions int) error {
 	hostname, err := cfg.EffectiveHostname()
 	if err != nil {
 		return fmt.Errorf("resolve hostname: %w", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	logging.Debugf("registering controlled device %q", hostname)
-	if _, err := client.InitMacDeviceContext(ctx, hostname); err != nil {
+	if _, err := client.InitDeviceContext(ctx, hostname); err != nil {
 		return fmt.Errorf("register controlled device: %w", err)
 	}
-	if _, err := client.SetMacControllableContext(ctx, true); err != nil {
+	if configPath != "" {
+		if err := auth.SaveConfigFile(configPath, cfg); err != nil {
+			return fmt.Errorf("save registered identity: %w", err)
+		}
+	}
+	if _, err := client.SetDeviceControllableContext(ctx, true); err != nil {
 		return fmt.Errorf("enable controlled device: %w", err)
 	}
 
@@ -73,7 +81,7 @@ func doUnboundGuestServe(ctx context.Context, client *api.Client, cfg *auth.Conf
 	}
 	cfg.ClientID = identity.ClientID
 	cfg.DeviceID = identity.DeviceID
-	cfg.Platform = 1
+	cfg.Platform = identity.Platform
 	// CreateUnboundGuest recorded the identity in cfg.UnboundClientID and
 	// cfg.UnboundDeviceID; persist it so the assistance ID survives restarts.
 	if shareOptions.ConfigPath != "" {
@@ -91,6 +99,9 @@ func doUnboundGuestServe(ctx context.Context, client *api.Client, cfg *auth.Conf
 }
 
 func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules []tunnel.Rule, room *api.RoomConnectionInfo, roomFile string, guestSession *api.GuestSession, shareOptions guestShareOptions, policy tunnel.SecurityPolicy, targetSessions int) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	if roomFile != "" {
 		roomInfoFile := roomFile
 		if guestSession != nil {
@@ -102,7 +113,7 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 		logging.Debugf("saved room connection info to %s", roomInfoFile)
 	}
 
-	sig, err := connectSignaling(room, false)
+	sig, err := connectSignaling(room, false, cfg)
 	if err != nil {
 		return fmt.Errorf("signaling connect: %w", err)
 	}
@@ -260,7 +271,10 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	var primarySession tunnel.Session
 	var adaptivePool *tunnel.AdaptiveSessionPool
 	p, err := peer.NewControlled(&peer.Config{
-		Signal: sig,
+		VersionName: cfg.Identity().VersionName,
+		Platform:    cfg.Identity().Platform,
+		Network:     cfg.Network,
+		Signal:      sig,
 		OnSignalData: func(data []byte) {
 			<-wired
 			frame := tunnel.DecodeFrameForTunnel(data)
@@ -296,7 +310,10 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	adaptivePool.Pool().AddSession(primarySession)
 	p.OnModeChange(adaptivePool.OnModeDetected)
 
-	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
+	tun, err = tunnel.NewTunnelWithSettings(rules, adaptivePool, cfg.Network)
+	if err != nil {
+		return err
+	}
 	tun.SetSecurityPolicy(policy)
 	close(wired)
 

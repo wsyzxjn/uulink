@@ -51,7 +51,7 @@ policy flags.`,
 			}
 			client := api.NewClient(cfg)
 			return recoverTunnel(func(ctx context.Context) error {
-				return doServe(ctx, client, cfg, rules, opts.roomFile, policy, sessions.target)
+				return doServe(ctx, client, cfg, rules, g.configPath, opts.roomFile, policy, sessions.target)
 			})
 		},
 	}

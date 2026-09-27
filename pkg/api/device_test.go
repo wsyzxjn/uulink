@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -35,14 +36,14 @@ func windowsInitTestClient(t *testing.T, cfg *auth.Config, captured *map[string]
 	})
 }
 
-func TestInitWindowsDeviceWithoutAuthReusesClientID(t *testing.T) {
-	cfg := &auth.Config{UnboundClientID: "MG-11223344-5566-7788-99AA-BBCCDDEEFF00"}
+func TestInitDeviceWithoutAuthReusesWindowsClientID(t *testing.T) {
+	cfg := &auth.Config{Platform: auth.WindowsPlatform, UnboundClientID: "MG-11223344-5566-7788-99AA-BBCCDDEEFF00"}
 	var captured map[string]any
 	client := windowsInitTestClient(t, cfg, &captured)
 
-	identity, err := client.InitWindowsDeviceWithoutAuth("TestHost")
+	identity, err := client.InitDeviceWithoutAuthContext(context.Background(), "TestHost")
 	if err != nil {
-		t.Fatalf("InitWindowsDeviceWithoutAuth: %v", err)
+		t.Fatalf("InitDeviceWithoutAuthContext: %v", err)
 	}
 
 	wantGUID := "11223344-5566-7788-99aa-bbccddeeff00"
@@ -58,14 +59,14 @@ func TestInitWindowsDeviceWithoutAuthReusesClientID(t *testing.T) {
 	}
 }
 
-func TestInitWindowsDeviceWithoutAuthGeneratesIdentityWhenEmpty(t *testing.T) {
-	cfg := &auth.Config{ClientID: "config-client"}
+func TestInitDeviceWithoutAuthGeneratesWindowsIdentityWhenEmpty(t *testing.T) {
+	cfg := &auth.Config{Platform: auth.WindowsPlatform, ClientID: "config-client"}
 	var captured map[string]any
 	client := windowsInitTestClient(t, cfg, &captured)
 
-	identity, err := client.InitWindowsDeviceWithoutAuth("TestHost")
+	identity, err := client.InitDeviceWithoutAuthContext(context.Background(), "TestHost")
 	if err != nil {
-		t.Fatalf("InitWindowsDeviceWithoutAuth: %v", err)
+		t.Fatalf("InitDeviceWithoutAuthContext: %v", err)
 	}
 	if !strings.HasPrefix(identity.ClientID, "MG-") || identity.ClientID == "MG-" {
 		t.Fatalf("generated client id = %q", identity.ClientID)

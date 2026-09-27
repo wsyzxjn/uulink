@@ -32,13 +32,12 @@ func NewSender(peer *net.UDPAddr) (*Sender, error) {
 	return &Sender{conn: conn, peer: peer}, nil
 }
 
-// SendPMFrame wraps payload in a mix-kcp frame (default session header) and
-// writes it to the peer. The command byte is currently fixed at 0x43 — the
-// CONNECT command observed in captures; per-frame rolling behavior of byte 0
-// is not yet reverse-engineered.
-func (s *Sender) SendPMFrame(cmd byte, payload []byte) error {
-	f := mixkcp.NewFrame(cmd, payload)
-	wire := f.Build()
+// SendFrame sends a caller-provided complete datagram without synthesizing
+// a command byte, session header or ciphertext from unrelated capture samples.
+func (s *Sender) SendFrame(wire []byte) error {
+	if _, err := mixkcp.ParseFrame(wire); err != nil {
+		return err
+	}
 	n, err := s.conn.Write(wire)
 	if err != nil {
 		return fmt.Errorf("mixsend write: %w", err)
@@ -46,13 +45,12 @@ func (s *Sender) SendPMFrame(cmd byte, payload []byte) error {
 	if n != len(wire) {
 		return fmt.Errorf("mixsend short write: %d/%d", n, len(wire))
 	}
-	logging.Debugf("[mixkcp] sent frame to %s: cmd=%#x len=%d", s.peer, cmd, len(wire))
 	return nil
 }
 
 // ReceivePMFrame blocks for one datagram and parses it as a mix-kcp frame.
 func (s *Sender) ReceivePMFrame() (*mixkcp.Frame, error) {
-	buf := make([]byte, 2048)
+	buf := make([]byte, 65535)
 	n, err := s.conn.Read(buf)
 	if err != nil {
 		return nil, fmt.Errorf("mixsend read: %w", err)

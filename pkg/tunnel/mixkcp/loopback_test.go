@@ -31,7 +31,10 @@ func TestLoopbackExchange(t *testing.T) {
 	defer init.Close()
 
 	payload := []byte(`{"seq":"6","portMappingFrame":{"sessionId":"1"}}`)
-	out := NewFrame(0x43, payload)
+	out, err := NewFrame(0x43, capturedSessionHeader, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -50,7 +53,7 @@ func TestLoopbackExchange(t *testing.T) {
 		if got.Cmd != out.Cmd {
 			t.Errorf("cmd = %#x, want %#x", got.Cmd, out.Cmd)
 		}
-		if !bytes.Equal(got.Session, SessionHeaderDefault) {
+		if !bytes.Equal(got.Session, capturedSessionHeader) {
 			t.Errorf("session = %s", hex.EncodeToString(got.Session))
 		}
 		if !bytes.Equal(got.Payload, payload) {

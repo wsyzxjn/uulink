@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"time"
 
@@ -47,8 +47,7 @@ type controllerOptions struct {
 }
 
 const (
-	defaultP2PTimeout     = 12 * time.Second
-	relayTransportTimeout = 30 * time.Second
+	defaultP2PTimeout = 12 * time.Second
 )
 
 var (
@@ -57,6 +56,10 @@ var (
 )
 
 func runController(ctx context.Context, client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options controllerOptions) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	transportTimeout := time.Duration(cfg.Network.TransportTimeoutSeconds) * time.Second
 	targetDevID := options.deviceID
 	rules := options.rules
 	var err error
@@ -110,16 +113,16 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	case options.shareGuest:
 		var guestSession *api.GuestSession
 		var guestErr error
-		if cfg.DeviceID != "" && cfg.ClientID != "" && (cfg.Platform == 1 || runtime.GOOS == "windows") {
+		if cfg.DeviceID != "" && cfg.ClientID != "" {
 			guestSession, guestErr = client.CreateGuestContext(ctx)
 		}
 		if guestSession == nil {
-			var identity *api.UnboundDeviceIdentity
+			var identity *api.DeviceIdentity
 			guestSession, identity, guestErr = client.CreateUnboundGuestContext(ctx, "guest-controller")
 			if guestErr == nil && identity != nil {
 				cfg.ClientID = identity.ClientID
 				cfg.DeviceID = identity.DeviceID
-				cfg.Platform = 1
+				cfg.Platform = identity.Platform
 				if options.configPath != "" {
 					_ = auth.SaveConfigFile(options.configPath, cfg)
 				}
@@ -166,7 +169,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 
 	// Step 2: connect to signaling gateway, falling back through the
 	// candidates the room advertised.
-	sig, err := connectSignaling(room, true)
+	sig, err := connectSignaling(room, true, cfg)
 	if err != nil {
 		return fmt.Errorf("signaling connect: %w", err)
 	}
@@ -182,11 +185,12 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		}
 	})
 
-	if options.capability != "" {
-		if err := peer.CapOverride(options.capability); err != nil {
-			return permanent(fmt.Errorf("cap override: %w", err))
-		}
-		logging.Debugf("capability blob overridden: %s", options.capability)
+	capability, err := hex.DecodeString(options.capability)
+	if err != nil {
+		return permanent(fmt.Errorf("cap override: %w", err))
+	}
+	if options.capability == "" {
+		capability = nil
 	}
 	var debugRule tunnel.Rule
 	var ruleID string
@@ -194,8 +198,8 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		debugRule = rules[0]
 		ruleID = debugRule.ID
 	}
-	if (options.pckSweep || options.mixKCP) && len(rules) == 0 {
-		return permanent(fmt.Errorf("-pck-sweep and -mixkcp require at least one port mapping"))
+	if options.pckSweep && len(rules) == 0 {
+		return permanent(fmt.Errorf("-pck-sweep requires at least one port mapping"))
 	}
 
 	// Step 4: control handshake (gets client_id, ice_id, TURN servers)
@@ -214,6 +218,10 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	var primarySession tunnel.Session
 	var expandPool *tunnel.AdaptiveSessionPool
 	p, err := peer.NewController(&peer.Config{
+		Capability:    capability,
+		VersionName:   cfg.Identity().VersionName,
+		Platform:      cfg.Identity().Platform,
+		Network:       cfg.Network,
 		Signal:        sig,
 		DeviceID:      peerDeviceID,
 		AppControlID:  controllerAppControlID,
@@ -245,6 +253,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	// negotiator has to be in place before the peer reports its mode.
 	negotiator := newExpandNegotiator()
 	expandSet := newSessionSet()
+	expandSet.transportTimeout = transportTimeout
 	defer expandSet.closeAll()
 	recoveryConfig := *cfg
 	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyHealthAware,
@@ -261,7 +270,10 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	p.OnTextMessage(func(data []byte) { negotiator.handle(data) })
 	p.OnModeChange(adaptivePool.OnModeDetected)
 
-	tun = tunnel.NewTunnelWithRules(rules, adaptivePool)
+	tun, err = tunnel.NewTunnelWithSettings(rules, adaptivePool, cfg.Network)
+	if err != nil {
+		return err
+	}
 	tun.SetSecurityPolicy(secPolicy)
 	close(wired)
 	runErr := make(chan error, 1)
@@ -327,7 +339,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	logging.Infof("waiting for WebRTC connection")
 
 	if options.mixKCP {
-		startMixKCPProbe(p, debugRule, ruleID)
+		startMixKCPProbe(p)
 	}
 
 	sig.On("bmsg_push", func(ev *signaling.Event) {
@@ -350,7 +362,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	if options.transportMode == peer.TransportAuto && options.p2pTimeout > 0 {
 		p2pTimer = time.After(options.p2pTimeout)
 	}
-	readyTimeout := time.After(relayTransportTimeout)
+	readyTimeout := time.After(transportTimeout)
 
 	select {
 	case <-tunnelReady:
@@ -365,7 +377,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		case <-tunnelReady:
 			logging.Infof("transport connection ready (mode=%s)", p.SelectedPairMode())
 		case <-readyTimeout:
-			return fmt.Errorf("transport connection timeout: connection not ready within %s", relayTransportTimeout)
+			return fmt.Errorf("transport connection timeout: connection not ready within %s", transportTimeout)
 		case <-ctx.Done():
 			logging.Infof("interrupted, shutting down")
 			return nil
@@ -375,7 +387,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 			return err
 		}
 	case <-readyTimeout:
-		return fmt.Errorf("transport connection timeout: connection not ready within %s", relayTransportTimeout)
+		return fmt.Errorf("transport connection timeout: connection not ready within %s", transportTimeout)
 	case <-ctx.Done():
 		logging.Infof("interrupted, shutting down")
 		return nil

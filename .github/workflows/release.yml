@@ -42,8 +42,8 @@ jobs:
       # Loopback/WebSocket/UDP tests need local socket permissions and are kept
       # separate from the fast unit suite so constrained runners can still run
       # deterministic checks.
-      - name: Integration test
-        run: go test -race -tags integration -count=1 ./...
+      - name: Integration test (including experiments)
+        run: go test -race -tags "integration experiments" -count=1 ./...
 
       - name: Build (experiments tag)
         run: go build -tags experiments ./cmd/uulink
@@ -91,7 +91,8 @@ jobs:
           NAME="uulink-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "$NAME"
           mv "uulink${{ matrix.goos == 'windows' && '.exe' || '' }}" "$NAME/"
-          cp config.example.json README.md "$NAME/"
+          cp config.example.json config.advanced.example.json README.md "$NAME/"
+          cp -R docs "$NAME/"
           if [ "${{ matrix.goos }}" = "windows" ]; then
             (cd . && zip -r "$NAME.zip" "$NAME")
           else
@@ -111,8 +112,6 @@ jobs:
         with:
           name: uulink-${{ matrix.goos }}-${{ matrix.goarch }}-tar
           path: uulink-*.tar.gz
-
-
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')

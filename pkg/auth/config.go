@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/google/uuid"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 )
 
 // EffectiveHostname returns the configured hostname, or the current system
@@ -48,6 +49,9 @@ func LoadOrInitConfigFile(path string) (*Config, error) {
 		}
 	case errors.Is(err, os.ErrNotExist):
 		cfg = &Config{}
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, err
 	}
@@ -61,4 +65,26 @@ func LoadOrInitConfigFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("initialize config: %w", err)
 	}
 	return cfg, nil
+}
+
+// Validate rejects invalid tuning before any authenticated request or listener.
+func (c *Config) Validate() error {
+	if err := c.Identity().Validate(); err != nil {
+		return err
+	}
+	if err := settings.ValidateAPIURL(c.APIBaseURL); err != nil {
+		return err
+	}
+	network, err := c.Network.Resolve()
+	if err != nil {
+		return err
+	}
+	c.Network = network
+	if c.UnboundPlatform != 0 && c.UnboundPlatform != WindowsPlatform && c.UnboundPlatform != MacPlatform {
+		return fmt.Errorf("unbound_platform must be 1 or 4")
+	}
+	if c.Devices.Mac.DPI < 0 || c.Devices.Windows.DPI < 0 {
+		return fmt.Errorf("device dpi must not be negative")
+	}
+	return nil
 }

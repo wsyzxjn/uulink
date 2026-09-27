@@ -3,6 +3,7 @@
 package tunnel
 
 import (
+	"github.com/wsyzxjn/uulink/pkg/settings"
 	"io"
 	"net"
 	"testing"
@@ -191,15 +192,17 @@ func TestTunnelFlowControlBackpressure(t *testing.T) {
 	defer senderA.Close()
 
 	targetPort := targetLn.Addr().(*net.TCPAddr).Port
-	tunnelA := NewTunnelWithRules([]Rule{{
+	tunnelA, err := NewTunnelWithSettings([]Rule{{
 		ID:         "2001",
 		LocalHost:  "127.0.0.1",
 		LocalPort:  0,
 		TargetHost: "127.0.0.1",
 		TargetPort: targetPort,
-	}}, senderA)
-	// Limit window to 2 in-flight frames
-	tunnelA.SetMaxInFlight(2)
+	}}, senderA, settings.Network{MaxInFlight: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The configured window must bound actual DATA flow, not only a getter.
 	if tunnelA.MaxInFlight() != 2 {
 		t.Fatalf("MaxInFlight = %d, want 2", tunnelA.MaxInFlight())
 	}

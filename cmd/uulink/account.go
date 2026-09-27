@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -168,7 +167,7 @@ func doRefreshLogin(client *api.Client, cfg *auth.Config, configPath string, tim
 // no device_id, so fall back to registering an accountless device first and
 // persist the identity, which keeps later runs on the cheap path.
 func ensureBootstrapGuest(client *api.Client, cfg *auth.Config, configPath, name string) (*api.GuestSession, error) {
-	if cfg.DeviceID != "" && cfg.ClientID != "" && (cfg.Platform == 1 || runtime.GOOS == "windows") {
+	if cfg.DeviceID != "" && cfg.ClientID != "" {
 		session, err := client.CreateGuest()
 		if err == nil {
 			return session, nil
@@ -182,7 +181,7 @@ func ensureBootstrapGuest(client *api.Client, cfg *auth.Config, configPath, name
 	if identity != nil {
 		cfg.ClientID = identity.ClientID
 		cfg.DeviceID = identity.DeviceID
-		cfg.Platform = 1
+		cfg.Platform = identity.Platform
 		if configPath != "" {
 			if saveErr := auth.SaveConfigFile(configPath, cfg); saveErr != nil {
 				logging.Warnf("could not persist the registered device identity: %v", saveErr)

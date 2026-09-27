@@ -25,7 +25,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 )
 
 // EIO4 packet types
@@ -56,9 +58,10 @@ type Event struct {
 
 // RoomInfo is the subset of the room_info ack needed by a controlled peer.
 type RoomInfo struct {
-	RoomID   string
-	ClientID string
-	DeviceID string
+	RoomID      string
+	ClientID    string
+	DeviceID    string
+	STUNServers []string
 }
 
 // Defaults used when the gateway's open packet does not advertise timings.
@@ -100,6 +103,8 @@ type pendingBinaryEvent struct {
 
 // ConnectConfig holds connection parameters for the signaling gateway.
 type ConnectConfig struct {
+	Network     settings.Network
+	UserAgent   string
 	GatewayURL  string // wss://sig-3207-z2.nrd.nie.163.com/
 	NRDAuth     string // X-NRD-AUTH token from room/join
 	ReconnKey   string // X-NRD-RECONN-KEY for reconnection
@@ -109,12 +114,16 @@ type ConnectConfig struct {
 
 // Connect establishes a socket.io connection to the signaling gateway.
 func Connect(cfg *ConnectConfig) (*Client, error) {
+	network, err := cfg.Network.Resolve()
+	if err != nil {
+		return nil, err
+	}
 	version := cfg.Version
 	if version == "" {
 		version = os.Getenv("UULINK_STREAMER_VERSION")
 	}
 	if version == "" {
-		version = "V4.5.3"
+		version = auth.DefaultStreamerVersion
 	}
 
 	controlling := "0"
@@ -137,10 +146,14 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 	}
 	header.Set("streamer_flag", `{"sdp_flags":{"gzip_sdp":true}}`)
 	header.Set("streamer_version", version)
-	header.Set("User-Agent", "WebSocket++/0.8.2")
+	ua := cfg.UserAgent
+	if ua == "" {
+		ua = auth.DefaultWebSocketUserAgent
+	}
+	header.Set("User-Agent", ua)
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: time.Duration(network.SignalingTimeoutSeconds) * time.Second,
 	}
 
 	conn, _, err := dialer.Dial(wsURL, header)
@@ -280,8 +293,9 @@ func (c *Client) RequestRoomInfo() (*RoomInfo, error) {
 			return
 		}
 		var raw struct {
-			RoomID string `json:"room_id"`
-			You    struct {
+			RoomID     string          `json:"room_id"`
+			ICEServers json.RawMessage `json:"iceServers"`
+			You        struct {
 				ClientID string `json:"client_id"`
 				DeviceID string `json:"device_id"`
 			} `json:"you"`
@@ -292,9 +306,10 @@ func (c *Client) RequestRoomInfo() (*RoomInfo, error) {
 			return
 		}
 		ch <- &RoomInfo{
-			RoomID:   raw.RoomID,
-			ClientID: raw.You.ClientID,
-			DeviceID: raw.You.DeviceID,
+			RoomID:      raw.RoomID,
+			ClientID:    raw.You.ClientID,
+			DeviceID:    raw.You.DeviceID,
+			STUNServers: stunServersFromJSON(raw.ICEServers),
 		}
 	})
 	if err != nil {
@@ -387,6 +402,30 @@ func (c *Client) EmitBinaryWithAck(event string, args any, attachment []byte, ac
 	return c.EmitBinaryWithAcks(event, args, attachment, []int{ackID}, onAck)
 }
 
+// EmitBinaryWithAckCount allocates consecutive ACK IDs from the same sequence
+// as other events. UU may send a reconnect-key ACK then the control result.
+func (c *Client) EmitBinaryWithAckCount(event string, args any, attachment []byte, count int, onAck func([]json.RawMessage)) error {
+	if count < 1 || count > 8 {
+		return fmt.Errorf("invalid ACK count %d", count)
+	}
+	c.amu.Lock()
+	ids := make([]int, count)
+	for i := range ids {
+		c.ackCounter++
+		ids[i] = c.ackCounter
+	}
+	c.amu.Unlock()
+	err := c.EmitBinaryWithAcks(event, args, attachment, ids, onAck)
+	if err != nil {
+		c.amu.Lock()
+		for _, id := range ids {
+			delete(c.ackHandlers, id)
+		}
+		c.amu.Unlock()
+	}
+	return err
+}
+
 // EmitBinaryWithAcks sends a binary event using the first ack ID and optionally
 // listens for additional ack IDs. UU's control handshake can return a reconnect
 // key ack followed by the actual control result under the next ack ID.
@@ -399,7 +438,7 @@ func (c *Client) EmitBinaryWithAcks(event string, args any, attachment []byte, a
 		if onAck != nil {
 			c.ackHandlers[ackID] = onAck
 		}
-		// Callers pass the captured, fixed ack IDs of the control handshake.
+		// Explicit IDs and dynamically allocated IDs share one counter.
 		// Keep the counter ahead of them so a later EmitWithAck cannot be
 		// assigned one of these IDs and steal the pending reply.
 		c.ackCounter = max(c.ackCounter, ackID)

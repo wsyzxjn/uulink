@@ -75,11 +75,11 @@ type sessionFlags struct {
 }
 
 func (s *sessionFlags) bind(fs *flag.FlagSet) {
-	fs.StringVar(&s.sessions, "sessions", "", "relay session mode: auto, or a fixed count from 1 to 16 (default: auto)")
+	fs.StringVar(&s.sessions, "sessions", "", "relay session mode: auto, or a fixed count within network.session_limit (default: auto)")
 }
 
 func (s *sessionFlags) resolve(cfg *auth.Config) (sessionPolicy, error) {
-	policy, err := resolveSessionPolicy(s.sessions, cfg.SessionMode, cfg.Sessions)
+	policy, err := resolveSessionPolicy(s.sessions, cfg.SessionMode, cfg.Sessions, cfg.Network.SessionLimit)
 	if err != nil {
 		return sessionPolicy{}, usageErrorf("resolve session policy: %w", err)
 	}
@@ -110,6 +110,9 @@ func (c *controllerFlags) bind(fs *flag.FlagSet) {
 }
 
 func (c *controllerFlags) transportMode() (peer.TransportMode, error) {
+	if err := validateExperimentFlags(); err != nil {
+		return "", usageErrorf("%v", err)
+	}
 	mode, err := peer.ParseTransportMode(c.transport)
 	if err != nil {
 		return "", usageErrorf("parse transport mode: %w", err)

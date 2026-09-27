@@ -299,7 +299,7 @@ func TestSlowLocalWriterDoesNotBlockSiblingStream(t *testing.T) {
 	// kernel will absorb, from a goroutine, since enqueue blocks once full.
 	chunk := bytes.Repeat([]byte("s"), 32*1024)
 	go func() {
-		for i := 0; i < 4*inboundQueueDepth; i++ { // 16 MiB: far beyond loopback socket buffers
+		for i := 0; i < 4*tun.network.MaxInFlight; i++ { // 16 MiB: far beyond loopback socket buffers
 			msg, _ := newDataMsg("9001", "1", chunk)
 			tun.HandleMessage(msg)
 		}

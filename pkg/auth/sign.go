@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"runtime"
 	"sort"
+	"strconv"
 	"strings"
-)
 
-const signKey = "alWiSzXZTLu3WfFnw13uBru3"
+	"github.com/wsyzxjn/uulink/pkg/settings"
+)
 
 // Sign computes X-Param-SIGN for a UU Remote API request.
 //
@@ -22,6 +22,12 @@ const signKey = "alWiSzXZTLu3WfFnw13uBru3"
 //
 //	material = METHOD + PATH(?query) + sorted(x-param-k=v joined by &) + body
 func Sign(method string, rawURL string, headers map[string]string, body string) string {
+	return SignWithKey(defaultSigningKey, method, rawURL, headers, body)
+}
+
+// SignWithKey uses the configured protocol key with the same canonical request
+// representation as Sign. It does not replace account authentication.
+func SignWithKey(key, method, rawURL string, headers map[string]string, body string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		u = &url.URL{Path: rawURL}
@@ -58,62 +64,30 @@ func Sign(method string, rawURL string, headers map[string]string, body string) 
 		b.WriteString(body)
 	}
 
-	mac := hmac.New(sha256.New, []byte(signKey))
+	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write([]byte(b.String()))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func platformParams(goos string, cfgPlatform int) (platform, versionName, versionCode string) {
-	if cfgPlatform == 1 || goos == "windows" {
-		return "1", "4.38.3", "9325"
-	}
-	return "4", "4.38.0", "616"
-}
-
-// UserAgent returns the official User-Agent matching the platform.
+// UserAgent returns the compatibility identity for a platform.
 func UserAgent(goos string, cfgPlatform int) string {
-	if cfgPlatform == 1 || goos == "windows" {
-		return "UURemote/4.38.3 (com.netease.uuremote; build:9325; Windows 10)"
-	}
-	return "UURemote/4.38.0 (com.netease.uuremote; build:616; macOS 27.0.0) Alamofire/5.7.1"
+	return (&Config{Platform: cfgPlatform}).identityFor(goos).UserAgent()
 }
 
-// BuildHeaders returns the full set of authentication headers for an API request.
+// BuildHeaders resolves one consistent client identity for all REST headers.
 func BuildHeaders(cfg *Config, ts string) map[string]string {
-	cfgPlatform := 0
-	if cfg != nil {
-		cfgPlatform = cfg.Platform
+	if cfg == nil {
+		cfg = &Config{}
 	}
-	platform, versionName, versionCode := platformParams(runtime.GOOS, cfgPlatform)
-	if cfg != nil {
-		if cfg.VersionName != "" {
-			versionName = cfg.VersionName
-		}
-		if cfg.VersionCode != "" {
-			versionCode = cfg.VersionCode
-		}
-	}
-	if envVN := os.Getenv("UULINK_CLIENT_VN"); envVN != "" {
-		versionName = envVN
-	}
-	if envVC := os.Getenv("UULINK_CLIENT_VC"); envVC != "" {
-		versionCode = envVC
-	}
+	identity := cfg.Identity()
 	headers := map[string]string{
-		"User-Agent":        UserAgent(runtime.GOOS, cfgPlatform),
-		"X-Param-PLAT":      platform,
-		"X-Param-VN":        versionName,
-		"X-Param-VC":        versionCode,
-		"X-Param-PKGN":      "com.netease.uuremote",
-		"X-Param-CHN":       "gwqd",
-		"X-Param-LANG":      "zh-CN",
-		"X-Param-CNT":       "CN",
-		"X-Param-REL":       "prod",
-		"X-Param-OPR":       "None",
-		"X-Param-TS":        ts,
-		"X-Param-client-id": cfg.ClientID,
-		"X-Param-device-id": cfg.DeviceID,
-		"X-Param-user-id":   cfg.UserID,
+		"User-Agent": identity.UserAgent(), "X-Param-PLAT": strconv.Itoa(identity.Platform),
+		"X-Param-VN": identity.VersionName, "X-Param-VC": identity.VersionCode,
+		"X-Param-PKGN": identity.PackageName, "X-Param-CHN": identity.Channel,
+		"X-Param-LANG": identity.Language, "X-Param-CNT": identity.Country,
+		"X-Param-REL": identity.Release, "X-Param-OPR": identity.Operator,
+		"X-Param-TS": ts, "X-Param-client-id": cfg.ClientID,
+		"X-Param-device-id": cfg.DeviceID, "X-Param-user-id": cfg.UserID,
 	}
 	if cfg.JWT != "" {
 		headers["Authorization"] = fmt.Sprintf("Bearer %s", cfg.JWT)
@@ -126,21 +100,25 @@ func BuildHeaders(cfg *Config, ts string) map[string]string {
 
 // Config holds credentials and identifiers for UU Remote API auth.
 type Config struct {
-	JWT             string        `json:"jwt"`
-	ClientID        string        `json:"client_id"` // IOPlatformUUID
-	DeviceID        string        `json:"device_id"` // this device id
-	UserID          string        `json:"user_id"`
-	Hostname        string        `json:"hostname,omitempty"`
-	GuestID         string        `json:"guest_id,omitempty"`
-	Platform        int           `json:"platform,omitempty"`
-	Mappings        []PortMapping `json:"mappings,omitempty"`
-	AllowLAN        bool          `json:"allow_lan,omitempty"`
-	AllowedPorts    []int         `json:"allowed_ports,omitempty"`
-	SessionMode     string        `json:"session_mode,omitempty"`
-	Sessions        int           `json:"sessions,omitempty"`
-	VersionName     string        `json:"version_name,omitempty"`
-	VersionCode     string        `json:"version_code,omitempty"`
-	StreamerVersion string        `json:"streamer_version,omitempty"`
+	APIBaseURL      string           `json:"api_base_url,omitempty"`
+	ClientProfile   ClientProfile    `json:"client_profile,omitzero"`
+	Devices         DeviceProfiles   `json:"devices,omitzero"`
+	Network         settings.Network `json:"network,omitzero"`
+	JWT             string           `json:"jwt"`
+	ClientID        string           `json:"client_id"` // IOPlatformUUID
+	DeviceID        string           `json:"device_id"` // this device id
+	UserID          string           `json:"user_id"`
+	Hostname        string           `json:"hostname,omitempty"`
+	GuestID         string           `json:"guest_id,omitempty"`
+	Platform        int              `json:"platform,omitempty"`
+	Mappings        []PortMapping    `json:"mappings,omitempty"`
+	AllowLAN        bool             `json:"allow_lan,omitempty"`
+	AllowedPorts    []int            `json:"allowed_ports,omitempty"`
+	SessionMode     string           `json:"session_mode,omitempty"`
+	Sessions        int              `json:"sessions,omitempty"`
+	VersionName     string           `json:"version_name,omitempty"`
+	VersionCode     string           `json:"version_code,omitempty"`
+	StreamerVersion string           `json:"streamer_version,omitempty"`
 	// Custom-code assistance: a fixed verification code plus the share this
 	// config connects to or serves, so a client can start without flags.
 	CustomCode string `json:"custom_code,omitempty"`
@@ -150,6 +128,7 @@ type Config struct {
 	// server, reused across restarts so the assistance ID stays stable.
 	UnboundClientID string `json:"unbound_client_id,omitempty"`
 	UnboundDeviceID string `json:"unbound_device_id,omitempty"`
+	UnboundPlatform int    `json:"unbound_platform,omitempty"`
 
 	// extra keeps the keys this version does not know about, so rewriting
 	// the file after a login does not silently drop a user's own entries
@@ -216,6 +195,7 @@ func knownConfigKeys() []string {
 		"hostname", "guest_id", "platform", "mappings", "allow_lan", "allowed_ports",
 		"session_mode", "sessions", "version_name", "version_code", "streamer_version",
 		"custom_code", "share_id", "share_code", "unbound_client_id", "unbound_device_id",
+		"api_base_url", "client_profile", "devices", "network", "unbound_platform",
 	)
 }
 
@@ -313,6 +293,9 @@ func LoadConfigFile(path string) (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &cfg, nil
 }

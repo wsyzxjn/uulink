@@ -3,6 +3,8 @@
 package peer
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,18 +15,23 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/stun/v3"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
 
 type fakeSignalingServer struct {
-	server           *httptest.Server
-	mu               sync.Mutex
-	writeMu          sync.Mutex
-	conns            map[string]*websocket.Conn
-	pending          map[string]string
-	controlledSOAC   []string
-	controllerEvents []string
+	server            *httptest.Server
+	mu                sync.Mutex
+	writeMu           sync.Mutex
+	conns             map[string]*websocket.Conn
+	pending           map[string]string
+	controlledSOAC    []string
+	controllerEvents  []string
+	controlOptions    []byte
+	controlledSTUNURL string
+	roomSTUNURL       string
 }
 
 func newFakeSignalingServer() *fakeSignalingServer {
@@ -99,7 +106,12 @@ func (s *fakeSignalingServer) handleText(role string, conn *websocket.Conn, text
 				return nil
 			}
 			ackID := before
-			s.write(conn, `43`+ackID+`[{"room_id":"fake-room","you":{"client_id":"controlled-client","device_id":"controlled-device"}}]`)
+			reply := map[string]any{"room_id": "fake-room", "you": map[string]string{"client_id": "controlled-client", "device_id": "controlled-device"}}
+			if s.roomSTUNURL != "" {
+				reply["iceServers"] = []any{map[string]any{"urls": s.roomSTUNURL}}
+			}
+			body, _ := json.Marshal([]any{reply})
+			s.write(conn, "43"+ackID+string(body))
 			return nil
 		}
 		if strings.Contains(text, `"refresh_reconnect_key"`) {
@@ -142,6 +154,9 @@ func (s *fakeSignalingServer) handleBinary(role string, attachment []byte) {
 
 	if strings.Contains(text, `"control"`) && role == "controller" {
 		s.recordControllerEvent("control")
+		s.mu.Lock()
+		s.controlOptions = append([]byte(nil), attachment[1:]...)
+		s.mu.Unlock()
 		rest := text[3:]
 		dash := strings.IndexByte(rest, '-')
 		if dash < 0 {
@@ -153,6 +168,13 @@ func (s *fakeSignalingServer) handleBinary(role string, attachment []byte) {
 			return
 		}
 		ackID := before
+		if s.controlledSTUNURL != "" {
+			payload, _ := json.Marshal([]any{"be-controlled", map[string]any{
+				"client_id": "controller-client", "ice_id": "fake-ice",
+				"iceServers": []any{map[string]any{"urls": s.controlledSTUNURL}},
+			}})
+			s.routeText("controlled", "42"+string(payload))
+		}
 		conn := s.connection(role)
 		if conn != nil {
 			s.write(conn, `43`+ackID+`["success",{"code":0,"client_id":"controller-client","ice_id":"fake-ice","force_relay":false,"iceServers":[]}]`)
@@ -250,7 +272,37 @@ func TestControllerAndControlledPeersCarrySymmetricTunnel(t *testing.T) {
 		}
 	}()
 
+	stunConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stunConn.Close()
+	queriedSTUN := make(chan struct{}, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := stunConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			request := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+			if request.Decode() != nil || request.Type != stun.BindingRequest {
+				continue
+			}
+			response, err := stun.Build(stun.NewTransactionIDSetter(request.TransactionID), stun.BindingSuccess, &stun.XORMappedAddress{IP: from.IP, Port: from.Port})
+			if err != nil {
+				return
+			}
+			_, _ = stunConn.WriteToUDP(response.Raw, from)
+			select {
+			case queriedSTUN <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	fake := newFakeSignalingServer()
+	fake.controlledSTUNURL = fmt.Sprintf("stun:127.0.0.1:%d", stunConn.LocalAddr().(*net.UDPAddr).Port)
+	fake.roomSTUNURL = fake.controlledSTUNURL
 	defer fake.Close()
 
 	controllerSignal, err := signaling.Connect(&signaling.ConnectConfig{
@@ -274,22 +326,9 @@ func TestControllerAndControlledPeersCarrySymmetricTunnel(t *testing.T) {
 	defer controlledSignal.Close()
 
 	var controllerTunnel, controlledTunnel *tunnel.Tunnel
-	controller, err := NewController(&Config{
-		Signal:   controllerSignal,
-		DeviceID: "controller-device",
-		OnSignalData: func(data []byte) {
-			if controllerTunnel != nil {
-				controllerTunnel.HandleMessage(data)
-			}
-		},
-	})
-	if err != nil {
-		t.Fatalf("new controller: %v", err)
-	}
-	defer controller.Close()
-
 	controlled, err := NewControlled(&Config{
-		Signal: controlledSignal,
+		Signal:  controlledSignal,
+		Network: settings.Network{},
 		OnSignalData: func(data []byte) {
 			if controlledTunnel != nil {
 				controlledTunnel.HandleMessage(data)
@@ -300,6 +339,34 @@ func TestControllerAndControlledPeersCarrySymmetricTunnel(t *testing.T) {
 		t.Fatalf("new controlled: %v", err)
 	}
 	defer controlled.Close()
+	controlled.soacMu.Lock()
+	roomURLs := append([]string(nil), controlled.roomSTUNServers...)
+	controlled.soacMu.Unlock()
+	if len(roomURLs) != 1 || roomURLs[0] != fake.roomSTUNURL {
+		t.Fatalf("room_info STUN metadata not applied: %v", roomURLs)
+	}
+
+	controller, err := NewController(&Config{
+		Signal:      controllerSignal,
+		VersionName: "5.2.1",
+		Network:     settings.Network{FileBufferBytes: 65536},
+		DeviceID:    "controller-device",
+		OnSignalData: func(data []byte) {
+			if controllerTunnel != nil {
+				controllerTunnel.HandleMessage(data)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	defer controller.Close()
+	fake.mu.Lock()
+	options := append([]byte(nil), fake.controlOptions...)
+	fake.mu.Unlock()
+	if version, _ := pbBytes(options, 12); string(version) != "5.2.1" {
+		t.Fatalf("wrong handshake version: %q", version)
+	}
 
 	controllerFileOpen := make(chan struct{})
 	controlledFileOpen := make(chan struct{})
@@ -309,6 +376,12 @@ func TestControllerAndControlledPeersCarrySymmetricTunnel(t *testing.T) {
 	if err := controller.Connect(nil); err != nil {
 		t.Fatalf("controller connect: %v", err)
 	}
+	select {
+	case <-queriedSTUN:
+	case <-time.After(5 * time.Second):
+		t.Fatal("controlled peer did not query the gateway-provided STUN server")
+	}
+
 	select {
 	case <-controllerFileOpen:
 	case <-time.After(10 * time.Second):

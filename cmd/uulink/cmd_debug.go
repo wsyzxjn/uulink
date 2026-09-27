@@ -19,7 +19,7 @@ func debugCommand() *command {
 					if err != nil {
 						return err
 					}
-					return doGuestTest(api.NewClient(cfg))
+					return doGuestTest(api.NewClient(cfg), cfg)
 				},
 			},
 		},

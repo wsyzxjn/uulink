@@ -295,7 +295,7 @@ func TestResolveSessionPolicy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveSessionPolicy(tt.flagValue, tt.configMode, tt.configSessions)
+			got, err := resolveSessionPolicy(tt.flagValue, tt.configMode, tt.configSessions, 16)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("resolveSessionPolicy() succeeded, want error")
@@ -390,5 +390,22 @@ func TestP2PTimeoutDefinition(t *testing.T) {
 	wrapped := fmt.Errorf("%w: detail", errP2PTimeout)
 	if !errors.Is(wrapped, errP2PTimeout) {
 		t.Fatalf("expected errors.Is(wrapped, errP2PTimeout) to be true")
+	}
+}
+
+func TestConfigurableSessionLimits(t *testing.T) {
+	if _, err := resolveSessionPolicy("24", "", 0, 16); err == nil {
+		t.Fatal("ignored configured session limit")
+	}
+	policy, err := resolveSessionPolicy("24", "", 0, 32)
+	if err != nil || policy.target != 24 {
+		t.Fatalf("raised limit ignored: %+v, %v", policy, err)
+	}
+	policy, err = resolveSessionPolicy("auto", "", 0, 2)
+	if err != nil || policy.target != 2 {
+		t.Fatalf("default exceeded reduced limit: %+v, %v", policy, err)
+	}
+	if _, err := resolveSessionPolicy("65", "", 0, 65); err == nil {
+		t.Fatal("resource safety guard bypassed")
 	}
 }

@@ -27,6 +27,9 @@ var capturedFrames = []string{
 	"4b9d53ea4d6bb59b555c492f254512146e7327b72bdcc8e9900707aea8ab61518064998aed7e56c71f4c4b6888eb12",
 }
 
+// A capture fixture, deliberately absent from the production codec.
+var capturedSessionHeader, _ = hex.DecodeString("9d53ea4d6bb59b555c492f254512146e73")
+
 func mustHex(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(s)
@@ -45,13 +48,13 @@ func TestParseRealFrames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("frame %d: parse: %v", i, err)
 		}
-		if len(f.Session) != len(SessionHeaderDefault) {
+		if len(f.Session) != len(capturedSessionHeader) {
 			t.Fatalf("frame %d: session header len = %d", i, len(f.Session))
 		}
-		for j := range SessionHeaderDefault {
-			if f.Session[j] != SessionHeaderDefault[j] {
+		for j := range capturedSessionHeader {
+			if f.Session[j] != capturedSessionHeader[j] {
 				t.Fatalf("frame %d: session byte %d = %#x, want %#x",
-					i, j, f.Session[j], SessionHeaderDefault[j])
+					i, j, f.Session[j], capturedSessionHeader[j])
 			}
 		}
 		if got := len(f.Payload); got != len(raw)-HeaderLen {
@@ -99,5 +102,23 @@ func TestParseRejectsShortFrames(t *testing.T) {
 	// only length checks reject here. 17B header + 1 cmd = 18 bytes minimum.
 	if _, err := ParseFrame(make([]byte, HeaderLen)); err != nil {
 		t.Fatalf("minimal 18-byte frame should parse: %v", err)
+	}
+}
+
+func TestNewFrameRequiresExplicitSession(t *testing.T) {
+	for _, n := range []int{0, 16, 18} {
+		if _, err := NewFrame(1, make([]byte, n), nil); err == nil {
+			t.Fatalf("accepted %d-byte session", n)
+		}
+	}
+	session := make([]byte, 17)
+	payload := []byte("encoded payload")
+	frame, err := NewFrame(7, session, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session[0], payload[0] = 9, 'X'
+	if frame.Session[0] != 0 || string(frame.Payload) != "encoded payload" {
+		t.Fatal("frame aliases caller buffers")
 	}
 }

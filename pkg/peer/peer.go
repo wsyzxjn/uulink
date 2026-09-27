@@ -13,7 +13,6 @@ package peer
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -21,13 +20,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pion/transport/v4"
 	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/webrtc/v4"
+	"github.com/wsyzxjn/uulink/pkg/auth"
 	"github.com/wsyzxjn/uulink/pkg/logging"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
 
@@ -39,27 +42,6 @@ const (
 	LabelBinary   = "BINARY_DATA_CHANNEL"
 	LabelText     = "TEXT_DATA_CHANNEL"
 )
-
-// connectOptionsHex is the GvPb_ConnectOptions protobuf captured from the
-// official 4.38.0 macOS client. Field 9 (the controller's device_id) holds a
-// 16-byte placeholder that sendControl replaces with this machine's ID; the
-// remaining fields (capabilities, version 4.38.0) are replayed verbatim.
-const connectOptionsHex = "080110ffffffffffffffffff011a190802100620012a0608802810c01632003801408087a70e583c220c0878100218801e20f0102801220c0878100218801e20f0102803220c0878100118801e20f0102801220c0878100118801e20f0102803320808802810c01618783a0608802810c01640044a10" + connectOptionsDevicePlaceholderHex + "50015a10080610021801200230023802400248016206342e33382e30"
-
-// connectOptionsDevicePlaceholderHex is sixteen '0' characters, the length of
-// a real device ID, so the captured length prefixes stay valid.
-const connectOptionsDevicePlaceholderHex = "30303030303030303030303030303030"
-
-// ConnectOptionsHex exposes the captured protobuf for external use.
-const ConnectOptionsHex = connectOptionsHex
-
-// Controlled peers do not receive the controller's control-ack ICE list.
-// These are the public STUN servers observed in that ack.
-var controlledSTUNServers = []webrtc.ICEServer{
-	{URLs: []string{"stun:61.174.14.99:2580"}},
-	{URLs: []string{"stun:61.153.100.69:2480"}},
-	{URLs: []string{"stun:61.153.100.70:2480"}},
-}
 
 // ControlAckData is the server's response to the control event.
 type ControlAckData struct {
@@ -89,6 +71,9 @@ func (a *ControlAckData) WebRTCICEServers() []webrtc.ICEServer {
 
 // Config for creating a controller Peer.
 type Config struct {
+	Platform      int
+	Capability    []byte
+	Network       settings.Network
 	Signal        *signaling.Client
 	DeviceID      string // our device id (for streamer_data)
 	VersionName   string // optional client version name override for ConnectOptions field 12
@@ -106,6 +91,9 @@ type Config struct {
 
 // Peer manages the UU Remote WebRTC session as controller.
 type Peer struct {
+	capability             []byte
+	network                settings.Network
+	controlSeq             atomic.Uint64
 	sig                    *signaling.Client
 	appControlID           string
 	iceID                  string
@@ -139,25 +127,19 @@ type Peer struct {
 	soacMu                 sync.Mutex
 	controlledReady        chan struct{}
 	pendingSOAC            []*signaling.Event
-	remoteDescSet          bool
-	pendingCandidates      []webrtc.ICECandidateInit
-	selectedPair           *webrtc.ICECandidatePair
-	statsDone              chan struct{}
-	statsRunning           bool
-	restartRequested       chan struct{}
-	restartOnce            sync.Once
-	fileSendMu             sync.Mutex
+	// Gateway STUN metadata belongs to this room/connection only. Both fields
+	// are protected by soacMu and are never persisted into user configuration.
+	controlledInfo    *signaling.ControlledInfo
+	roomSTUNServers   []string
+	remoteDescSet     bool
+	pendingCandidates []webrtc.ICECandidateInit
+	selectedPair      *webrtc.ICECandidatePair
+	statsDone         chan struct{}
+	statsRunning      bool
+	restartRequested  chan struct{}
+	restartOnce       sync.Once
+	fileSendMu        sync.Mutex
 }
-
-const (
-	// Keep the SCTP user-data queue bounded across all streams that share a
-	// peer. Per-stream DATA_ACK windows protect individual TCP streams, while
-	// this high-water mark prevents many concurrent streams from multiplying
-	// buffered bytes without limit.
-	fileChannelHighWater = 8 * 1024 * 1024
-	fileChannelPoll      = 10 * time.Millisecond
-	fileChannelWait      = 30 * time.Second
-)
 
 type soacEvent struct {
 	ClientID string `json:"client_id"`
@@ -177,6 +159,11 @@ type soacEvent struct {
 
 // NewController creates a controller peer and initiates the control handshake.
 func NewController(cfg *Config) (*Peer, error) {
+	network, err := cfg.Network.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	identity := (&auth.Config{Platform: cfg.Platform, VersionName: cfg.VersionName}).Identity()
 	appControlID := cfg.AppControlID
 	if appControlID == "" {
 		var err error
@@ -194,7 +181,9 @@ func NewController(cfg *Config) (*Peer, error) {
 		sdpOfferFile:     cfg.SDPOfferFile,
 		sdpAnswerFile:    cfg.SDPAnswerFile,
 		transportMode:    cfg.TransportMode,
-		versionName:      cfg.VersionName,
+		versionName:      identity.VersionName,
+		capability:       append([]byte(nil), cfg.Capability...),
+		network:          network,
 		onBinaryData:     cfg.OnBinaryData,
 		onSignalData:     cfg.OnSignalData,
 		ackCh:            make(chan *ControlAckData, 1),
@@ -255,20 +244,20 @@ func NewController(cfg *Config) (*Peer, error) {
 		return p, nil
 	case <-cfg.Signal.Done():
 		return nil, fmt.Errorf("signaling closed while waiting for control ack")
-	case <-time.After(controlAckTimeout):
-		return nil, fmt.Errorf("timeout waiting for control ack after %s", controlAckTimeout)
+	case <-time.After(time.Duration(p.network.ControlAckTimeoutSeconds) * time.Second):
+		return nil, fmt.Errorf("timeout waiting for control ack after %s", time.Duration(p.network.ControlAckTimeoutSeconds)*time.Second)
 	}
 }
-
-// controlAckTimeout bounds the wait for the gateway's answer to the control
-// event. The gateway answers within a second or two; a missing ack means the
-// room is unusable and the caller should start over.
-const controlAckTimeout = 15 * time.Second
 
 // NewControlled creates a peer that answers a controller's soac offer. It is
 // the UULink-side replacement for running the official controlled client.
 func NewControlled(cfg *Config) (*Peer, error) {
+	network, err := cfg.Network.Resolve()
+	if err != nil {
+		return nil, err
+	}
 	p := &Peer{
+		network: network, capability: append([]byte(nil), cfg.Capability...),
 		textOpen:         make(chan struct{}),
 		restartRequested: make(chan struct{}),
 		sig:              cfg.Signal,
@@ -277,6 +266,8 @@ func NewControlled(cfg *Config) (*Peer, error) {
 		controlledReady:  make(chan struct{}),
 		statsDone:        make(chan struct{}),
 	}
+
+	cfg.Signal.On("be-controlled", p.handleControlledInfo)
 
 	// A controller can emit its offer immediately after room/create returns,
 	// before this process has completed room_info. Cache early offers until the
@@ -301,6 +292,9 @@ func NewControlled(cfg *Config) (*Peer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("room info: %w", err)
 	}
+	p.soacMu.Lock()
+	p.roomSTUNServers = append([]string(nil), info.STUNServers...)
+	p.soacMu.Unlock()
 	if _, err := cfg.Signal.RefreshReconnectKey(); err != nil {
 		return nil, fmt.Errorf("refresh reconnect key: %w", err)
 	}
@@ -319,119 +313,12 @@ func NewControlled(cfg *Config) (*Peer, error) {
 	return p, nil
 }
 
-// CapOverride replaces field 11 (capability blob) inside the ConnectOptions
-// protobuf. capHex is the hex of the inner 16-byte blob (e.g. "08061002180120023002380240024801").
-func CapOverride(capHex string) error {
-	pb, err := hex.DecodeString(connectOptionsHex)
-	if err != nil {
-		return err
-	}
-	newCap, err := hex.DecodeString(capHex)
-	if err != nil {
-		return fmt.Errorf("bad cap hex: %w", err)
-	}
-	// Re-encode the protobuf with field 11 replaced.
-	out, err := replacePBBytesField(pb, 11, newCap)
-	if err != nil {
-		return err
-	}
-	connectOptionsOverride = hex.EncodeToString(out)
-	return nil
-}
-
-var connectOptionsOverride string
-
-func replacePBBytesField(pb []byte, fieldNum uint64, value []byte) ([]byte, error) {
-	var out []byte
-	i := 0
-	rd := func() (uint64, error) {
-		var v uint64
-		var s uint
-		for {
-			if i >= len(pb) {
-				return 0, fmt.Errorf("truncated varint")
-			}
-			x := pb[i]
-			i++
-			v |= uint64(x&0x7f) << s
-			if x < 0x80 {
-				return v, nil
-			}
-			s += 7
-		}
-	}
-	for i < len(pb) {
-		tag, err := rd()
-		if err != nil {
-			return nil, err
-		}
-		currentField := tag >> 3
-		wireType := tag & 7
-		switch wireType {
-		case 0:
-			v, _ := rd()
-			out = append(out, byte(tag))
-			var buf []byte
-			for v >= 0x80 {
-				buf = append(buf, byte(v)|0x80)
-				v >>= 7
-			}
-			out = append(out, append(buf, byte(v))...)
-		case 2:
-			ln, err := rd()
-			if err != nil {
-				return nil, err
-			}
-			payload := pb[i : i+int(ln)]
-			i += int(ln)
-			if currentField == fieldNum {
-				payload = value
-				ln = uint64(len(value))
-			}
-			out = append(out, byte(tag))
-			var buf []byte
-			for ln >= 0x80 {
-				buf = append(buf, byte(ln)|0x80)
-				ln >>= 7
-			}
-			out = append(out, append(buf, byte(ln))...)
-			out = append(out, payload...)
-		default:
-			return nil, fmt.Errorf("unsupported wire type %d", wireType)
-		}
-	}
-	return out, nil
-}
-
 // sendControl emits the control event with the ConnectOptions protobuf.
 func (p *Peer) sendControl(deviceID string) error {
-	hexStr := connectOptionsHex
-	if connectOptionsOverride != "" {
-		hexStr = connectOptionsOverride
-	}
-	pb, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return err
-	}
 	if deviceID == "" {
-		// Never send the placeholder: the gateway would attribute this
-		// controller to a device that does not exist.
-		return fmt.Errorf("this machine has no device_id; run \"uulink -login\" to register it")
+		return fmt.Errorf("this machine has no device_id; run uulink login to register it")
 	}
-	pb, err = replacePBBytesField(pb, 9, []byte(deviceID))
-	if err != nil {
-		return fmt.Errorf("replace control device id: %w", err)
-	}
-	vn := p.versionName
-	if vn == "" {
-		vn = os.Getenv("UULINK_CLIENT_VN")
-	}
-	if vn != "" {
-		pb, err = replacePBBytesField(pb, 12, []byte(vn))
-		if err != nil {
-			return fmt.Errorf("replace control version name: %w", err)
-		}
-	}
+	pb := gvpb.ConnectOptions(deviceID, p.versionName, p.capability)
 
 	streamerData := map[string]any{
 		"control_id": p.appControlID,
@@ -449,7 +336,7 @@ func (p *Peer) sendControl(deviceID string) error {
 		"streamer_data":  string(sdJSON),
 	}
 
-	return p.sig.EmitBinaryWithAcks("control", payload, pb, []int{3, 4}, func(arr []json.RawMessage) {
+	return p.sig.EmitBinaryWithAckCount("control", payload, pb, 2, func(arr []json.RawMessage) {
 		// arr = ["success", {data}]
 		if len(arr) < 2 {
 			logging.Debugf("[peer] control ack malformed: %v", arr)
@@ -481,6 +368,7 @@ func (p *Peer) sendControl(deviceID string) error {
 // Connect creates the PeerConnection with TURN servers from the control ack
 // (or the provided override), creates data channels, sends the SDP offer via soac.
 type bufferedNet struct {
+	bufferBytes int
 	transport.Net
 }
 
@@ -488,8 +376,8 @@ func (b *bufferedNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport
 	conn, err := b.Net.ListenUDP(network, locAddr)
 	if err == nil {
 		if uconn, ok := conn.(*net.UDPConn); ok {
-			_ = uconn.SetReadBuffer(4 * 1024 * 1024)
-			_ = uconn.SetWriteBuffer(4 * 1024 * 1024)
+			_ = uconn.SetReadBuffer(b.bufferBytes)
+			_ = uconn.SetWriteBuffer(b.bufferBytes)
 		}
 	}
 	return conn, err
@@ -499,8 +387,8 @@ func (b *bufferedNet) ListenPacket(network string, address string) (net.PacketCo
 	conn, err := b.Net.ListenPacket(network, address)
 	if err == nil {
 		if uconn, ok := conn.(*net.UDPConn); ok {
-			_ = uconn.SetReadBuffer(4 * 1024 * 1024)
-			_ = uconn.SetWriteBuffer(4 * 1024 * 1024)
+			_ = uconn.SetReadBuffer(b.bufferBytes)
+			_ = uconn.SetWriteBuffer(b.bufferBytes)
 		}
 	}
 	return conn, err
@@ -510,20 +398,20 @@ func (b *bufferedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transp
 	conn, err := b.Net.DialUDP(network, laddr, raddr)
 	if err == nil {
 		if uconn, ok := conn.(*net.UDPConn); ok {
-			_ = uconn.SetReadBuffer(4 * 1024 * 1024)
-			_ = uconn.SetWriteBuffer(4 * 1024 * 1024)
+			_ = uconn.SetReadBuffer(b.bufferBytes)
+			_ = uconn.SetWriteBuffer(b.bufferBytes)
 		}
 	}
 	return conn, err
 }
 
-func newWebRTCAPI() *webrtc.API {
+func newWebRTCAPI(network settings.Network) *webrtc.API {
 	s := webrtc.SettingEngine{}
-	s.SetSCTPMaxReceiveBufferSize(4 * 1024 * 1024)
-	s.SetSCTPMinCwnd(128 * 1024)
-	s.SetSCTPRTOMax(1500 * time.Millisecond)
+	s.SetSCTPMaxReceiveBufferSize(uint32(network.SCTPReceiveBufferBytes))
+	s.SetSCTPMinCwnd(uint32(network.SCTPMinCwndBytes))
+	s.SetSCTPRTOMax(time.Duration(network.SCTPRTOMaxMS) * time.Millisecond)
 	if stdNet, err := stdnet.NewNet(); err == nil {
-		s.SetNet(&bufferedNet{Net: stdNet})
+		s.SetNet(&bufferedNet{Net: stdNet, bufferBytes: network.UDPBufferBytes})
 	}
 	return webrtc.NewAPI(webrtc.WithSettingEngine(s))
 }
@@ -552,7 +440,7 @@ func (p *Peer) Connect(iceServers []webrtc.ICEServer) error {
 	}
 	logging.Infof("[peer] transport mode=%s server_requires_relay=%v", mode.String(), serverRequiresRelay)
 
-	pc, err := newWebRTCAPI().NewPeerConnection(rtcCfg)
+	pc, err := newWebRTCAPI(p.network).NewPeerConnection(rtcCfg)
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
 	}
@@ -881,8 +769,10 @@ func (p *Peer) answerControlledOffer(msg soacEvent) error {
 	// peer echoes that ID rather than using its own room_info client_id.
 	p.routingClientID = msg.ClientID
 
-	pc, err := newWebRTCAPI().NewPeerConnection(webrtc.Configuration{
-		ICEServers: controlledSTUNServers,
+	urls, source := p.controlledSTUNServers(msg)
+	logging.Infof("[peer] controlled STUN source=%s servers=%d", source, len(urls))
+	pc, err := newWebRTCAPI(p.network).NewPeerConnection(webrtc.Configuration{
+		ICEServers: stunServers(urls),
 	})
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
@@ -1059,12 +949,8 @@ func (p *Peer) SendControl(data []byte) error {
 }
 
 func (p *Peer) sendControlHandshake() {
-	frames := [][]byte{
-		mustHex("10c4d8d1d4061a12221008061002180120023002380240024801"),
-		mustHex("080110c4d8d1d4061a12221008061002180120023002380240024801"),
-		mustHex("080210c4d8d1d4061a12221008061002180120023002380240024801"),
-	}
-	for _, frame := range frames {
+	for range 3 {
+		frame := gvpb.ControlHandshake(p.controlSeq.Add(1)-1, uint64(time.Now().Unix()), p.capability)
 		if err := p.SendControl(frame); err != nil {
 			logging.Errorf("[peer] control handshake send error: %v", err)
 			return
@@ -1073,7 +959,7 @@ func (p *Peer) sendControlHandshake() {
 }
 
 func (p *Peer) sendTextHandshake() {
-	frame := mustHex("080410c4d8d1d4066a040a020102")
+	frame := gvpb.TextHandshake(p.controlSeq.Add(1)-1, uint64(time.Now().Unix()))
 	if err := p.SendText(frame); err != nil {
 		logging.Errorf("[peer] text handshake send error: %v", err)
 	}
@@ -1090,7 +976,7 @@ func (p *Peer) handleControlEcho(data []byte) {
 		inner = appendPBBytesField(inner, 2, args)
 		inner = appendPBBytesField(inner, 4, remoteFeatureFlags)
 
-		out := appendPBVarintField(nil, 1, 3)
+		out := appendPBVarintField(nil, 1, p.controlSeq.Add(1)-1)
 		out = appendPBVarintField(out, 2, uint64(time.Now().Unix()))
 		out = appendPBBytesField(out, 3, inner)
 
@@ -1288,14 +1174,6 @@ func (p *Peer) SendText(data []byte) error {
 	return dc.Send(data)
 }
 
-func mustHex(s string) []byte {
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
 // SendSignalPB sends a binary gvpb Message on FILE_DATA_CHANNEL. The official
 // client logs this path as sentProtocolBufferfile/streamerDidReceiveFileData.
 func (p *Peer) SendSignalPB(msg []byte) error {
@@ -1313,29 +1191,32 @@ func (p *Peer) SendSignalPB(msg []byte) error {
 	// growing process memory without limit.
 	p.fileSendMu.Lock()
 	defer p.fileSendMu.Unlock()
-	if err := waitForFileChannelCapacity(dc, len(msg)); err != nil {
+	if err := waitForFileChannelCapacity(dc, len(msg), p.network); err != nil {
 		return err
 	}
 	return dc.SendText(string(msg))
 }
 
-func waitForFileChannelCapacity(dc *webrtc.DataChannel, messageSize int) error {
+func waitForFileChannelCapacity(dc *webrtc.DataChannel, messageSize int, network settings.Network) error {
 	if messageSize < 0 {
 		return fmt.Errorf("invalid file channel message size %d", messageSize)
 	}
-	deadline := time.Now().Add(fileChannelWait)
+	deadline := time.Now().Add(time.Duration(network.FileBufferWaitSeconds) * time.Second)
 	for {
 		if dc.ReadyState() != webrtc.DataChannelStateOpen {
 			return fmt.Errorf("file data channel is not open")
 		}
 		buffered := dc.BufferedAmount()
-		if messageSize >= fileChannelHighWater || buffered+uint64(messageSize) <= fileChannelHighWater {
+		if messageSize > network.FileBufferBytes {
+			return fmt.Errorf("file channel message exceeds buffer limit")
+		}
+		if buffered+uint64(messageSize) <= uint64(network.FileBufferBytes) {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("file data channel remained above %d-byte buffer limit", fileChannelHighWater)
+			return fmt.Errorf("file data channel remained above %d-byte buffer limit", network.FileBufferBytes)
 		}
-		time.Sleep(fileChannelPoll)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1577,4 +1458,11 @@ func (p *Peer) ConnectionState() string {
 		return "new"
 	}
 	return pc.ConnectionState().String()
+}
+
+func stunServers(urls []string) []webrtc.ICEServer {
+	if len(urls) == 0 {
+		return nil
+	}
+	return []webrtc.ICEServer{{URLs: append([]string(nil), urls...)}}
 }

@@ -101,9 +101,13 @@ func TestDoContextCancellation(t *testing.T) {
 }
 
 func TestReportRequestUsesConfiguredHTTPClient(t *testing.T) {
+	t.Setenv("UULINK_STREAMER_VERSION", "")
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.String() != "https://relay.example/api/v1/ip" {
 			t.Fatalf("report URL = %q", request.URL.String())
+		}
+		if request.Header.Get("x-param-sv") != "V7.0.0" {
+			t.Fatalf("report ignored streamer version: %v", request.Header)
 		}
 		if request.Header.Get("x-report-token") != "report-token" {
 			t.Fatalf("report token header = %q", request.Header.Get("x-report-token"))
@@ -114,7 +118,7 @@ func TestReportRequestUsesConfiguredHTTPClient(t *testing.T) {
 			Header:     make(http.Header),
 		}, nil
 	})
-	client := NewClientWithOptions(&auth.Config{}, ClientOptions{
+	client := NewClientWithOptions(&auth.Config{StreamerVersion: "V7.0.0"}, ClientOptions{
 		BaseURL:    "https://api.example",
 		HTTPClient: &http.Client{Transport: transport},
 	})

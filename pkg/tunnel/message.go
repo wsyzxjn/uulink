@@ -11,13 +11,9 @@ import (
 
 var msgSeqCounter atomic.Uint64
 
-// nextSeq returns the next message sequence (official client starts low, e.g. 6).
+// nextSeq returns a monotonic sequence; the protocol does not require a captured starting value.
 func nextSeq() string {
-	n := msgSeqCounter.Add(1)
-	if n < 6 {
-		n = 5 + n // first call returns 6
-	}
-	return strconv.FormatUint(n, 10)
+	return strconv.FormatUint(msgSeqCounter.Add(1), 10)
 }
 
 // newConnectMsg builds the CONNECT/SYN Message.

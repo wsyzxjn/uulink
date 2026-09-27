@@ -235,6 +235,7 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 		slots[i].config = *cfg
 		slots[i].config.UnboundClientID = ""
 		slots[i].config.UnboundDeviceID = ""
+		slots[i].config.UnboundPlatform = 0
 		slots[i].config.CustomCode = ""
 		slots[i].config.ShareID = ""
 	}
@@ -279,7 +280,7 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 				slot := &slots[i]
 				slot.rt = nil
 				copyConfig := slot.config
-				rt, share, err := startPooledGuestServer(set.ctx, api.NewClient(&copyConfig), tun, pool, set, nextSessionID(fmt.Sprintf("expand-%d", i+1)), fmt.Sprintf("uulink-expand-%d", i+1), options, nil, policy)
+				rt, share, err := startPooledGuestServer(set.ctx, api.NewClient(&copyConfig), &copyConfig, tun, pool, set, nextSessionID(fmt.Sprintf("expand-%d", i+1)), fmt.Sprintf("uulink-expand-%d", i+1), options, nil, policy)
 				slot.config = copyConfig
 				if err != nil {
 					logging.Warnf("[expand] room %d repair failed: %v", i+1, err)

@@ -1,0 +1,35 @@
+{
+  "platform": 0,
+  "version_name": "",
+  "version_code": "",
+  "streamer_version": "",
+  "client_profile": {
+    "channel": "gwqd",
+    "language": "zh-CN",
+    "country": "CN"
+  },
+  "devices": {
+    "windows": {
+      "cpu": "Virtual CPU",
+      "video": ["Virtual GPU"]
+    }
+  },
+  "network": {
+    "stun_servers": null,
+    "api_timeout_seconds": 60,
+    "signaling_timeout_seconds": 10,
+    "control_ack_timeout_seconds": 15,
+    "transport_timeout_seconds": 30,
+    "connect_timeout_seconds": 10,
+    "half_close_timeout_seconds": 60,
+    "keepalive_seconds": 30,
+    "udp_buffer_bytes": 4194304,
+    "sctp_receive_buffer_bytes": 4194304,
+    "sctp_min_cwnd_bytes": 131072,
+    "sctp_rto_max_ms": 1500,
+    "file_buffer_bytes": 8388608,
+    "file_buffer_wait_seconds": 30,
+    "max_in_flight": 128,
+    "session_limit": 16
+  }
+}

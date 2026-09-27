@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
 
@@ -45,41 +46,47 @@ func TestControlledOfferFailureLeavesPeerReadyForNextOffer(t *testing.T) {
 	}
 }
 
-func TestReplacePBBytesFieldUpdatesControlDeviceAndCapability(t *testing.T) {
-	pb, err := hex.DecodeString(ConnectOptionsHex)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	updated, err := replacePBBytesField(pb, 9, []byte("test-device-123456"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(updated, []byte("test-device-123456")) {
-		t.Fatal("control device ID was not replaced")
-	}
-	if bytes.Contains(updated, []byte("0000000000000000")) {
-		t.Fatal("device ID placeholder remained in ConnectOptions")
-	}
-
+func TestStructuredConnectOptionsUsesPerPeerIdentity(t *testing.T) {
 	capability := mustHex("08061003180320022801300238024003480150015801")
-	updated, err = replacePBBytesField(updated, 11, capability)
-	if err != nil {
-		t.Fatal(err)
+	encoded := gvpb.ConnectOptions("long-device-id-beyond-sixteen-characters", "5.2.1", capability)
+	if device, ok := pbBytes(encoded, 9); !ok || string(device) != "long-device-id-beyond-sixteen-characters" {
+		t.Fatal("device identity not encoded")
 	}
-	if !bytes.Contains(updated, capability) {
-		t.Fatal("capability field was not replaced")
+	if version, ok := pbBytes(encoded, 12); !ok || string(version) != "5.2.1" {
+		t.Fatal("version not encoded")
 	}
+	if cap, ok := pbBytes(encoded, 11); !ok || !bytes.Equal(cap, capability) {
+		t.Fatal("capability not encoded")
+	}
+	other := gvpb.ConnectOptions("another-device", "5.2.2", nil)
+	if bytes.Contains(other, capability) {
+		t.Fatal("capability override leaked into another peer")
+	}
+}
 
-	updated, err = replacePBBytesField(updated, 12, []byte("4.39.0"))
+func mustHex(s string) []byte {
+	b, err := hex.DecodeString(s)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	if !bytes.Contains(updated, []byte("4.39.0")) {
-		t.Fatal("version name field was not replaced")
+	return b
+}
+
+func TestHandshakeCarriesCurrentSequenceAndTimestamp(t *testing.T) {
+	for _, seq := range []uint64{0, 1, 2, 19} {
+		frame := gvpb.ControlHandshake(seq, 1790500000, nil)
+		timestamp, ok := pbVarint(frame, 2)
+		if !ok || timestamp != 1790500000 {
+			t.Fatal("captured timestamp remained")
+		}
+		got, _ := pbVarint(frame, 1)
+		if got != seq {
+			t.Fatalf("seq %d, want %d", got, seq)
+		}
 	}
-	if bytes.Contains(updated, []byte("4.38.0")) {
-		t.Fatal("default version name remained in ConnectOptions")
+	frame := gvpb.TextHandshake(20, 1790500001)
+	if ts, _ := pbVarint(frame, 2); ts != 1790500001 {
+		t.Fatal("text timestamp not updated")
 	}
 }
 

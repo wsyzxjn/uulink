@@ -1,30 +1,18 @@
 // Package mixkcp implements the UU Remote "mix-kcp" wire format observed on
 // the PM (port mapping) UDP transport.
 //
-// Wire layout (reverse-engineered from official client captures, 2026-08-30;
-// the capture notes live in the maintainer's local doc/ directory, which is
-// not part of the repository):
-//
-//	byte 0      : rolling command/checksum byte (differs per frame and per
-//	              session even for identical message sizes)
-//	bytes 1-17  : session header, constant 9d53ea4d6bb59b555c492f254512146e73
-//	              across sessions (17 bytes starting after byte 0)
-//	bytes 18+  : encrypted payload
-//
-// The 17-byte header constant was extracted from five captured PM frames
-// (CONNECT/DATA/FIN) that all share it byte-for-byte.
+// This is a structural codec only. Session headers and the first byte come
+// from each datagram, not from a universal sample. Encryption and the rolling
+// first-byte algorithm have not been established; this package cannot create
+// an interoperable encrypted PM request from plaintext.
 package mixkcp
 
 import (
-	"encoding/hex"
 	"fmt"
 )
 
 // HeaderLen is the fixed frame header size: 1 command byte + 17 session bytes.
 const HeaderLen = 18
-
-// SessionHeaderDefault is the session header shared by every captured PM frame.
-var SessionHeaderDefault = mustDecodeHex("9d53ea4d6bb59b555c492f254512146e73")
 
 // Frame is a parsed mix-kcp datagram.
 type Frame struct {
@@ -59,13 +47,13 @@ func (f *Frame) Build() []byte {
 	return out
 }
 
-// NewFrame constructs a frame with the default session header.
-func NewFrame(cmd byte, payload []byte) *Frame {
-	sess := make([]byte, len(SessionHeaderDefault))
-	copy(sess, SessionHeaderDefault)
-	p := make([]byte, len(payload))
-	copy(p, payload)
-	return &Frame{Cmd: cmd, Session: sess, Payload: p}
+// NewFrame requires an explicit session header and already encoded payload.
+// It validates framing, not cryptographic or upstream session validity.
+func NewFrame(cmd byte, session, payload []byte) (*Frame, error) {
+	if len(session) != HeaderLen-1 {
+		return nil, fmt.Errorf("mixkcp: session header must be %d bytes", HeaderLen-1)
+	}
+	return &Frame{Cmd: cmd, Session: append([]byte(nil), session...), Payload: append([]byte(nil), payload...)}, nil
 }
 
 // SplitCryptoRegion splits a frame payload region into the hypothesized
@@ -78,12 +66,4 @@ func SplitCryptoRegion(region []byte) (nonce, crc, body []byte) {
 		return region, nil, nil
 	}
 	return region[:8], region[8:12], region[12:]
-}
-
-func mustDecodeHex(s string) []byte {
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		panic("mixkcp: bad embedded hex: " + err.Error())
-	}
-	return b
 }
