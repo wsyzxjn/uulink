@@ -83,6 +83,8 @@ type Client struct {
 	pingTimeout  time.Duration
 	done         chan struct{}
 	readyCh      chan struct{} // closed on namespace connect confirmation
+	discCh       chan struct{} // closed on namespace disconnect or close
+	discOnce     sync.Once
 	handlers     map[string]func(*Event)
 	hmu          sync.RWMutex
 	ackHandlers  map[int]func([]json.RawMessage)
@@ -165,6 +167,7 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 		conn:        conn,
 		done:        make(chan struct{}),
 		readyCh:     make(chan struct{}),
+		discCh:      make(chan struct{}),
 		handlers:    make(map[string]func(*Event)),
 		ackHandlers: make(map[int]func([]json.RawMessage)),
 		eventQueue:  make(chan *Event, eventQueueDepth),
@@ -207,7 +210,6 @@ func Connect(cfg *ConnectConfig) (*Client, error) {
 	logging.Infof("[signaling] connected")
 
 	go c.readLoop()
-	go c.pingLoop()
 	go c.dispatchLoop()
 
 	// Complete the socket.io namespace connection (server responds 40{"sid":...})
@@ -478,11 +480,20 @@ func (c *Client) NamespaceConnected() <-chan struct{} {
 	return c.readyCh
 }
 
+// NamespaceDisconnected returns a channel closed when the socket.io namespace
+// is disconnected by the server or when the signaling client closes.
+func (c *Client) NamespaceDisconnected() <-chan struct{} {
+	return c.discCh
+}
+
 // Close shuts down the connection.
 func (c *Client) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		close(c.done)
+		c.discOnce.Do(func() {
+			close(c.discCh)
+		})
 		err = c.conn.Close()
 	})
 	return err
@@ -499,10 +510,13 @@ func (c *Client) send(msg string) error {
 	return c.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
-// extendReadDeadline arms the liveness deadline: our ping every pingInterval
-// draws a pong, so a healthy connection always delivers something well
-// within pingInterval+pingTimeout. Without this a half-open TCP connection
-// would only be noticed by OS keepalives, long after the room is gone.
+// extendReadDeadline arms the liveness deadline. In EIO=4 the gateway sends a
+// ping every pingInterval and the client only answers it, so a healthy
+// connection always delivers something within pingInterval+pingTimeout; the
+// official client (socket.io-client-cpp 3.x in libstreamer) uses the same
+// limit and never pings on its own. Without this deadline a half-open TCP
+// connection would only be noticed by OS keepalives, long after the room is
+// gone.
 func (c *Client) extendReadDeadline() {
 	_ = c.conn.SetReadDeadline(time.Now().Add(c.pingInterval + c.pingTimeout))
 }
@@ -693,6 +707,9 @@ func (c *Client) handleSIOPacket(data []byte) {
 		}
 	case sioDisconnect:
 		logging.Infof("[signaling] namespace disconnected")
+		c.discOnce.Do(func() {
+			close(c.discCh)
+		})
 	case sioConnectError:
 		logging.Errorf("[signaling] namespace connect error: %s", string(data[1:]))
 	case sioEvent:
@@ -804,22 +821,5 @@ func (c *Client) handleEvent(ev *Event) {
 		handler(ev)
 	} else {
 		logging.Debugf("[signaling] unhandled event: %s", ev.Name)
-	}
-}
-
-func (c *Client) pingLoop() {
-	ticker := time.NewTicker(c.pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-ticker.C:
-			if err := c.send(string([]byte{eioPing})); err != nil {
-				logging.Errorf("[signaling] ping error: %v", err)
-				return
-			}
-		}
 	}
 }

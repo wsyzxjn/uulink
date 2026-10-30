@@ -91,8 +91,9 @@ func runConnect(g *globalOptions, opts *connectOptions) error {
 			targetSessions: sessions.target,
 			autoSessions:   sessions.auto,
 		}
-		return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode) error {
+		return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode, ready func()) error {
 			remoteOptions.transportMode = mode
+			remoteOptions.onReady = ready
 			return runRemoteConfigController(ctx, client, cfg, policy, remoteOptions)
 		})
 	}
@@ -120,8 +121,9 @@ func runConnect(g *globalOptions, opts *connectOptions) error {
 		configPath:      g.configPath,
 		p2pTimeout:      opts.ctrl.p2pTimeout,
 	}
-	return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode) error {
+	return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode, ready func()) error {
 		controller.transportMode = mode
+		controller.onReady = ready
 		return runController(ctx, client, cfg, policy, controller)
 	})
 }

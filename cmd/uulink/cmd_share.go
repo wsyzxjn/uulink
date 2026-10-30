@@ -234,7 +234,9 @@ func runShareJoin(g *globalOptions, opts *shareJoinOptions) error {
 	client := api.NewClient(cfg)
 
 	if len(shares) > 1 {
-		return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode) error {
+		// Pooled sessions fall back to relay one at a time and never return
+		// errP2PTimeout, so readiness is not needed to leave the fallback.
+		return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode, _ func()) error {
 			return doMultiSessionController(ctx, client, cfg, rules, shares, multiSessionControllerOptions{
 				transportMode: mode,
 				useGuest:      guest,
@@ -264,8 +266,9 @@ func runShareJoin(g *globalOptions, opts *shareJoinOptions) error {
 		configPath:        g.configPath,
 		p2pTimeout:        opts.ctrl.p2pTimeout,
 	}
-	return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode) error {
+	return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode, ready func()) error {
 		controller.transportMode = mode
+		controller.onReady = ready
 		return runController(ctx, client, cfg, policy, controller)
 	})
 }

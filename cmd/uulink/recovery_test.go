@@ -13,6 +13,32 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/peer"
 )
 
+func TestRecoveryDelayForError(t *testing.T) {
+	rateErr := &api.ResponseError{Code: api.CodeTooFrequent}
+	for attempt := range 4 {
+		delay := recoveryDelayForError(rateErr, attempt)
+		minExpected := 60 * time.Second
+		if delay < minExpected {
+			t.Errorf("attempt %d rate limit delay = %v, want >= %v", attempt, delay, minExpected)
+		}
+	}
+
+	offlineErr := &api.ResponseError{Code: api.CodeControlledDeviceOffline}
+	for attempt := range 4 {
+		delay := recoveryDelayForError(offlineErr, attempt)
+		minExpected := 15 * time.Second
+		if delay < minExpected {
+			t.Errorf("attempt %d offline delay = %v, want >= %v", attempt, delay, minExpected)
+		}
+	}
+
+	genericErr := errors.New("network timeout")
+	d0 := recoveryDelayForError(genericErr, 0)
+	if d0 < time.Second || d0 > 2*time.Second {
+		t.Errorf("attempt 0 generic delay = %v, want ~1-2s", d0)
+	}
+}
+
 func TestIsPermanentError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -77,20 +103,59 @@ func TestRecoverTunnelRetriesTransientErrors(t *testing.T) {
 	}
 }
 
-func TestRunWithRelayFallbackSwitchesModeAfterP2PTimeout(t *testing.T) {
+// A P2P timeout moves the next attempt to relay. A relay session that stayed
+// ready long enough and then dropped sends the attempt after it back to auto.
+func TestRunWithRelayFallbackSwitchesModeAndProbesP2PAgain(t *testing.T) {
+	previous := relayProbeAfter
+	relayProbeAfter = 10 * time.Millisecond
+	t.Cleanup(func() { relayProbeAfter = previous })
+
 	var modes []peer.TransportMode
-	err := runWithRelayFallback(peer.TransportAuto, time.Second, func(_ context.Context, mode peer.TransportMode) error {
+	err := runWithRelayFallback(peer.TransportAuto, time.Second, func(_ context.Context, mode peer.TransportMode, ready func()) error {
 		modes = append(modes, mode)
-		if mode == peer.TransportAuto {
+		switch len(modes) {
+		case 1:
 			return fmt.Errorf("wrapped: %w", errP2PTimeout)
+		case 2:
+			ready()
+			time.Sleep(2 * relayProbeAfter)
+			return errTransportLost
+		default:
+			return nil
 		}
-		return nil
 	})
 	if err != nil {
 		t.Fatalf("runWithRelayFallback() = %v", err)
 	}
-	if len(modes) != 2 || modes[0] != peer.TransportAuto || modes[1] != peer.TransportRelay {
-		t.Fatalf("transport modes = %v, want [auto relay]", modes)
+	want := []peer.TransportMode{peer.TransportAuto, peer.TransportRelay, peer.TransportAuto}
+	if fmt.Sprint(modes) != fmt.Sprint(want) {
+		t.Fatalf("transport modes = %v, want %v", modes, want)
+	}
+}
+
+func TestRelayFallbackNext(t *testing.T) {
+	stable := relayProbeAfter
+	cases := []struct {
+		name     string
+		initial  peer.TransportMode
+		mode     peer.TransportMode
+		err      error
+		readyFor time.Duration
+		want     peer.TransportMode
+	}{
+		{"p2p timeout falls back", peer.TransportAuto, peer.TransportAuto, fmt.Errorf("x: %w", errP2PTimeout), 0, peer.TransportRelay},
+		{"other auto failure stays auto", peer.TransportAuto, peer.TransportAuto, errTransportLost, stable, peer.TransportAuto},
+		{"relay never ready stays relay", peer.TransportAuto, peer.TransportRelay, errors.New("join failed"), 0, peer.TransportRelay},
+		{"short relay session stays relay", peer.TransportAuto, peer.TransportRelay, errTransportLost, stable / 2, peer.TransportRelay},
+		{"stable relay session probes p2p", peer.TransportAuto, peer.TransportRelay, errTransportLost, stable, peer.TransportAuto},
+		{"explicit relay is kept", peer.TransportRelay, peer.TransportRelay, errTransportLost, 10 * stable, peer.TransportRelay},
+	}
+	for _, tc := range cases {
+		f := &relayFallback{initial: tc.initial, mode: tc.mode, p2pTimeout: time.Second}
+		f.next(tc.err, tc.readyFor)
+		if f.mode != tc.want {
+			t.Errorf("%s: mode = %s, want %s", tc.name, f.mode, tc.want)
+		}
 	}
 }
 

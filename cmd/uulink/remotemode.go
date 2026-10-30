@@ -35,6 +35,8 @@ type remoteConfigOptions struct {
 	// Relay pool policy, as resolved from -sessions and the config.
 	targetSessions int
 	autoSessions   bool
+	// onReady is passed to the controller; see controllerOptions.onReady.
+	onReady func()
 }
 
 func runRemoteConfigController(ctx context.Context, client *api.Client, cfg *auth.Config, secPolicy tunnel.SecurityPolicy, options remoteConfigOptions) error {
@@ -84,6 +86,7 @@ func runRemoteConfigController(ctx context.Context, client *api.Client, cfg *aut
 		p2pTimeout:     options.p2pTimeout,
 		targetSessions: options.targetSessions,
 		autoSessions:   options.autoSessions,
+		onReady:        options.onReady,
 	})
 }
 

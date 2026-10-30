@@ -126,6 +126,14 @@ through the established WebRTC connection. Production gateway validation is a
 separate opt-in test; local tests do not establish acceptance of the current
 production event payload.
 
+Relay diagnostics: warnings from Pion's TURN client, such as a rejected
+allocation refresh, a failed channel bind or a full relay receive buffer, are
+logged as `turnc WARNING:` lines next to uulink's own output. `-log-level error`
+hides them. Pion's `PION_LOG_<LEVEL>=<scope,...|all>` variables still override
+each scope, for example `PION_LOG_DEBUG=ice,turnc` to trace candidate checks and
+TURN refreshes. The periodic `connection status` line reports the selected
+candidate pair, including the relay address, RTT and byte counts.
+
 To allow a target above 16 sessions, set `network.session_limit` on both ends,
 then choose a target with `sessions`/`-sessions`. Increasing the limit alone does
 not create more sessions. The default automatic target stays 4 (or the lower

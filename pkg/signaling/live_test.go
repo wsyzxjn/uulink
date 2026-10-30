@@ -70,3 +70,49 @@ func TestLiveSignalingConnect(t *testing.T) {
 		}
 	}
 }
+
+// TestLiveGatewayHeartbeat keeps a signaling connection open past one full
+// liveness window without sending engine.io pings of its own. Surviving it
+// shows that the gateway pings (otherwise the read deadline would expire) and
+// accepts pong-only clients (otherwise it would close the connection).
+//
+// Run with: UULINK_LIVE=1 go test ./pkg/signaling/ -run TestLiveGatewayHeartbeat -v
+func TestLiveGatewayHeartbeat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live test in short mode")
+	}
+	if os.Getenv("UULINK_LIVE") == "" {
+		t.Skip("set UULINK_LIVE=1 to run live signaling test")
+	}
+
+	cfg, err := auth.LoadConfigFile("../../config.json")
+	if err != nil {
+		t.Skip("config.json not found:", err)
+	}
+	room, err := api.NewClient(cfg).CreateRoom()
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	sig, err := Connect(&ConnectConfig{
+		GatewayURL:  room.SignalingServer,
+		NRDAuth:     room.Token,
+		Controlling: false,
+		Network:     cfg.Network,
+		Version:     cfg.Identity().StreamerVersion,
+		UserAgent:   cfg.Identity().WebSocketUserAgent,
+	})
+	if err != nil {
+		t.Fatalf("signaling connect: %v", err)
+	}
+	defer sig.Close()
+
+	window := sig.pingInterval + sig.pingTimeout
+	hold := window + sig.pingInterval
+	t.Logf("gateway pingInterval=%s pingTimeout=%s; holding %s", sig.pingInterval, sig.pingTimeout, hold)
+	select {
+	case <-sig.Done():
+		t.Fatal("signaling connection closed within the liveness window")
+	case <-time.After(hold):
+		t.Logf("connection alive after %s without client pings", hold)
+	}
+}

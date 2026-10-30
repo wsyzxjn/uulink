@@ -58,6 +58,8 @@ const (
 	CodeInvalidParams = 1001
 	// CodeInvalidSign is returned when X-Param-SIGN does not verify.
 	CodeInvalidSign = 1003
+	// CodeTooFrequent is returned when API rate limits are triggered.
+	CodeTooFrequent = 1004
 	// CodeTokenExpired is returned when the JWT is invalid or has expired.
 	CodeTokenExpired = 1120
 	// CodeDeviceOrCodeMismatch is returned when a share join carries a wrong
@@ -67,6 +69,9 @@ const (
 	CodeDeviceOrCodeMismatch = 1131
 	// CodeQRCodeExpired is returned once a login QR code can no longer be used.
 	CodeQRCodeExpired = 1190
+	// CodeControlledDeviceOffline is returned when attempting to join a share
+	// whose controlled side is offline or has disconnected from signaling.
+	CodeControlledDeviceOffline = 2001
 )
 
 // Permanent reports whether the error describes the request itself rather

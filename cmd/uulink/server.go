@@ -339,15 +339,25 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	})
 	defer tun.Stop()
 
-	select {
-	case <-ctx.Done():
-		logging.Infof("interrupted, shutting down")
-	case <-sig.Done():
-		return errSignalingClosed
-	case err := <-runErr:
-		return err
+	nsDisc := sig.NamespaceDisconnected()
+	for {
+		select {
+		case <-ctx.Done():
+			logging.Infof("interrupted, shutting down")
+			return nil
+		case <-sig.Done():
+			return errSignalingClosed
+		case <-nsDisc:
+			nsDisc = nil
+			if p.ConnectionState() != "connected" {
+				logging.Warnf("[signaling] namespace disconnected before peer connected; refreshing room")
+				return errSignalingClosed
+			}
+			logging.Infof("[signaling] namespace disconnected while peer active; keeping peer connection")
+		case err := <-runErr:
+			return err
+		}
 	}
-	return nil
 }
 
 func waitForGuestConnectID(client *api.Client, session *api.GuestSession) (*api.GuestShareInfo, error) {

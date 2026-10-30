@@ -406,7 +406,7 @@ func (b *bufferedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transp
 }
 
 func newWebRTCAPI(network settings.Network) *webrtc.API {
-	s := webrtc.SettingEngine{}
+	s := webrtc.SettingEngine{LoggerFactory: newPionLoggerFactory()}
 	s.SetSCTPMaxReceiveBufferSize(uint32(network.SCTPReceiveBufferBytes))
 	s.SetSCTPMinCwnd(uint32(network.SCTPMinCwndBytes))
 	s.SetSCTPRTOMax(time.Duration(network.SCTPRTOMaxMS) * time.Millisecond)

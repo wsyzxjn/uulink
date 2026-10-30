@@ -488,6 +488,8 @@ For automatic relay pooling, use `share serve -custom` on the server and join it
 
 Every long-running command (`serve`, `share serve`, `connect`, `share join`, including pooled joins) retries transient signaling and transport failures with bounded backoff. Errors that a retry cannot fix end the process instead, so a supervisor such as systemd or Docker's restart policy sees the failure: invalid flags or mappings exit with status `2`, and runtime failures such as an expired login (`1120`) or bad parameters (`1001`) exit with status `1`. A rejected share code (`1131`) is retried, because the API returns the same code for a few seconds whenever the served side restarts. Press Ctrl-C once to shut down cleanly; a second Ctrl-C terminates immediately if a pending network call is still blocking.
 
+After a P2P attempt times out, reconnects require a TURN relay. This is not permanent: once a relayed session has stayed up for a minute and is then lost, the next reconnect tries a direct P2P connection again, because the network conditions that forced the relay may have changed.
+
 Pooled relay sessions are monitored independently: a failed session is removed, its affected TCP streams are closed, and the pool requests a replacement while healthy sessions continue serving new streams. An interrupted TCP stream cannot be moved transparently to another transport, so the application must retry that transfer.
 
 ## Known Issues

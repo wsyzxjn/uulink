@@ -36,14 +36,34 @@ func waitRecovery(ctx context.Context, delay time.Duration) bool {
 }
 
 func recoveryDelay(attempt int) time.Duration {
-	if attempt > 5 {
-		attempt = 5
+	if attempt > 6 {
+		attempt = 6
 	}
 	if attempt < 0 {
 		attempt = 0
 	}
-	base := min(time.Second*time.Duration(1<<attempt), 30*time.Second)
-	return min(base+time.Duration(rand.Int64N(int64(base/5)+1)), 30*time.Second)
+	base := min(time.Second*time.Duration(1<<attempt), 60*time.Second)
+	return min(base+time.Duration(rand.Int64N(int64(base/5)+1)), 60*time.Second)
+}
+
+func recoveryDelayForError(err error, attempt int) time.Duration {
+	var respErr *api.ResponseError
+	if errors.As(err, &respErr) {
+		switch respErr.Code {
+		case api.CodeTooFrequent:
+			// Rate limit cool-down: wait at least 60 seconds, scaling up to 3 minutes.
+			step := min(attempt, 3)
+			base := 60*time.Second + time.Duration(step)*30*time.Second
+			return base + time.Duration(rand.Int64N(int64(10*time.Second)+1))
+		case api.CodeControlledDeviceOffline:
+			// When the target device is offline, back off further (up to 2 minutes)
+			// to avoid hammering the API.
+			step := min(attempt, 4)
+			base := 15*time.Second + time.Duration(step)*25*time.Second
+			return base + time.Duration(rand.Int64N(int64(10*time.Second)+1))
+		}
+	}
+	return recoveryDelay(attempt)
 }
 
 // permanentError marks a failure that a retry cannot fix: bad flags or
@@ -101,7 +121,7 @@ func recoverTunnel(run func(ctx context.Context) error) error {
 		if time.Since(start) > time.Minute {
 			attempt = 0
 		}
-		delay := recoveryDelay(attempt)
+		delay := recoveryDelayForError(err, attempt)
 		logging.Warnf("[recovery] %v; reconnecting in %s", err, delay.Round(time.Millisecond))
 		if !waitRecovery(ctx, delay) {
 			return nil
@@ -109,18 +129,55 @@ func recoverTunnel(run func(ctx context.Context) error) error {
 	}
 }
 
+// relayProbeAfter is how long a relay session has to stay ready before the
+// next reconnect probes a direct P2P connection again. It matches the
+// one-minute threshold recoverTunnel uses to call an attempt healthy.
+var relayProbeAfter = time.Minute
+
 // runWithRelayFallback runs a controller under recoverTunnel. When a P2P
-// attempt times out in auto mode, the next attempt requires a TURN relay.
-func runWithRelayFallback(initial peer.TransportMode, p2pTimeout time.Duration, run func(ctx context.Context, mode peer.TransportMode) error) error {
-	mode := initial
+// attempt times out in auto mode, the next attempts require a TURN relay.
+// The fallback is not permanent: once a relay session has stayed ready for
+// relayProbeAfter, the reconnect after it starts from the initial mode again,
+// because the conditions that forced the relay may have changed since.
+//
+// run calls ready when its transport is ready; later calls are ignored.
+func runWithRelayFallback(initial peer.TransportMode, p2pTimeout time.Duration, run func(ctx context.Context, mode peer.TransportMode, ready func()) error) error {
+	fallback := &relayFallback{initial: initial, mode: initial, p2pTimeout: p2pTimeout}
 	return recoverTunnel(func(ctx context.Context) error {
-		err := run(ctx, mode)
-		if errors.Is(err, errP2PTimeout) && mode == peer.TransportAuto {
-			logging.Warnf("[peer] P2P punch-through timed out after %s; falling back to relay transport for subsequent attempts", p2pTimeout)
-			mode = peer.TransportRelay
+		var readyAt atomic.Int64
+		err := run(ctx, fallback.mode, func() { readyAt.CompareAndSwap(0, time.Now().UnixNano()) })
+		// A clean exit, a shutdown or a permanent error ends recoverTunnel, so
+		// there is no next attempt to choose a mode for.
+		if err == nil || ctx.Err() != nil || isPermanentError(err) {
+			return err
 		}
+		var readyFor time.Duration
+		if at := readyAt.Load(); at != 0 {
+			readyFor = time.Since(time.Unix(0, at))
+		}
+		fallback.next(err, readyFor)
 		return err
 	})
+}
+
+// relayFallback holds the transport mode of the next controller attempt.
+type relayFallback struct {
+	initial    peer.TransportMode
+	mode       peer.TransportMode
+	p2pTimeout time.Duration
+}
+
+// next picks the mode for the attempt after one that failed with err and
+// whose transport stayed ready for readyFor (zero if it never was ready).
+func (f *relayFallback) next(err error, readyFor time.Duration) {
+	switch {
+	case errors.Is(err, errP2PTimeout) && f.mode == peer.TransportAuto:
+		logging.Warnf("[peer] P2P punch-through timed out after %s; falling back to relay transport", f.p2pTimeout)
+		f.mode = peer.TransportRelay
+	case f.mode != f.initial && readyFor >= relayProbeAfter:
+		logging.Infof("[peer] relay session ended after %s; the next attempt probes a direct P2P connection again", readyFor.Round(time.Second))
+		f.mode = f.initial
+	}
 }
 
 // lostTransport tolerates a short disconnected interval but not a failed or
@@ -206,7 +263,7 @@ func reconcileLoop(ctx context.Context, step func(context.Context) error) error 
 		err := step(ctx)
 		delay := 5 * time.Second
 		if err != nil {
-			delay = recoveryDelay(attempt)
+			delay = recoveryDelayForError(err, attempt)
 			attempt++
 			logging.Warnf("[recovery] %v; retry in %s", err, delay.Round(time.Millisecond))
 		} else {

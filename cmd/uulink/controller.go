@@ -44,6 +44,8 @@ type controllerOptions struct {
 	lanMotd      string
 	configPath   string
 	p2pTimeout   time.Duration
+	// onReady, when set, is called once the transport is ready.
+	onReady func()
 }
 
 const (
@@ -363,10 +365,16 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		p2pTimer = time.After(options.p2pTimeout)
 	}
 	readyTimeout := time.After(transportTimeout)
+	transportReady := func() {
+		logging.Infof("transport connection ready (mode=%s)", p.SelectedPairMode())
+		if options.onReady != nil {
+			options.onReady()
+		}
+	}
 
 	select {
 	case <-tunnelReady:
-		logging.Infof("transport connection ready (mode=%s)", p.SelectedPairMode())
+		transportReady()
 	case <-p2pTimer:
 		state := p.ConnectionState()
 		logging.Infof("[peer] %s countdown: peer connection state is %s", options.p2pTimeout, state)
@@ -375,7 +383,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		}
 		select {
 		case <-tunnelReady:
-			logging.Infof("transport connection ready (mode=%s)", p.SelectedPairMode())
+			transportReady()
 		case <-readyTimeout:
 			return fmt.Errorf("transport connection timeout: connection not ready within %s", transportTimeout)
 		case <-ctx.Done():
@@ -383,6 +391,8 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 			return nil
 		case <-sig.Done():
 			return errSignalingClosed
+		case <-sig.NamespaceDisconnected():
+			return fmt.Errorf("signaling namespace disconnected: %w", errSignalingClosed)
 		case err := <-runErr:
 			return err
 		}
@@ -393,6 +403,8 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		return nil
 	case <-sig.Done():
 		return errSignalingClosed
+	case <-sig.NamespaceDisconnected():
+		return fmt.Errorf("signaling namespace disconnected: %w", errSignalingClosed)
 	case err := <-runErr:
 		return err
 	}
