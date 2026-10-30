@@ -51,15 +51,31 @@ func recoveryDelayForError(err error, attempt int) time.Duration {
 	if errors.As(err, &respErr) {
 		switch respErr.Code {
 		case api.CodeTooFrequent:
-			// Rate limit cool-down: wait at least 60 seconds, scaling up to 3 minutes.
-			step := min(attempt, 3)
-			base := 60*time.Second + time.Duration(step)*30*time.Second
-			return base + time.Duration(rand.Int64N(int64(10*time.Second)+1))
+			// Rate limit cool-down: NetEase risk control penalty windows can last
+			// 10-15 minutes. Back off up to 15 minutes to allow the penalty window
+			// to naturally expire without continuous client resets.
+			delays := [...]time.Duration{
+				1 * time.Minute,
+				2 * time.Minute,
+				5 * time.Minute,
+				10 * time.Minute,
+				15 * time.Minute,
+			}
+			idx := min(attempt, len(delays)-1)
+			base := delays[idx]
+			return base + time.Duration(rand.Int64N(int64(15*time.Second)+1))
 		case api.CodeControlledDeviceOffline:
-			// When the target device is offline, back off further (up to 2 minutes)
-			// to avoid hammering the API.
-			step := min(attempt, 4)
-			base := 15*time.Second + time.Duration(step)*25*time.Second
+			// When the target device is offline, back off further (up to 5 minutes)
+			// to avoid hammering the API during long peer WAN outages.
+			delays := [...]time.Duration{
+				15 * time.Second,
+				30 * time.Second,
+				1 * time.Minute,
+				2 * time.Minute,
+				5 * time.Minute,
+			}
+			idx := min(attempt, len(delays)-1)
+			base := delays[idx]
 			return base + time.Duration(rand.Int64N(int64(10*time.Second)+1))
 		}
 	}

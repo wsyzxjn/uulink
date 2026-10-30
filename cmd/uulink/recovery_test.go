@@ -15,12 +15,15 @@ import (
 
 func TestRecoveryDelayForError(t *testing.T) {
 	rateErr := &api.ResponseError{Code: api.CodeTooFrequent}
-	for attempt := range 4 {
+	for attempt := range 6 {
 		delay := recoveryDelayForError(rateErr, attempt)
 		minExpected := 60 * time.Second
 		if delay < minExpected {
 			t.Errorf("attempt %d rate limit delay = %v, want >= %v", attempt, delay, minExpected)
 		}
+	}
+	if delay := recoveryDelayForError(rateErr, 4); delay < 15*time.Minute {
+		t.Errorf("max rate limit delay = %v, want >= 15m", delay)
 	}
 
 	offlineErr := &api.ResponseError{Code: api.CodeControlledDeviceOffline}
