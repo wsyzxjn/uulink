@@ -259,7 +259,6 @@ func runShareJoin(g *globalOptions, opts *shareJoinOptions) error {
 		pckSweep:          *experimentPCKSweep,
 		mixKCP:            *experimentMixKCP,
 		targetSessions:    sessions.target,
-		autoSessions:      sessions.auto,
 		rules:             rules,
 		lanDiscovery:      opts.ctrl.lanDiscovery,
 		lanMotd:           opts.ctrl.lanMotd,

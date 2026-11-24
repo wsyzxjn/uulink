@@ -31,7 +31,11 @@ type Network struct {
 }
 
 const (
-	DefaultMaxInFlight  = 128
+	DefaultMaxInFlight = 128
+	// MaxInFlightLimit is the largest accepted max_in_flight. The window is
+	// never negotiated, so a receiver accepts up to this many unacknowledged
+	// DATA frames per stream from any peer.
+	MaxInFlightLimit    = 4096
 	DefaultSessionLimit = 16
 	// HardSessionLimit is a resource guard, including untrusted expansion requests.
 	HardSessionLimit = 64
@@ -57,7 +61,7 @@ func (n Network) Resolve() (Network, error) {
 		{"sctp_rto_max_ms", &n.SCTPRTOMaxMS, 1500, 60000},
 		{"file_buffer_bytes", &n.FileBufferBytes, 8 << 20, 64 << 20},
 		{"file_buffer_wait_seconds", &n.FileBufferWaitSeconds, 30, 3600},
-		{"max_in_flight", &n.MaxInFlight, DefaultMaxInFlight, 4096},
+		{"max_in_flight", &n.MaxInFlight, DefaultMaxInFlight, MaxInFlightLimit},
 		{"session_limit", &n.SessionLimit, DefaultSessionLimit, HardSessionLimit},
 	} {
 		if *field.value < 0 || *field.value > field.maximum {

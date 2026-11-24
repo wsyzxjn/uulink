@@ -43,11 +43,11 @@ func TestLiveControlledSTUN(t *testing.T) {
 	if err := guestCfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	pool := tunnel.NewAdaptiveSessionPool(1, tunnel.PolicyHealthAware, nil)
+	pool := tunnel.NewAdaptiveSessionPool(1, tunnel.PolicyStreamLeastLoaded, nil)
 	defer pool.Close()
 	tun := tunnel.NewTunnelWithRules(nil, pool)
 	defer tun.Stop()
-	set := newSessionSet()
+	set := newSessionSet(ctx)
 	defer set.closeAll()
 	code, err := api.GenerateSharePassCode()
 	if err != nil {

@@ -13,6 +13,7 @@ package peer
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -405,10 +406,18 @@ func (b *bufferedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transp
 	return conn, err
 }
 
+// sctpCwndCAStep is how far the SCTP congestion window grows per round trip
+// once it is above ssthresh. Relay paths drop packets that are not congestion
+// signals; at pion's default of one MTU per round trip a halved window on a
+// 165 ms path takes minutes to refill, while 32 KiB takes about ten seconds,
+// comparable to CUBIC's recovery at that latency.
+const sctpCwndCAStep = 32 << 10
+
 func newWebRTCAPI(network settings.Network) *webrtc.API {
 	s := webrtc.SettingEngine{LoggerFactory: newPionLoggerFactory()}
 	s.SetSCTPMaxReceiveBufferSize(uint32(network.SCTPReceiveBufferBytes))
 	s.SetSCTPMinCwnd(uint32(network.SCTPMinCwndBytes))
+	s.SetSCTPCwndCAStep(sctpCwndCAStep)
 	s.SetSCTPRTOMax(time.Duration(network.SCTPRTOMaxMS) * time.Millisecond)
 	if stdNet, err := stdnet.NewNet(); err == nil {
 		s.SetNet(&bufferedNet{Net: stdNet, bufferBytes: network.UDPBufferBytes})
@@ -1032,7 +1041,7 @@ func pbField(data []byte, want uint64) ([]byte, bool) {
 			return nil, false
 		}
 		length, n := readPBVarint(data[pos:])
-		if n == 0 || int(length) > len(data)-pos-n {
+		if n == 0 || length > uint64(len(data)-pos-n) {
 			return nil, false
 		}
 		start := pos + n
@@ -1070,7 +1079,7 @@ func pbVarint(data []byte, want uint64) (uint64, bool) {
 			return 0, false
 		}
 		length, n := readPBVarint(data[pos:])
-		if n == 0 || int(length) > len(data)-pos-n {
+		if n == 0 || length > uint64(len(data)-pos-n) {
 			return 0, false
 		}
 		pos += n + int(length)
@@ -1102,15 +1111,11 @@ func appendPBVarint(buf []byte, v uint64) []byte {
 }
 
 func readPBVarint(data []byte) (uint64, int) {
-	var v uint64
-	for i := 0; i < len(data) && i < 10; i++ {
-		b := data[i]
-		v |= uint64(b&0x7f) << (7 * i)
-		if b < 0x80 {
-			return v, i + 1
-		}
+	v, n := binary.Uvarint(data)
+	if n <= 0 {
+		return 0, 0
 	}
-	return 0, 0
+	return v, n
 }
 
 func (p *Peer) markTextOpen() {
@@ -1179,42 +1184,55 @@ func (p *Peer) SendText(data []byte) error {
 func (p *Peer) SendSignalPB(msg []byte) error {
 	p.mu.Lock()
 	dc := p.fileDC
+	pc := p.pc
 	p.mu.Unlock()
-	if dc == nil {
+	if dc == nil || pc == nil {
 		return fmt.Errorf("file data channel not ready")
 	}
 
-	// Pion's SendText queues application data synchronously, but the SCTP
-	// transport may still retain a large amount of user data after it returns.
-	// Serialize this path and wait below a bounded high-water mark so a burst
-	// across many tunnel streams applies backpressure to the tunnel instead of
-	// growing process memory without limit.
+	// Pion keeps every accepted message in one FIFO per association, so bytes
+	// beyond what the congestion window carries only delay later frames,
+	// including other streams' handshakes and acknowledgements. Serialize this
+	// path and hold the queue just above the window instead: a burst then
+	// waits here, where each busy stream holds a single frame and the mutex
+	// hands out turns roughly in arrival order.
 	p.fileSendMu.Lock()
 	defer p.fileSendMu.Unlock()
-	if err := waitForFileChannelCapacity(dc, len(msg), p.network); err != nil {
+	if err := waitForFileChannelCapacity(dc, pc.SCTP(), len(msg), p.network); err != nil {
 		return err
 	}
 	return dc.SendText(string(msg))
 }
 
-func waitForFileChannelCapacity(dc *webrtc.DataChannel, messageSize int, network settings.Network) error {
+// minFileQueueMargin keeps pion's pending queue non-empty between capacity
+// polls; pion grows the congestion window only while data is pending.
+const minFileQueueMargin = 128 << 10
+
+// fileQueueLimit is the SCTP send queue the file channel may fill: the
+// congestion window plus a margin, capped by network.file_buffer_bytes.
+func fileQueueLimit(cwnd uint32, ceiling int) int {
+	window := int(cwnd)
+	return min(ceiling, window+max(window/2, minFileQueueMargin))
+}
+
+func waitForFileChannelCapacity(dc *webrtc.DataChannel, sctp *webrtc.SCTPTransport, messageSize int, network settings.Network) error {
 	if messageSize < 0 {
 		return fmt.Errorf("invalid file channel message size %d", messageSize)
+	}
+	if messageSize > network.FileBufferBytes {
+		return fmt.Errorf("file channel message exceeds buffer limit")
 	}
 	deadline := time.Now().Add(time.Duration(network.FileBufferWaitSeconds) * time.Second)
 	for {
 		if dc.ReadyState() != webrtc.DataChannelStateOpen {
 			return fmt.Errorf("file data channel is not open")
 		}
-		buffered := dc.BufferedAmount()
-		if messageSize > network.FileBufferBytes {
-			return fmt.Errorf("file channel message exceeds buffer limit")
-		}
-		if buffered+uint64(messageSize) <= uint64(network.FileBufferBytes) {
+		limit := fileQueueLimit(sctp.Stats().CongestionWindow, network.FileBufferBytes)
+		if sctp.BufferedAmount()+messageSize <= limit {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("file data channel remained above %d-byte buffer limit", network.FileBufferBytes)
+			return fmt.Errorf("file data channel remained above its %d-byte send queue limit", limit)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

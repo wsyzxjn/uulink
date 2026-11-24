@@ -20,6 +20,7 @@
 package gvpb
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strconv"
 	"sync/atomic"
@@ -299,15 +300,11 @@ func appendVarint(buf []byte, v uint64) []byte {
 }
 
 func decodeVarint(data []byte) (uint64, int) {
-	var v uint64
-	for i := 0; i < len(data) && i < 10; i++ {
-		b := data[i]
-		v |= uint64(b&0x7f) << (7 * i)
-		if b < 0x80 {
-			return v, i + 1
-		}
+	v, n := binary.Uvarint(data)
+	if n <= 0 {
+		return 0, 0
 	}
-	return 0, 0
+	return v, n
 }
 
 func decodeBytesField(data []byte, wireType uint64) ([]byte, int, error) {
@@ -318,7 +315,7 @@ func decodeBytesField(data []byte, wireType uint64) ([]byte, int, error) {
 	if n == 0 {
 		return nil, 0, fmt.Errorf("bad length varint")
 	}
-	if int(length) > len(data)-n {
+	if length > uint64(len(data)-n) {
 		return nil, 0, fmt.Errorf("length %d exceeds data", length)
 	}
 	return data[n : n+int(length)], n + int(length), nil
@@ -333,11 +330,17 @@ func skipField(data []byte, wireType uint64) (int, error) {
 		}
 		return n, nil
 	case 1:
+		if len(data) < 8 {
+			return 0, fmt.Errorf("truncated fixed64 field")
+		}
 		return 8, nil
 	case 2:
 		_, n, err := decodeBytesField(data, 2)
 		return n, err
 	case 5:
+		if len(data) < 4 {
+			return 0, fmt.Errorf("truncated fixed32 field")
+		}
 		return 4, nil
 	default:
 		return 0, fmt.Errorf("unsupported wire type %d", wireType)

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/logging"
@@ -276,6 +277,7 @@ type Tunnel struct {
 	remoteLogTime  time.Time
 	remoteLogged   bool
 	maxInFlight    int
+	earlyData      atomic.Bool
 }
 
 // stream is one forwarded TCP connection.
@@ -287,17 +289,24 @@ type Tunnel struct {
 // target never stalls the other streams sharing the transport. All FIN state
 // transitions run on writeLoop, which keeps them ordered behind the data they
 // follow.
+//
+// The inbox is not sized from the local max_in_flight: the window is never
+// negotiated, so the peer's own setting decides how many DATA frames arrive
+// before an ACK, and enqueueing must not wait for room.
 type stream struct {
 	ruleID string
 	id     string
 	tunnel *Tunnel
 	ready  chan struct{}
 	ackSem chan struct{}
-	inbox  chan inboundItem
 	closed chan struct{}
+	wake   chan struct{}
 
 	closeOnce sync.Once
 	readyOnce sync.Once
+
+	inboxMu sync.Mutex
+	inbox   []inboundItem
 
 	mu             sync.Mutex
 	conn           net.Conn
@@ -455,7 +464,7 @@ func (t *Tunnel) newStream(ruleID, streamID string, conn net.Conn) *stream {
 		tunnel: t,
 		ready:  make(chan struct{}),
 		closed: make(chan struct{}),
-		inbox:  make(chan inboundItem, t.network.MaxInFlight),
+		wake:   make(chan struct{}, 1),
 	}
 	if limit := t.effectiveMaxInFlight(); limit > 0 {
 		s.ackSem = make(chan struct{}, limit)
@@ -469,6 +478,14 @@ func (t *Tunnel) SetSecurityPolicy(policy SecurityPolicy) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.securityPolicy = policy
+}
+
+// EnableEarlyData lets each new local connection send its bytes right behind
+// its CONNECT instead of a round trip later, after the peer's SYN_ACK. Enable
+// it only for a peer known to queue such DATA until its target is connected;
+// the official client relies on the SYN_ACK wait.
+func (t *Tunnel) EnableEarlyData() {
+	t.earlyData.Store(true)
 }
 
 // SecurityPolicy returns the active security policy.
@@ -531,7 +548,7 @@ func (t *Tunnel) acceptLoop(rule Rule, ln net.Listener) {
 			t.removeStream(s, "")
 			continue
 		}
-		go s.readLoop()
+		go s.readLoop(t.earlyData.Load())
 	}
 }
 
@@ -545,7 +562,7 @@ func (t *Tunnel) HandleMessage(data []byte) {
 // HandleFrame processes an already decoded port mapping frame. Callers that
 // inspect the frame before dispatching it use this to avoid decoding twice.
 //
-// HandleFrame never blocks on local I/O: DATA and FIN are queued to the
+// HandleFrame never waits for a stream: DATA and FIN are queued to the
 // stream's writer, and CONNECT dials its target asynchronously.
 func (t *Tunnel) HandleFrame(frame *gvpb.PortMappingFrame) {
 	if frame == nil || !isValidFrameID(frame.RuleID) || !isValidFrameID(frame.StreamID) {
@@ -581,7 +598,7 @@ func (t *Tunnel) HandleFrame(frame *gvpb.PortMappingFrame) {
 		if !streamExists {
 			return
 		}
-		v.(*stream).enqueue(inboundItem{payload: frame.Payload})
+		t.deliver(v.(*stream), inboundItem{payload: frame.Payload})
 
 	case gvpb.TypeDataAck:
 		if streamExists {
@@ -592,11 +609,23 @@ func (t *Tunnel) HandleFrame(frame *gvpb.PortMappingFrame) {
 		if !streamExists {
 			return
 		}
-		v.(*stream).enqueue(inboundItem{fin: true})
+		t.deliver(v.(*stream), inboundItem{fin: true})
 
 	default:
 		logging.Debugf("[tunnel] unknown frame type ignored")
 	}
+}
+
+// deliver queues a peer frame. A peer that runs past every window it may be
+// configured with does not wait for DATA_ACK, so its stream is closed instead
+// of buffering without bound.
+func (t *Tunnel) deliver(s *stream, item inboundItem) {
+	if s.enqueue(item) {
+		return
+	}
+	logging.Warnf("[tunnel] rule %s stream %s: peer exceeded %d unacknowledged frames; closing stream",
+		s.ruleID, s.id, settings.MaxInFlightLimit)
+	t.removeStream(s, gvpb.TypeFin)
 }
 
 func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
@@ -634,8 +663,9 @@ func (t *Tunnel) handleConnect(frame *gvpb.PortMappingFrame) {
 	}
 
 	// Register the stream before dialing so a retransmitted CONNECT is
-	// ignored, then dial off the transport's receive goroutine: an unreachable
-	// target must not hold up every other stream for the connect timeout.
+	// ignored and DATA sent early waits in its inbox, then dial off the
+	// transport's receive goroutine: an unreachable target must not hold up
+	// every other stream for the connect timeout.
 	s := t.newStream(frame.RuleID, frame.StreamID, nil)
 	t.streams.Store(streamKey(frame.RuleID, frame.StreamID), s)
 	go t.dialStream(s, target.TargetHost, target.TargetPort)
@@ -669,7 +699,7 @@ func (t *Tunnel) dialStream(s *stream, host string, port int) {
 	t.sendBuilt(s.ruleID, s.id, gvpb.TypeSynAck, msg, err)
 	s.markReady()
 	logging.Debugf("[tunnel] stream connected: rule=%s stream=%s target=%q", s.ruleID, s.id, host)
-	go s.readLoop()
+	go s.readLoop(false)
 }
 
 func (t *Tunnel) allowRemoteLog() bool {
@@ -809,12 +839,51 @@ func (s *stream) close() {
 	})
 }
 
-// enqueue hands a DATA frame, a remote FIN, or the local EOF to writeLoop.
-func (s *stream) enqueue(item inboundItem) {
+// enqueue hands a DATA frame, a remote FIN, or the local EOF to writeLoop
+// without blocking. It refuses a peer frame only when the peer already has a
+// full maximum window plus its FIN queued.
+func (s *stream) enqueue(item inboundItem) bool {
+	s.inboxMu.Lock()
+	if !item.localEOF && len(s.inbox) > settings.MaxInFlightLimit {
+		s.inboxMu.Unlock()
+		return false
+	}
+	s.inbox = append(s.inbox, item)
+	s.inboxMu.Unlock()
 	select {
-	case s.inbox <- item:
-	case <-s.closed:
-	case <-s.tunnel.done:
+	case s.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// next waits for the oldest queued item. It reports false once the stream or
+// the tunnel has shut down.
+func (s *stream) next() (inboundItem, bool) {
+	for {
+		select {
+		case <-s.closed:
+			return inboundItem{}, false
+		case <-s.tunnel.done:
+			return inboundItem{}, false
+		default:
+		}
+		s.inboxMu.Lock()
+		if len(s.inbox) > 0 {
+			item := s.inbox[0]
+			s.inbox[0] = inboundItem{}
+			s.inbox = s.inbox[1:]
+			s.inboxMu.Unlock()
+			return item, true
+		}
+		s.inboxMu.Unlock()
+		select {
+		case <-s.wake:
+		case <-s.closed:
+			return inboundItem{}, false
+		case <-s.tunnel.done:
+			return inboundItem{}, false
+		}
 	}
 }
 
@@ -885,9 +954,7 @@ func (s *stream) handleRemoteFIN() (done bool) {
 	return false
 }
 
-// writeLoop is the single writer of the local connection. It acknowledges
-// each DATA frame after the local write succeeded, which is what keeps the
-// peer's in-flight window honest.
+// writeLoop is the single writer of the local connection.
 func (s *stream) writeLoop() {
 	select {
 	case <-s.ready:
@@ -895,47 +962,68 @@ func (s *stream) writeLoop() {
 		return
 	}
 	for {
-		select {
-		case <-s.closed:
+		item, ok := s.next()
+		if !ok {
 			return
-		case <-s.tunnel.done:
-			return
-		case item := <-s.inbox:
-			switch {
-			case item.localEOF:
-				if s.handleLocalEOF() {
-					return
-				}
-			case item.fin:
-				if s.handleRemoteFIN() {
-					return
-				}
-			default:
-				conn := s.connection()
-				if conn == nil {
-					return
-				}
-				if _, err := conn.Write(item.payload); err != nil {
-					select {
-					case <-s.closed:
-					default:
-						logging.Errorf("[tunnel] local write error: %v", err)
-					}
-					s.tunnel.removeStream(s, gvpb.TypeFin)
-					return
-				}
-				msg, err := newACKMsg(s.ruleID, s.id)
-				s.tunnel.sendBuilt(s.ruleID, s.id, gvpb.TypeDataAck, msg, err)
+		}
+		switch {
+		case item.localEOF:
+			if s.handleLocalEOF() {
+				return
+			}
+		case item.fin:
+			if s.handleRemoteFIN() {
+				return
+			}
+		default:
+			if !s.writeData(item.payload) {
+				return
 			}
 		}
 	}
 }
 
-func (s *stream) readLoop() {
-	select {
-	case <-s.ready:
-	case <-s.closed:
-		return
+// writeData writes one DATA frame locally and then acknowledges it, which is
+// what keeps the peer's in-flight window honest. The peer counts the frame
+// against its window until the ACK arrives, so a stream whose ACK cannot be
+// sent is closed rather than left running one slot short.
+func (s *stream) writeData(payload []byte) bool {
+	conn := s.connection()
+	if conn == nil {
+		return false
+	}
+	if _, err := conn.Write(payload); err != nil {
+		// The local application or target went away, like a read error in
+		// readLoop; it ends this stream and is no fault of the tunnel.
+		logging.Debugf("[tunnel] local write ended stream: %v", err)
+		s.tunnel.removeStream(s, gvpb.TypeFin)
+		return false
+	}
+	msg, err := newACKMsg(s.ruleID, s.id)
+	if err == nil {
+		err = s.tunnel.send(s.ruleID, s.id, gvpb.TypeDataAck, msg)
+	}
+	if err != nil {
+		select {
+		case <-s.closed:
+		default:
+			logging.Warnf("[tunnel] send DATA_ACK error (rule %s stream %s): %v; closing stream", s.ruleID, s.id, err)
+		}
+		s.tunnel.removeStream(s, gvpb.TypeFin)
+		return false
+	}
+	return true
+}
+
+// readLoop moves bytes from the local connection to the peer. A local
+// connection waits for the peer's SYN_ACK first unless early is set.
+func (s *stream) readLoop(early bool) {
+	if !early {
+		select {
+		case <-s.ready:
+		case <-s.closed:
+			return
+		}
 	}
 	select {
 	case <-s.closed:

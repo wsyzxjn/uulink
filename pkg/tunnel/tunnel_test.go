@@ -3,6 +3,8 @@
 package tunnel
 
 import (
+	"errors"
+	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 	"github.com/wsyzxjn/uulink/pkg/settings"
 	"io"
 	"net"
@@ -275,6 +277,173 @@ func TestTunnelFlowControlBackpressure(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for chunk3 after DATA_ACK")
+	}
+}
+
+// ackFailingSender refuses DATA_ACK frames, as a transport that just failed
+// would.
+type ackFailingSender struct{ *channelSender }
+
+func (s ackFailingSender) SendFrame(msg []byte) error {
+	if f := decodeFrameForTunnel(msg); f != nil && f.Type == gvpb.TypeDataAck {
+		return errors.New("transport down")
+	}
+	return s.channelSender.SendFrame(msg)
+}
+
+// The peer counts a DATA frame against its window until the DATA_ACK
+// arrives, so a stream whose ACK cannot be sent is closed rather than left
+// running one slot short for good.
+func TestUnsentDataAckClosesStream(t *testing.T) {
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLn.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+	}()
+
+	out := ackFailingSender{newChannelSender()}
+	defer out.Close()
+	tun := NewTunnelWithRules(nil, out)
+	defer tun.Stop()
+
+	connect, err := newConnectMsg("4001", "1", "127.0.0.1", targetLn.Addr().(*net.TCPAddr).Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun.HandleMessage(connect)
+	if f := decodeFrameForTunnel(receiveFrame(t, out.ch)); f == nil || f.Type != gvpb.TypeSynAck {
+		t.Fatalf("expected SYN_ACK, got %v", f)
+	}
+	var target net.Conn
+	select {
+	case target = <-accepted:
+		defer target.Close()
+	case <-time.After(time.Second):
+		t.Fatal("target never accepted")
+	}
+
+	data, err := newDataMsg("4001", "1", []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun.HandleMessage(data)
+
+	_ = target.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := io.ReadAll(target)
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("target read %q, %v; want the data followed by EOF", got, err)
+	}
+	if f := decodeFrameForTunnel(receiveFrame(t, out.ch)); f == nil || f.Type != gvpb.TypeFin {
+		t.Fatalf("expected FIN, got %v", f)
+	}
+	if _, ok := tun.streams.Load(streamKey("4001", "1")); ok {
+		t.Fatal("stream is still registered after its DATA_ACK failed")
+	}
+}
+
+// With early data a local connection's bytes follow its CONNECT at once;
+// otherwise they wait for the peer's SYN_ACK.
+func TestEarlyDataSkipsSynAckWait(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		early bool
+	}{{"gated", false}, {"early", true}} {
+		t.Run(c.name, func(t *testing.T) {
+			sender := newChannelSender()
+			defer sender.Close()
+			tun := NewTunnelWithRules([]Rule{{ID: "5001", LocalHost: "127.0.0.1", TargetHost: "127.0.0.1", TargetPort: 9}}, sender)
+			if c.early {
+				tun.EnableEarlyData()
+			}
+			if err := tun.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer tun.Stop()
+			addr, err := tun.ListenerAddr("5001")
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := net.DialTimeout("tcp", addr.String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if f := decodeFrameForTunnel(receiveFrame(t, sender.ch)); f == nil || f.Type != gvpb.TypeConnect {
+				t.Fatalf("expected CONNECT, got %v", f)
+			}
+			if _, err := conn.Write([]byte("hello")); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case raw := <-sender.ch:
+				f := decodeFrameForTunnel(raw)
+				if !c.early {
+					t.Fatalf("frame sent before SYN_ACK: %v", f)
+				}
+				if f == nil || f.Type != gvpb.TypeData || string(f.Payload) != "hello" {
+					t.Fatalf("expected early DATA, got %v", f)
+				}
+			case <-time.After(200 * time.Millisecond):
+				if c.early {
+					t.Fatal("early data waited for SYN_ACK")
+				}
+			}
+		})
+	}
+}
+
+// DATA that arrives before the target is connected waits for it instead of
+// being dropped; early data depends on this.
+func TestDataBeforeSynAckReachesTarget(t *testing.T) {
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLn.Close()
+	received := make(chan string, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 16)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _ := io.ReadFull(conn, buf[:5])
+		received <- string(buf[:n])
+	}()
+
+	out := newChannelSender()
+	defer out.Close()
+	tun := NewTunnelWithRules(nil, out)
+	defer tun.Stop()
+
+	connect, err := newConnectMsg("6001", "1", "127.0.0.1", targetLn.Addr().(*net.TCPAddr).Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := newDataMsg("6001", "1", []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun.HandleMessage(connect)
+	tun.HandleMessage(data)
+
+	select {
+	case got := <-received:
+		if got != "hello" {
+			t.Fatalf("target received %q, want %q", got, "hello")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("target never received the early DATA")
 	}
 }
 

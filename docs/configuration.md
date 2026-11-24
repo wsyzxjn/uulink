@@ -95,6 +95,16 @@ WebSocket handshake, initial gateway packet and namespace connection.
 `connect_timeout_seconds` and `half_close_timeout_seconds` apply to forwarded TCP
 connections. OS socket buffer sizes remain subject to the OS's own limits.
 
+`file_buffer_bytes` caps the SCTP send queue that all forwarded connections of
+one session share. Below that cap the queue is kept just above the current
+congestion window, so new connections are not stuck behind bulk transfers.
+`file_buffer_wait_seconds` bounds how long a frame waits for room in it.
+
+`max_in_flight` is this side's send window: the DATA frames one connection may
+have unacknowledged before reading from it pauses. The window is not
+negotiated, so as a receiver each connection accepts up to 4096 unacknowledged
+frames from the peer and closes when the peer goes beyond that.
+
 `stun_servers` controls STUN discovery on the serving peer:
 
 - Omitted or `null`: use automatic discovery. When answering a new connection,

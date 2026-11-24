@@ -89,7 +89,6 @@ func runConnect(g *globalOptions, opts *connectOptions) error {
 			capability:     opts.ctrl.capability,
 			p2pTimeout:     opts.ctrl.p2pTimeout,
 			targetSessions: sessions.target,
-			autoSessions:   sessions.auto,
 		}
 		return runWithRelayFallback(transportMode, opts.ctrl.p2pTimeout, func(ctx context.Context, mode peer.TransportMode, ready func()) error {
 			remoteOptions.transportMode = mode
@@ -114,7 +113,6 @@ func runConnect(g *globalOptions, opts *connectOptions) error {
 		pckSweep:        *experimentPCKSweep,
 		mixKCP:          *experimentMixKCP,
 		targetSessions:  sessions.target,
-		autoSessions:    sessions.auto,
 		rules:           rules,
 		lanDiscovery:    opts.ctrl.lanDiscovery,
 		lanMotd:         opts.ctrl.lanMotd,

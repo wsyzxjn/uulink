@@ -116,7 +116,7 @@ func TestPoolKeepsBindingForHalfCloseResponse(t *testing.T) {
 func TestPoolReleasesBindingOnRejectedConnect(t *testing.T) {
 	out := newChannelSender()
 	defer out.Close()
-	pool := NewSessionPool(PolicyHealthAware)
+	pool := NewSessionPool(PolicyStreamLeastLoaded)
 	sess := NewSimpleSession("primary", out, nil)
 	pool.AddSession(sess)
 
@@ -295,16 +295,23 @@ func TestSlowLocalWriterDoesNotBlockSiblingStream(t *testing.T) {
 		t.Fatal("stuck target never accepted")
 	}
 
-	// Fill the stuck stream's socket buffers and its inbox far beyond what the
-	// kernel will absorb, from a goroutine, since enqueue blocks once full.
+	// Queue far more for the stuck stream than the kernel will absorb and than
+	// the local window allows. The receive path must take all of it without
+	// waiting on the stalled writer.
 	chunk := bytes.Repeat([]byte("s"), 32*1024)
+	delivered := make(chan struct{})
 	go func() {
+		defer close(delivered)
 		for i := 0; i < 4*tun.network.MaxInFlight; i++ { // 16 MiB: far beyond loopback socket buffers
 			msg, _ := newDataMsg("9001", "1", chunk)
 			tun.HandleMessage(msg)
 		}
 	}()
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive path waited on a stalled local writer")
+	}
 
 	// The sibling stream must still round-trip promptly.
 	msg, err := newDataMsg("9002", "1", []byte("ping"))

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
+	"github.com/wsyzxjn/uulink/pkg/settings"
 )
 
 func TestIsLoopbackHost(t *testing.T) {
@@ -224,5 +225,43 @@ func TestRemoteLogLimiter(t *testing.T) {
 	}
 	if tun.allowRemoteLog() {
 		t.Fatal("second remote log in the same window should be suppressed")
+	}
+}
+
+// A peer that ignores DATA_ACK loses the stream once it runs past the largest
+// window any peer may be configured with, instead of being buffered without
+// bound or holding up the receive path.
+func TestPeerBeyondMaxWindowClosesStream(t *testing.T) {
+	sender := newChannelSender()
+	defer sender.Close()
+	tun := NewTunnelWithRules(nil, sender)
+	defer tun.Stop()
+
+	key := streamKey("3001", "1")
+	// Never ready, so nothing is written locally and nothing is acknowledged.
+	tun.streams.Store(key, tun.newStream("3001", "1", nil))
+
+	data, err := newDataMsg("3001", "1", []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fin, err := newFINMsg("3001", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < settings.MaxInFlightLimit; i++ {
+		tun.HandleMessage(data)
+	}
+	tun.HandleMessage(fin)
+	if _, ok := tun.streams.Load(key); !ok {
+		t.Fatal("stream closed within a full maximum window plus FIN")
+	}
+
+	tun.HandleMessage(data)
+	if f := decodeFrameForTunnel(receiveFrame(t, sender.ch)); f == nil || f.Type != gvpb.TypeFin {
+		t.Fatalf("expected FIN for the overrun stream, got %v", f)
+	}
+	if _, ok := tun.streams.Load(key); ok {
+		t.Fatal("overrun stream is still registered")
 	}
 }

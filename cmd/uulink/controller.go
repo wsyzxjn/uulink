@@ -13,7 +13,6 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/landiscover"
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/peer"
-	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
@@ -35,7 +34,6 @@ type controllerOptions struct {
 	pckSweep          bool
 	mixKCP            bool
 	targetSessions    int
-	autoSessions      bool
 	// rules are the local listeners; the caller has validated them.
 	rules []tunnel.Rule
 	// lanDiscovery announces the first forwarded port as a Minecraft LAN
@@ -231,18 +229,7 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 		TransportMode: options.transportMode,
 		OnSignalData: func(data []byte) {
 			<-wired
-			frame := tunnel.DecodeFrameForTunnel(data)
-			if frame == nil {
-				return
-			}
-			expandPool.Pool().ObserveReceived("primary", len(data))
-			// Replies for a peer-initiated stream must leave through the
-			// session its CONNECT arrived on. Only a CONNECT creates a
-			// binding; the tunnel releases it when the stream is done.
-			if frame.Type == gvpb.TypeConnect {
-				expandPool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
-			}
-			tun.HandleFrame(frame)
+			handleSessionData(tun, expandPool.Pool(), primarySession, data)
 		}})
 	if err != nil {
 		return fmt.Errorf("control handshake: %w", err)
@@ -254,22 +241,17 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	// the served side for additional rooms in band and joins them here. The
 	// negotiator has to be in place before the peer reports its mode.
 	negotiator := newExpandNegotiator()
-	expandSet := newSessionSet()
+	expandSet := newSessionSet(ctx)
 	expandSet.transportTimeout = transportTimeout
 	defer expandSet.closeAll()
 	recoveryConfig := *cfg
-	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyHealthAware,
+	adaptivePool := tunnel.NewAdaptiveSessionPool(options.targetSessions, tunnel.PolicyStreamLeastLoaded,
 		func(target int) error {
-			batch := target - 1
-			if options.autoSessions {
-				batch = 1
-			}
-			return maintainControllerPool(client, &recoveryConfig, negotiator, p, tun, expandPool, expandSet, target, batch, options.transportMode, options.p2pTimeout, secPolicy)
+			return maintainControllerPool(client, &recoveryConfig, negotiator, p, tun, expandPool, expandSet, target, options.transportMode, options.p2pTimeout, secPolicy)
 		})
 	expandPool = adaptivePool
 	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
 	adaptivePool.Pool().AddSession(primarySession)
-	p.OnTextMessage(func(data []byte) { negotiator.handle(data) })
 	p.OnModeChange(adaptivePool.OnModeDetected)
 
 	tun, err = tunnel.NewTunnelWithSettings(rules, adaptivePool, cfg.Network)
@@ -278,6 +260,13 @@ func runController(ctx context.Context, client *api.Client, cfg *auth.Config, se
 	}
 	tun.SetSecurityPolicy(secPolicy)
 	close(wired)
+	// Registered once tun exists: earlier messages are replayed to it.
+	onEarlyData := earlyDataHandler(p, tun.EnableEarlyData, true)
+	p.OnTextMessage(func(data []byte) {
+		if !negotiator.handle(data) {
+			onEarlyData(data)
+		}
+	})
 	runErr := make(chan error, 1)
 	monitorPrimary(expandSet.ctx, p, runErr)
 	tunnelReady := make(chan struct{})

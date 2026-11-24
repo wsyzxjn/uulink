@@ -2,6 +2,7 @@ package peer
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"testing"
@@ -9,6 +10,17 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
 )
+
+func TestControlEchoRejectsMalformedLengths(t *testing.T) {
+	for _, data := range [][]byte{
+		binary.AppendUvarint([]byte{0x08, 0x01, 0x1a}, ^uint64(0)),
+		append([]byte{0x08, 0x01, 0x1a}, bytes.Repeat([]byte{0xff}, 10)...),
+	} {
+		if _, _, ok := parseControlEcho(data); ok {
+			t.Fatal("accepted malformed control echo")
+		}
+	}
+}
 
 func TestControlledOfferFailureLeavesPeerReadyForNextOffer(t *testing.T) {
 	p := &Peer{controlledReady: make(chan struct{}), statsDone: make(chan struct{})}

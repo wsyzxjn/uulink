@@ -70,6 +70,20 @@ func TestIsPermanentError(t *testing.T) {
 	}
 }
 
+func TestReconcileLoopReturnsPermanentError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	want := errors.New("invalid credentials")
+	calls := 0
+	err := reconcileLoop(ctx, func(context.Context) error {
+		calls++
+		return permanent(want)
+	})
+	if !errors.Is(err, want) || calls != 1 {
+		t.Fatalf("permanent repair error = %v after %d calls", err, calls)
+	}
+}
+
 func TestRecoverTunnelReturnsPermanentErrorsImmediately(t *testing.T) {
 	calls := 0
 	want := permanent(errors.New("bad flags"))

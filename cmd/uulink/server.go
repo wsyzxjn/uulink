@@ -12,7 +12,6 @@ import (
 	"github.com/wsyzxjn/uulink/pkg/auth"
 	"github.com/wsyzxjn/uulink/pkg/logging"
 	"github.com/wsyzxjn/uulink/pkg/peer"
-	"github.com/wsyzxjn/uulink/pkg/proto/gvpb"
 	"github.com/wsyzxjn/uulink/pkg/signaling"
 	"github.com/wsyzxjn/uulink/pkg/tunnel"
 )
@@ -277,15 +276,7 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 		Signal:      sig,
 		OnSignalData: func(data []byte) {
 			<-wired
-			frame := tunnel.DecodeFrameForTunnel(data)
-			if frame == nil {
-				return
-			}
-			adaptivePool.Pool().ObserveReceived("primary", len(data))
-			if frame.Type == gvpb.TypeConnect {
-				adaptivePool.Pool().BindStream(frame.RuleID, frame.StreamID, primarySession)
-			}
-			tun.HandleFrame(frame)
+			handleSessionData(tun, adaptivePool.Pool(), primarySession, data)
 		},
 	})
 	if err != nil {
@@ -305,7 +296,7 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	// The controller drives pool growth: it is the side that can tell whether
 	// the connection landed on a relay. Each extra session needs a room of its
 	// own, which this side mints on request.
-	adaptivePool = tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyHealthAware, nil)
+	adaptivePool = tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
 	primarySession = tunnel.NewSimpleSession("primary", &peerSender{peer: p}, nil)
 	adaptivePool.Pool().AddSession(primarySession)
 	p.OnModeChange(adaptivePool.OnModeDetected)
@@ -317,9 +308,18 @@ func serveRoom(ctx context.Context, client *api.Client, cfg *auth.Config, rules 
 	tun.SetSecurityPolicy(policy)
 	close(wired)
 
-	expandSet := newSessionSet()
+	expandSet := newSessionSet(ctx)
 	defer expandSet.closeAll()
-	p.OnTextMessage(serveExpandRequests(p, targetSessions-1, newExpansionMinter(cfg, tun, adaptivePool, expandSet, shareOptions, policy)))
+	serveExpand := serveExpandRequests(p, targetSessions-1, newExpansionMinter(cfg, tun, adaptivePool, expandSet, shareOptions, policy))
+	onEarlyData := earlyDataHandler(p, tun.EnableEarlyData, false)
+	// Minting rooms takes several API round trips. It must not hold the text
+	// channel's receive path, nor this goroutine when buffered requests are
+	// replayed during registration.
+	p.OnTextMessage(func(data []byte) {
+		onEarlyData(data)
+		go serveExpand(data)
+	})
+	go announceEarlyData(expandSet.ctx, p)
 	runErr := make(chan error, 1)
 	monitorPrimary(expandSet.ctx, p, runErr)
 	p.OnFileChannelOpen(func() {

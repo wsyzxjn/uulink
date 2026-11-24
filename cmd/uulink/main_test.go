@@ -43,6 +43,37 @@ func unsignedTestJWT(subject string) string {
 	return "header." + payload + ".signature"
 }
 
+func TestAllowedPortsPolicySurvivesConfigSave(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		ports []int
+		allow bool
+	}{
+		{"omitted", nil, true},
+		{"deny all", []int{}, false},
+		{"allow SSH", []int{22}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &auth.Config{AllowedPorts: tt.ports}
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := auth.SaveConfigFile(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := auth.LoadConfigFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy, err := buildSecurityPolicy(loaded, false, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if allowed := policy.ValidateTarget("127.0.0.1", 22) == nil; allowed != tt.allow {
+				t.Fatalf("port 22 allowed after save = %v, want %v", allowed, tt.allow)
+			}
+		})
+	}
+}
+
 // The relay requirement is a controller-only option: the served side has no
 // -transport flag at all, so the restriction is structural.
 func TestServerCommandsHaveNoTransportFlag(t *testing.T) {

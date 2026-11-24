@@ -2,6 +2,7 @@ package gvpb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"testing"
@@ -56,6 +57,33 @@ func TestConnectRoundTrip(t *testing.T) {
 	if target.Version != 1 || target.TargetPort != 3389 || target.TargetHost != "127.0.0.1" {
 		t.Errorf("payload mismatch: %+v", target)
 	}
+}
+
+func TestDecodeMessageRejectsMalformedLengths(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{"oversized frame", binary.AppendUvarint([]byte{0xda, 0x01}, ^uint64(0))},
+		{"overflowing varint", append([]byte{0x08}, bytes.Repeat([]byte{0xff}, 10)...)},
+		{"overflowing final byte", append(append([]byte{0x08}, bytes.Repeat([]byte{0xff}, 9)...), 0x02)},
+		{"truncated fixed64", []byte{0x19, 0x01}},
+		{"truncated fixed32", []byte{0x1d, 0x01}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := DecodeMessage(tt.data); err == nil {
+				t.Fatal("accepted malformed protobuf")
+			}
+		})
+	}
+}
+
+func FuzzDecodeMessage(f *testing.F) {
+	f.Add([]byte{0x08, 0x01})
+	f.Add(binary.AppendUvarint([]byte{0xda, 0x01}, ^uint64(0)))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DecodeMessage(data)
+	})
 }
 
 // TestSynAckRoundTrip verifies SYN_ACK decode.

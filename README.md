@@ -526,6 +526,12 @@ as relay-only (`server_requires_relay=true`), which is common for share and gues
 rooms. In that case every stream goes through a TURN relay even when both peers
 are directly reachable, and latency is dominated by the relay path.
 
+When a uulink controller joins `serve` or the single share of `share serve`, a
+new forwarded connection sends its first bytes together with its CONNECT
+instead of waiting a round trip for the target's acknowledgement. Rooms
+prepared with `share serve -sessions N` and targets running the official client
+keep that wait.
+
 **Q: Can other devices on my local network access the forwarded port?**
 
 Yes. By default, local listeners bind to `127.0.0.1` for security. To expose the port across your local network (e.g., for a phone or another computer), set `-local-host 0.0.0.0` on the command line or set `"local_host": "0.0.0.0"` in your `config.json` mapping rule.

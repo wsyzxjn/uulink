@@ -634,26 +634,30 @@ func (c *Client) dispatchBinaryEvent(packet []byte, attachments [][]byte) {
 // is NOT used - the placeholder is replaced by the decompressed string
 // by the official client; we pass raw and let handlers decode.
 func spliceAttachment(raw json.RawMessage, attachments [][]byte) json.RawMessage {
-	var probe map[string]any
+	var probe struct {
+		Placeholder bool            `json:"_placeholder"`
+		Num         json.RawMessage `json:"num"`
+	}
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return raw
 	}
-	if ph, ok := probe["_placeholder"].(bool); ok && ph {
-		num := 0
-		if n, ok := probe["num"].(float64); ok {
-			num = int(n)
+	if probe.Placeholder {
+		var num int
+		if len(probe.Num) == 0 || string(probe.Num) == "null" {
+			return raw
 		}
-		if num < len(attachments) {
-			// Try gzip decode; fall back to raw
-			content := attachments[num]
-			if s, err := gunzipIfCompressed(content); err == nil {
-				quoted, _ := json.Marshal(s)
-				return quoted
-			}
-			// Not gzip: return as base64 string to keep JSON valid
-			quoted, _ := json.Marshal(content)
+		if err := json.Unmarshal(probe.Num, &num); err != nil || num < 0 || num >= len(attachments) {
+			return raw
+		}
+		// Try gzip decode; fall back to raw
+		content := attachments[num]
+		if s, err := gunzipIfCompressed(content); err == nil {
+			quoted, _ := json.Marshal(s)
 			return quoted
 		}
+		// Not gzip: return as base64 string to keep JSON valid
+		quoted, _ := json.Marshal(content)
+		return quoted
 	}
 	// Recurse into nested objects
 	var obj map[string]json.RawMessage

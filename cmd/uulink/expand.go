@@ -107,7 +107,7 @@ type expandNegotiator struct {
 }
 
 func newExpandNegotiator() *expandNegotiator {
-	return &expandNegotiator{result: make(chan *expandMessage, 1)}
+	return &expandNegotiator{}
 }
 
 // handle feeds a TEXT_DATA_CHANNEL payload to the negotiator and reports
@@ -121,7 +121,7 @@ func (n *expandNegotiator) handle(data []byte) bool {
 	case expandTypeOffer, expandTypeError:
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if msg.RequestID != "" && msg.RequestID != n.active {
+		if n.active == "" || msg.RequestID != n.active {
 			return true
 		}
 		select {
@@ -149,13 +149,21 @@ func (n *expandNegotiator) requestContext(ctx context.Context, p textSender, ext
 	n.next++
 	n.active = fmt.Sprint(n.next)
 	id := n.active
+	result := make(chan *expandMessage, 1)
+	n.result = result
 	n.mu.Unlock()
+	defer func() {
+		n.mu.Lock()
+		n.active = ""
+		n.result = nil
+		n.mu.Unlock()
+	}()
 
 	if err := sendExpandMessage(p, &expandMessage{Type: expandTypeRequest, Sessions: extra, RequestID: id}); err != nil {
 		return nil, err
 	}
 	select {
-	case msg := <-n.result:
+	case msg := <-result:
 		if msg.Type == expandTypeError {
 			return nil, fmt.Errorf("peer declined to expand the pool: %s", msg.Message)
 		}
@@ -314,7 +322,7 @@ func newExpansionMinter(cfg *auth.Config, tun *tunnel.Tunnel, pool *tunnel.Adapt
 
 // maintainControllerPool is the sole repair coordinator. It retries partial
 // expansion with capped backoff and never rejoins an already healthy room.
-func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegotiator, p *peer.Peer, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, target, batch int, mode peer.TransportMode, p2pTimeout time.Duration, policy tunnel.SecurityPolicy) error {
+func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegotiator, p *peer.Peer, tun *tunnel.Tunnel, pool *tunnel.AdaptiveSessionPool, set *sessionSet, target int, mode peer.TransportMode, p2pTimeout time.Duration, policy tunnel.SecurityPolicy) error {
 	if !set.begin() {
 		return nil
 	}
@@ -335,9 +343,6 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 		if before >= target {
 			return nil
 		}
-		if batch <= 0 || batch > target-before {
-			batch = target - before
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -345,7 +350,8 @@ func maintainControllerPool(client *api.Client, cfg *auth.Config, n *expandNegot
 		case <-time.After(expandChannelTimeout):
 			return fmt.Errorf("control channel readiness timeout")
 		}
-		shares, err := n.requestContext(ctx, p, batch)
+		// The peer mints and this side joins every missing room in parallel.
+		shares, err := n.requestContext(ctx, p, target-before)
 		if err != nil {
 			return err
 		}

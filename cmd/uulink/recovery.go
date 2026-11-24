@@ -247,6 +247,34 @@ func monitorSession(set *sessionSet, rt *sessionRuntime, tun *tunnel.Tunnel, poo
 	}()
 }
 
+// maintainSession repairs one slot without closing the other sessions or
+// moving interrupted TCP streams to a replacement transport.
+func (s *sessionSet) maintainSession(rt *sessionRuntime, start func(context.Context) (*sessionRuntime, error)) {
+	if !s.begin() {
+		return
+	}
+	go func() {
+		defer s.jobs.Done()
+		err := reconcileLoop(s.ctx, func(ctx context.Context) error {
+			select {
+			case <-rt.done:
+			default:
+				return nil
+			}
+			replacement, err := start(ctx)
+			if err != nil {
+				return err
+			}
+			rt = replacement
+			s.add(rt)
+			return nil
+		})
+		if err != nil {
+			s.fail(err)
+		}
+	}()
+}
+
 func monitorPrimary(ctx context.Context, p *peer.Peer, failures chan<- error) {
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -277,6 +305,9 @@ func reconcileLoop(ctx context.Context, step func(context.Context) error) error 
 			return nil
 		}
 		err := step(ctx)
+		if isPermanentError(err) {
+			return err
+		}
 		delay := 5 * time.Second
 		if err != nil {
 			delay = recoveryDelayForError(err, attempt)

@@ -196,8 +196,8 @@ func (s *sessionRuntime) activate(fn func()) {
 	}
 }
 
-// sessionSet tracks pooled sessions so they can be closed together and so the
-// first failure can stop the whole process.
+// sessionSet owns pooled sessions and reports failures that require shutting
+// down the whole pool. Individual transport failures are repaired per slot.
 type sessionSet struct {
 	transportTimeout time.Duration
 	mu               sync.Mutex
@@ -211,8 +211,8 @@ type sessionSet struct {
 	jobs             sync.WaitGroup
 }
 
-func newSessionSet() *sessionSet {
-	ctx, cancel := context.WithCancel(context.Background())
+func newSessionSet(parent context.Context) *sessionSet {
+	ctx, cancel := context.WithCancel(parent)
 	return &sessionSet{transportTimeout: time.Duration(settings.Defaults().TransportTimeoutSeconds) * time.Second, failed: make(chan error, 1), ready: make(chan struct{}), ctx: ctx, cancel: cancel}
 }
 
@@ -279,17 +279,6 @@ func (s *sessionSet) closeAll() {
 		rt.close()
 	}
 	s.jobs.Wait()
-}
-
-// watchSignaling turns an unexpected signaling disconnect into a pool failure.
-func (s *sessionSet) watchSignaling(id string, sig *signaling.Client, done <-chan struct{}) {
-	go func() {
-		select {
-		case <-sig.Done():
-			s.fail(fmt.Errorf("%s: %w", id, errSignalingClosed))
-		case <-done:
-		}
-	}()
 }
 
 // startTunnelOnce starts the shared tunnel when the first session is ready.
@@ -391,7 +380,7 @@ func doMultiSessionController(ctx context.Context, client *api.Client, cfg *auth
 		return fmt.Errorf("share count exceeds network.session_limit")
 	}
 	logging.Infof("starting multi-session controller with %d sessions", len(shares))
-	pool := tunnel.NewAdaptiveSessionPool(len(shares), tunnel.PolicyHealthAware, nil)
+	pool := tunnel.NewAdaptiveSessionPool(len(shares), tunnel.PolicyStreamLeastLoaded, nil)
 	defer pool.Close()
 	tun, err := tunnel.NewTunnelWithSettings(rules, pool, cfg.Network)
 	if err != nil {
@@ -400,11 +389,9 @@ func doMultiSessionController(ctx context.Context, client *api.Client, cfg *auth
 	tun.SetSecurityPolicy(secPolicy)
 	defer tun.Stop()
 
-	set := newSessionSet()
+	set := newSessionSet(ctx)
 	set.transportTimeout = time.Duration(cfg.Network.TransportTimeoutSeconds) * time.Second
 	defer set.closeAll()
-	done := make(chan struct{})
-	defer close(done)
 
 	// Every session requires relay when the controller asked for it; the
 	// server side cannot request relay for a pooled guest room.
@@ -414,16 +401,21 @@ func doMultiSessionController(ctx context.Context, client *api.Client, cfg *auth
 			return nil
 		}
 		sessionID := fmt.Sprintf("session-%d", index+1)
-		rt, err := startPooledController(ctx, client, cfg, tun, pool, set, sessionID, entry, useGuest, options.transportMode, options.p2pTimeout, rules, secPolicy)
-		if errors.Is(err, errP2PTimeout) && options.transportMode == peer.TransportAuto {
-			logging.Infof("[multisession] %s: P2P timed out, retrying with relay transport", sessionID)
-			rt, err = startPooledController(ctx, client, cfg, tun, pool, set, sessionID, entry, useGuest, peer.TransportRelay, options.p2pTimeout, rules, secPolicy)
+		start := func(ctx context.Context) (*sessionRuntime, error) {
+			id := nextSessionID(sessionID)
+			rt, err := startPooledController(ctx, client, cfg, tun, pool, set, id, entry, useGuest, options.transportMode, options.p2pTimeout, rules, secPolicy)
+			if errors.Is(err, errP2PTimeout) && options.transportMode == peer.TransportAuto {
+				logging.Infof("[multisession] %s: P2P timed out, retrying with relay transport", id)
+				rt, err = startPooledController(ctx, client, cfg, tun, pool, set, nextSessionID(sessionID), entry, useGuest, peer.TransportRelay, options.p2pTimeout, rules, secPolicy)
+			}
+			return rt, err
 		}
+		rt, err := start(ctx)
 		if err != nil {
 			return fmt.Errorf("%s: %w", sessionID, err)
 		}
 		set.add(rt)
-		set.watchSignaling(sessionID, rt.sig, done)
+		set.maintainSession(rt, start)
 	}
 
 	logging.Infof("waiting for WebRTC connections")
@@ -460,6 +452,8 @@ func startPooledController(ctx context.Context, client *api.Client, cfg *auth.Co
 	// Cleanup is installed before readiness can race with a timeout.
 	rt.cleanup = func() { tun.CloseStreams(pool.Pool().RemoveSession(sessionID)) }
 
+	var poolSession *tunnel.SimpleSession
+	wired := make(chan struct{})
 	p, err := peer.NewController(&peer.Config{
 		VersionName:   cfg.Identity().VersionName,
 		Platform:      cfg.Identity().Platform,
@@ -468,12 +462,8 @@ func startPooledController(ctx context.Context, client *api.Client, cfg *auth.Co
 		DeviceID:      peerDeviceID,
 		TransportMode: transportMode,
 		OnSignalData: func(data []byte) {
-			frame := tunnel.DecodeFrameForTunnel(data)
-			if frame == nil {
-				return
-			}
-			pool.Pool().ObserveReceived(sessionID, len(data))
-			tun.HandleFrame(frame)
+			<-wired
+			handleSessionData(tun, pool.Pool(), poolSession, data)
 		},
 	})
 	if err != nil {
@@ -481,6 +471,8 @@ func startPooledController(ctx context.Context, client *api.Client, cfg *auth.Co
 		return nil, fmt.Errorf("control handshake: %w", err)
 	}
 	rt.peer = p
+	poolSession = tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil)
+	close(wired)
 	if err := p.Connect(nil); err != nil {
 		rt.close()
 		return nil, fmt.Errorf("peer connect: %w", err)
@@ -495,7 +487,7 @@ func startPooledController(ctx context.Context, client *api.Client, cfg *auth.Co
 			}
 			return
 		}
-		rt.activate(func() { pool.Pool().AddSession(tunnel.NewSimpleSession(sessionID, &peerSender{peer: p}, nil)) })
+		rt.activate(func() { pool.Pool().AddSession(poolSession) })
 		select {
 		case ready <- nil:
 		default:
@@ -568,7 +560,7 @@ func doMultiSessionUnboundGuestServe(ctx context.Context, cfg *auth.Config, rule
 	}
 	logging.Infof("initializing %d unbound guest sessions for the relay pool", targetSessions)
 
-	pool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyHealthAware, nil)
+	pool := tunnel.NewAdaptiveSessionPool(targetSessions, tunnel.PolicyStreamLeastLoaded, nil)
 	defer pool.Close()
 	tun, err := tunnel.NewTunnelWithSettings(rules, pool, cfg.Network)
 	if err != nil {
@@ -577,47 +569,71 @@ func doMultiSessionUnboundGuestServe(ctx context.Context, cfg *auth.Config, rule
 	tun.SetSecurityPolicy(policy)
 	defer tun.Stop()
 
-	set := newSessionSet()
+	set := newSessionSet(ctx)
 	set.transportTimeout = time.Duration(cfg.Network.TransportTimeoutSeconds) * time.Second
 	defer set.closeAll()
-	done := make(chan struct{})
-	defer close(done)
-
-	shares := make([]*api.GuestShareInfo, 0, targetSessions)
+	shares := make([]*api.GuestShareInfo, targetSessions)
+	configs := make([]auth.Config, targetSessions)
+	runtimes := make([]*sessionRuntime, targetSessions)
 	for index := range targetSessions {
 		if ctx.Err() != nil {
 			return nil
 		}
 		sessionID := fmt.Sprintf("session-%d", index+1)
-		sessionCfg := *cfg
+		configs[index] = *cfg
+		sessionCfg := &configs[index]
 		if index > 0 {
 			sessionCfg.UnboundClientID = ""
 			sessionCfg.UnboundDeviceID = ""
 			sessionCfg.UnboundPlatform = 0
 		}
-		rt, share, err := startPooledGuestServer(ctx, api.NewClient(&sessionCfg), &sessionCfg, tun, pool, set, sessionID, fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
+		rt, share, err := startPooledGuestServer(ctx, api.NewClient(sessionCfg), sessionCfg, tun, pool, set, sessionID, fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
 		if err != nil {
 			return fmt.Errorf("%s: %w", sessionID, err)
 		}
 		set.add(rt)
-		set.watchSignaling(sessionID, rt.sig, done)
-		shares = append(shares, share)
+		runtimes[index] = rt
+		shares[index] = share
 	}
 
-	if roomFile != "" {
-		if err := saveMultiGuestShareFile(roomFile, shares); err != nil {
-			return fmt.Errorf("save multi guest share file: %w", err)
+	publish := func() error {
+		if roomFile != "" {
+			if err := saveMultiGuestShareFile(roomFile, shares); err != nil {
+				return permanent(fmt.Errorf("save multi guest share file: %w", err))
+			}
 		}
-		logging.Debugf("saved %d guest shares to %s", len(shares), roomFile)
+		ids := make([]string, 0, len(shares))
+		codes := make([]string, 0, len(shares))
+		for _, share := range shares {
+			ids = append(ids, share.ConnectID)
+			codes = append(codes, share.ConnectCode)
+		}
+		logging.Infof("multi-session guest shares ready (%d sessions): uulink share join -id %s -code %s",
+			len(shares), strings.Join(ids, ","), strings.Join(codes, ","))
+		return nil
 	}
-	ids := make([]string, 0, len(shares))
-	codes := make([]string, 0, len(shares))
-	for _, share := range shares {
-		ids = append(ids, share.ConnectID)
-		codes = append(codes, share.ConnectCode)
+	if err := publish(); err != nil {
+		return err
 	}
-	logging.Infof("multi-session guest shares ready (%d sessions): uulink share join -id %s -code %s",
-		len(shares), strings.Join(ids, ","), strings.Join(codes, ","))
+	var shareMu sync.Mutex
+	for index, rt := range runtimes {
+		set.maintainSession(rt, func(ctx context.Context) (*sessionRuntime, error) {
+			sessionCfg := &configs[index]
+			rt, share, err := startPooledGuestServer(ctx, api.NewClient(sessionCfg), sessionCfg, tun, pool, set, nextSessionID(fmt.Sprintf("session-%d", index+1)), fmt.Sprintf("%s-%d", hostname, index+1), shareOptions, rules, policy)
+			if err != nil {
+				return nil, err
+			}
+			shareMu.Lock()
+			shares[index] = share
+			err = publish()
+			shareMu.Unlock()
+			if err != nil {
+				rt.close()
+				return nil, err
+			}
+			return rt, nil
+		})
+	}
 
 	return set.waitForShutdown(ctx, false)
 }
@@ -703,17 +719,7 @@ func startPooledGuestServer(ctx context.Context, client *api.Client, cfg *auth.C
 		Signal:  sig,
 		OnSignalData: func(data []byte) {
 			<-wired
-			frame := tunnel.DecodeFrameForTunnel(data)
-			if frame == nil {
-				return
-			}
-			pool.Pool().ObserveReceived(sessionID, len(data))
-			// Replies for a stream must leave through the session its CONNECT
-			// arrived on; bind the stream before the tunnel handles the frame.
-			if frame.Type == gvpb.TypeConnect {
-				pool.Pool().BindStream(frame.RuleID, frame.StreamID, poolSession)
-			}
-			tun.HandleFrame(frame)
+			handleSessionData(tun, pool.Pool(), poolSession, data)
 		},
 	})
 	if err != nil {
@@ -741,6 +747,18 @@ func startPooledGuestServer(ctx context.Context, client *api.Client, cfg *auth.C
 	}
 	monitorSession(set, rt, tun, pool.Pool())
 	return rt, share, nil
+}
+
+// handleSessionData binds peer-initiated streams before the tunnel can reply.
+func handleSessionData(tun *tunnel.Tunnel, pool *tunnel.SessionPool, session tunnel.Session, data []byte) {
+	frame := tunnel.DecodeFrameForTunnel(data)
+	if frame == nil {
+		return
+	}
+	if frame.Type == gvpb.TypeConnect {
+		pool.BindStream(frame.RuleID, frame.StreamID, session)
+	}
+	tun.HandleFrame(frame)
 }
 
 // handlePooledPush answers one controlled-side bmsg_push for a pooled guest

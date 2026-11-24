@@ -1,10 +1,49 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"testing"
 )
+
+type replySender func([]byte) error
+
+func (f replySender) SendText(data []byte) error { return f(data) }
+
+func expansionReply(n *expandNegotiator, shares []expandShare) textSender {
+	return replySender(func(data []byte) error {
+		request, _ := parseExpandMessage(data)
+		reply, err := json.Marshal(&expandMessage{UULink: expandProtocolVersion, Type: expandTypeOffer, RequestID: request.RequestID, Shares: shares})
+		if err == nil {
+			n.handle(reply)
+		}
+		return err
+	})
+}
+
+func TestNegotiatorDoesNotReuseCanceledReply(t *testing.T) {
+	n := newExpandNegotiator()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requestID string
+	_, err := n.requestContext(ctx, replySender(func(data []byte) error {
+		request, _ := parseExpandMessage(data)
+		requestID = request.RequestID
+		cancel()
+		return nil
+	}), 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled request returned %v", err)
+	}
+	late, _ := json.Marshal(&expandMessage{UULink: expandProtocolVersion, Type: expandTypeOffer, RequestID: requestID, Shares: []expandShare{{ID: "old", Code: "A"}}})
+	n.handle(late)
+	shares, err := n.request(expansionReply(n, []expandShare{{ID: "current", Code: "B"}}), 1)
+	if err != nil || len(shares) != 1 || shares[0].ID != "current" {
+		t.Fatalf("new request consumed stale reply: shares=%v err=%v", shares, err)
+	}
+}
 
 // fakeSender records what the expansion exchange writes to the peer.
 type fakeSender struct{ sent [][]byte }
@@ -73,30 +112,22 @@ func TestNegotiatorIgnoresUnrelatedPayloads(t *testing.T) {
 		t.Fatal("offer should be consumed")
 	}
 	select {
-	case msg := <-n.result:
-		if len(msg.Shares) != 1 {
-			t.Fatalf("unexpected shares: %+v", msg.Shares)
-		}
+	case <-n.result:
+		t.Fatal("unsolicited offer was queued")
 	default:
-		t.Fatal("offer was not delivered")
 	}
 }
 
 func TestNegotiatorDropsDuplicateOffers(t *testing.T) {
 	n := newExpandNegotiator()
-	first := []byte(`{"uulink":1,"type":"expand_offer","shares":[{"id":"1","code":"A"}]}`)
-	second := []byte(`{"uulink":1,"type":"expand_offer","shares":[{"id":"2","code":"B"}]}`)
-	if !n.handle(first) {
-		t.Fatal("the first offer should be recognised")
-	}
-	if !n.handle(second) {
-		t.Fatal("the second offer should be recognised")
-	}
-	<-n.result
-	select {
-	case <-n.result:
-		t.Fatal("a duplicate offer was queued")
-	default:
+	shares, err := n.request(replySender(func(data []byte) error {
+		if err := expansionReply(n, []expandShare{{ID: "1", Code: "A"}}).SendText(data); err != nil {
+			return err
+		}
+		return expansionReply(n, []expandShare{{ID: "2", Code: "B"}}).SendText(data)
+	}), 1)
+	if err != nil || len(shares) != 1 || shares[0].ID != "1" {
+		t.Fatalf("first reply not preserved: shares=%v err=%v", shares, err)
 	}
 }
 
@@ -160,14 +191,12 @@ func TestExpansionOfferValidation(t *testing.T) {
 		{{ID: "1", Code: ""}},
 	} {
 		n := newExpandNegotiator()
-		n.result <- &expandMessage{Type: expandTypeOffer, Shares: shares}
-		if _, err := n.request(&fakeSender{}, 1); err == nil {
+		if _, err := n.request(expansionReply(n, shares), 1); err == nil {
 			t.Fatalf("accepted invalid offer: %+v", shares)
 		}
 	}
 	n := newExpandNegotiator()
-	n.result <- &expandMessage{Type: expandTypeOffer, Shares: []expandShare{{ID: "1", Code: "A"}, {ID: "1", Code: "A"}}}
-	if _, err := n.request(&fakeSender{}, 2); err == nil {
+	if _, err := n.request(expansionReply(n, []expandShare{{ID: "1", Code: "A"}, {ID: "1", Code: "A"}}), 2); err == nil {
 		t.Fatal("accepted duplicate rooms")
 	}
 }
