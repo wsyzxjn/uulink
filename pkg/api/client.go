@@ -72,6 +72,9 @@ const (
 	// CodeControlledDeviceOffline is returned when attempting to join a share
 	// whose controlled side is offline or has disconnected from signaling.
 	CodeControlledDeviceOffline = 2001
+	// CodeControllerVersionTooLow is returned when the share requires a newer
+	// controller client version than the one advertised by this process.
+	CodeControllerVersionTooLow = 2007
 )
 
 // Permanent reports whether the error describes the request itself rather
@@ -84,7 +87,7 @@ const (
 // every retry anyway.
 func (e *ResponseError) Permanent() bool {
 	switch e.Code {
-	case CodeInvalidParams, CodeInvalidSign, CodeTokenExpired, CodeQRCodeExpired:
+	case CodeInvalidParams, CodeInvalidSign, CodeTokenExpired, CodeQRCodeExpired, CodeControllerVersionTooLow:
 		return true
 	}
 	return false

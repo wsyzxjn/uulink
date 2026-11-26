@@ -111,7 +111,7 @@ type ConnectConfig struct {
 	NRDAuth     string // X-NRD-AUTH token from room/join
 	ReconnKey   string // X-NRD-RECONN-KEY for reconnection
 	Controlling bool   // true = controller, false = controlled
-	Version     string // streamer_version, default V4.5.3
+	Version     string // streamer_version, default V4.14.2
 }
 
 // Connect establishes a socket.io connection to the signaling gateway.

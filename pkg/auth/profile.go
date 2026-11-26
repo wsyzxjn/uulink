@@ -8,11 +8,12 @@ import (
 	"strings"
 )
 
-// Compatibility defaults are from the working macOS 4.38.0 / Windows 4.38.3
-// clients. They are protocol identities, not claims about the host hardware.
+// Compatibility defaults are from the working macOS 4.48.4 (636) and Windows
+// 4.48.4 (6020) clients. They are protocol identities, not claims about the
+// host hardware.
 const (
 	DefaultAPIBaseURL         = "https://api.nrd.nie.163.com"
-	DefaultStreamerVersion    = "V4.5.3"
+	DefaultStreamerVersion    = "V4.14.2"
 	DefaultWebSocketUserAgent = "WebSocket++/0.8.2"
 	defaultSigningKey         = "alWiSzXZTLu3WfFnw13uBru3"
 	WindowsPlatform           = 1
@@ -55,9 +56,9 @@ func (c *Config) identityFor(goos string) Identity {
 		}
 	}
 	i := Identity{Platform: p, ClientProfile: c.ClientProfile, VersionName: c.VersionName, VersionCode: c.VersionCode, StreamerVersion: c.StreamerVersion}
-	vn, vc, uaOS, suffix := "4.38.0", "616", "macOS 27.0.0", " Alamofire/5.7.1"
+	vn, vc, uaOS, suffix := "4.48.4", "636", "macOS 27.0.0", " Alamofire/5.7.1"
 	if p == WindowsPlatform {
-		vn, vc, uaOS, suffix = "4.38.3", "9325", "Windows 10", ""
+		vn, vc, uaOS, suffix = "4.48.4", "6020", "Windows 10", ""
 	}
 	for _, value := range []struct {
 		dst      *string

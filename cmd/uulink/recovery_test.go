@@ -57,6 +57,7 @@ func TestIsPermanentError(t *testing.T) {
 		{"api params", fmt.Errorf("join: %w", &api.ResponseError{Code: api.CodeInvalidParams}), true},
 		{"api token expired", &api.ResponseError{Code: api.CodeTokenExpired}, true},
 		{"api bad sign", &api.ResponseError{Code: api.CodeInvalidSign}, true},
+		{"api controller version too low", &api.ResponseError{Code: api.CodeControllerVersionTooLow}, true},
 		{"api wrong code is transient while the peer re-registers", &api.ResponseError{Code: api.CodeDeviceOrCodeMismatch}, false},
 		{"api not found is transient", &api.ResponseError{Code: api.CodeObjectNotFound}, false},
 	}
@@ -100,6 +101,25 @@ func TestRecoverTunnelReturnsPermanentErrorsImmediately(t *testing.T) {
 	}
 	if time.Since(start) > 500*time.Millisecond {
 		t.Fatal("recoverTunnel waited before returning a permanent error")
+	}
+}
+
+func TestRecoverTunnelStopsOnControllerVersionTooLow(t *testing.T) {
+	calls := 0
+	want := &api.ResponseError{Code: api.CodeControllerVersionTooLow, Message: "controller version too low"}
+	start := time.Now()
+	err := recoverTunnel(func(context.Context) error {
+		calls++
+		return fmt.Errorf("join share room: %w", want)
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("recoverTunnel() = %v, want %v", err, want)
+	}
+	if calls != 1 {
+		t.Fatalf("run called %d times, want 1", calls)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatal("recoverTunnel retried a controller version mismatch")
 	}
 }
 

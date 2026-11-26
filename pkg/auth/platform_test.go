@@ -13,10 +13,10 @@ func TestPlatformParams(t *testing.T) {
 		versionName string
 		versionCode string
 	}{
-		{"darwin", 0, "4", "4.38.0", "616"},
-		{"windows", 0, "1", "4.38.3", "9325"},
-		{"darwin", 1, "1", "4.38.3", "9325"},
-		{"darwin", 4, "4", "4.38.0", "616"},
+		{"darwin", 0, "4", "4.48.4", "636"},
+		{"windows", 0, "1", "4.48.4", "6020"},
+		{"darwin", 1, "1", "4.48.4", "6020"},
+		{"darwin", 4, "4", "4.48.4", "636"},
 	}
 
 	for _, test := range tests {

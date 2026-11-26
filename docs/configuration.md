@@ -20,10 +20,10 @@ compatibility profile. The environment variables are `UULINK_CLIENT_VN`,
 `UULINK_CLIENT_VC`, and `UULINK_STREAMER_VERSION`. All connection paths, including
 reconnections and additional pooled sessions, use the same resolution rules.
 
-The bundled defaults remain macOS `4.38.0` / build `616`, Windows `4.38.3` / build
-`9325`, and streamer `V4.5.3`. These are known compatibility baselines, not a claim
-that they are the latest official versions. A newer version string alone does
-not implement new upstream protocol features.
+The bundled defaults are macOS `4.48.4` / build `636`, Windows `4.48.4` / build
+`6020`, and streamer `V4.14.2`. These are known compatibility baselines, not a
+claim that every future official release remains compatible without changes. A
+newer version string alone does not implement new upstream protocol features.
 
 `client_profile` can override `package_name`, `channel`, `language`, `country`,
 `release`, `operator`, `user_agent_os`, `user_agent_suffix`, and
